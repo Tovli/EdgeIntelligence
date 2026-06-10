@@ -1,0 +1,13 @@
+[package]
+name = "el-provenance"
+description = "Model signature verification gate — Conformist load gate (ADR-006)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+el-core = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

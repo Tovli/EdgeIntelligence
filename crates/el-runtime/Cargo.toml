@@ -1,0 +1,16 @@
+[package]
+name = "el-runtime"
+description = "Inference session lifecycle + decode-loop orchestration (ADR-001/004)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+el-core = { workspace = true }
+el-memory = { workspace = true }
+el-safety = { workspace = true }
+el-provenance = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

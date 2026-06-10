@@ -1,0 +1,13 @@
+[package]
+name = "el-memory"
+description = "Static memory planning + zero-allocation arena + KV compaction (ADR-003)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+el-core = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

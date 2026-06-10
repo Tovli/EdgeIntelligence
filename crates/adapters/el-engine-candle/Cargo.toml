@@ -1,0 +1,19 @@
+# EXCLUDED from the workspace — needs crates.io (Candle) + model assets + real
+# inference work. This is the ADR-002 follow-up. Activate inside this directory
+# once network + a quantized model are available.
+[package]
+name = "el-engine-candle"
+description = "RuntimeAcl: InferenceEngine over Candle — GGUF/safetensors (ADR-002)."
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+el-core = { path = "../../el-core" }
+el-runtime = { path = "../../el-runtime" }
+candle-core = "0.8"
+candle-transformers = "0.8"
+
+[features]
+default = []
+metal = ["candle-core/metal"]

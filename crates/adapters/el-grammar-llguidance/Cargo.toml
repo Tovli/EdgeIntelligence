@@ -1,0 +1,16 @@
+# EXCLUDED from the workspace — needs crates.io (llguidance). ADR-004 grammar
+# follow-up. Activate inside this directory once network is available.
+[package]
+name = "el-grammar-llguidance"
+description = "GrammarMasker over llguidance — JSON-schema constrained decoding (ADR-004)."
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+el-core = { path = "../../el-core" }
+el-runtime = { path = "../../el-runtime" }
+llguidance = "0.7"
+
+[lints.rust]
+unsafe_code = "forbid"

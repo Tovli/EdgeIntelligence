@@ -1,0 +1,16 @@
+# EXCLUDED from the workspace (see root Cargo.toml) — needs crates.io to fetch
+# ed25519-dalek. Activate by `cargo build` inside this directory once network is
+# available, then add it back to the workspace members.
+[package]
+name = "el-provenance-ed25519"
+description = "Real ED25519 SignatureVerifier over ed25519-dalek (ADR-006)."
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+el-provenance = { path = "../../el-provenance" }
+ed25519-dalek = "2"
+
+[lints.rust]
+unsafe_code = "forbid"

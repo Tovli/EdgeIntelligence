@@ -1,0 +1,46 @@
+# Edge-Native LLM SDK — Rust workspace.
+# Realizes the ADRs in docs/adr (see docs/adr/README.md). Per ADR-008 the entire
+# SDK is Rust with no C/C++ in our code or default dependency set.
+#
+# The MEMBER crates below are pure-Rust (std-only) and build/test offline on the
+# host. Integration adapters that pull external crates (Candle, llguidance,
+# ed25519-dalek) or need cross-targets (wasm32/aarch64-mobile) live under
+# crates/adapters/ and are EXCLUDED until network + targets are available — so a
+# default `cargo build` always succeeds. See docs/adr ADR-002.
+[workspace]
+resolver = "2"
+members = [
+    "crates/el-core",
+    "crates/el-memory",
+    "crates/el-telemetry",
+    "crates/el-provenance",
+    "crates/el-safety",
+    "crates/el-runtime",
+]
+exclude = [
+    "crates/adapters/el-engine-candle",
+    "crates/adapters/el-grammar-llguidance",
+    "crates/adapters/el-provenance-ed25519",
+    "crates/adapters/el-ffi",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "Apache-2.0"
+rust-version = "1.96"
+repository = "Edge-Native LLM SDK"
+
+[workspace.dependencies]
+# Internal crates referenced by path.
+el-core = { path = "crates/el-core" }
+el-memory = { path = "crates/el-memory" }
+el-telemetry = { path = "crates/el-telemetry" }
+el-provenance = { path = "crates/el-provenance" }
+el-safety = { path = "crates/el-safety" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

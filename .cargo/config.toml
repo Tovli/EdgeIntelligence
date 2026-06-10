@@ -1,0 +1,14 @@
+# ARM target-features per ADR-002 / PRD §"Model Format & Quantization".
+# These only take effect when building for the named targets (installed via
+# `rustup target add aarch64-linux-android aarch64-apple-ios wasm32-wasip1`).
+# They are inert for the host (x86_64) build used to verify the foundation.
+
+[target.aarch64-linux-android]
+rustflags = ["-C", "target-feature=+neon,+dotprod,+i8mm"]
+
+[target.aarch64-apple-ios]
+rustflags = ["-C", "target-feature=+neon,+dotprod,+i8mm"]
+
+# wasm32 portable/sandboxed path (run via Wasmtime — ADR-001).
+[target.wasm32-wasip1]
+rustflags = []

@@ -1,0 +1,13 @@
+[package]
+name = "el-core"
+description = "Shared domain vocabulary for the Edge-Native LLM SDK (ADR-007/008)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Intentionally zero external dependencies — pure std, builds offline (ADR-008).
+
+[lints.rust]
+unsafe_code = "forbid"

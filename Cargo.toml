@@ -16,11 +16,15 @@ members = [
     "crates/el-provenance",
     "crates/el-safety",
     "crates/el-runtime",
+    # Increment 2: crates.io verified reachable, so the small/complete ed25519
+    # adapter is now a first-class member (ADR-006).
+    "crates/adapters/el-provenance-ed25519",
+    # Increment 3: real Candle CPU forward verified on host (ADR-002).
+    "crates/adapters/el-engine-candle",
 ]
 exclude = [
-    "crates/adapters/el-engine-candle",
+    # Still excluded: not yet implemented (skeletons) / need cross-targets.
     "crates/adapters/el-grammar-llguidance",
-    "crates/adapters/el-provenance-ed25519",
     "crates/adapters/el-ffi",
 ]
 

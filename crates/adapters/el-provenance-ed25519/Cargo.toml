@@ -1,16 +1,19 @@
-# EXCLUDED from the workspace (see root Cargo.toml) — needs crates.io to fetch
-# ed25519-dalek. Activate by `cargo build` inside this directory once network is
-# available, then add it back to the workspace members.
+# Workspace member (Increment 2): real ED25519 verifier. Small, pure-Rust dep
+# tree fetched from crates.io; plugs into the el-provenance gate (ADR-006).
 [package]
 name = "el-provenance-ed25519"
 description = "Real ED25519 SignatureVerifier over ed25519-dalek (ADR-006)."
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
-el-provenance = { path = "../../el-provenance" }
+el-provenance = { workspace = true }
 ed25519-dalek = "2"
+
+[dev-dependencies]
+el-core = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

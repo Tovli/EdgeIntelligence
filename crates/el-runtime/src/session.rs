@@ -221,11 +221,11 @@ fn pick(logits: &[i32], mask: &[bool], adj: &LogitAdjustment) -> Token {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::defaults::{AllowAllMasker, NullEngine};
+    use crate::defaults::NullEngine;
     use crate::ports::{GrammarMasker, Ports};
     use el_core::{ModelFormat, ModelId, ModelVersion};
     use el_provenance::{ModelArtifact, SignatureVerifier};
-    use el_safety::{LightweightFilter, SafetySteerer};
+    use el_safety::LightweightFilter;
 
     struct OkVerifier;
     impl SignatureVerifier for OkVerifier {

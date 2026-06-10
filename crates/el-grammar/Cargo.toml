@@ -1,0 +1,17 @@
+[package]
+name = "el-grammar"
+description = "Pure-Rust DFA/regular-grammar token masking (Grammar Constraint context)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+el-core = { workspace = true }
+el-runtime = { path = "../el-runtime" }
+
+[dev-dependencies]
+el-provenance = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

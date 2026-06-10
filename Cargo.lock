@@ -361,6 +361,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "el-grammar"
+version = "0.1.0"
+dependencies = [
+ "el-core",
+ "el-provenance",
+ "el-runtime",
+]
+
+[[package]]
 name = "el-memory"
 version = "0.1.0"
 dependencies = [

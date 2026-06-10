@@ -19,16 +19,17 @@ network + targets are available.
 | `crates/el-provenance` | ADR-006 | Model Provenance (gate logic) | ✅ implemented + tested |
 | `crates/el-safety` | ADR-005 | Safety (Lightweight real) | ◑ partial |
 | `crates/el-runtime` | ADR-001/004 | Inference Runtime + air-gap | ✅ implemented + tested |
+| `crates/el-grammar` | context 4 (grammar) | DFA token masking | ✅ in workspace — real, 3 tests |
 | `crates/adapters/el-provenance-ed25519` | ADR-006 | real ED25519 (`ed25519-dalek`) | ✅ in workspace — real crypto, 3 tests |
 | `crates/adapters/el-engine-candle` | ADR-002 | Candle inference engine | ✅ in workspace — real Candle CPU forward (toy model), 2 tests |
-| `crates/adapters/el-grammar-llguidance` | ADR-004 | llguidance grammar masking | ▢ excluded — skeleton |
+| `crates/adapters/el-grammar-llguidance` | context 4 (grammar) | llguidance (CFG/JSON-schema) | ▢ excluded — scale-up (needs tokenizer env) |
 | `crates/adapters/el-ffi` | ADR-001 | UniFFI / wasm-bindgen host bindings | ▢ excluded — skeleton |
 
 ## Build & test (host)
 
 ```sh
 cargo build --workspace   # 6 core crates are dep-free; ed25519 + candle adapters pull (cached) trees
-cargo test  --workspace   # 28 tests across the 8 member crates
+cargo test  --workspace   # 31 tests across the 9 member crates
 ```
 
 ## What's implemented vs. follow-up
@@ -47,6 +48,10 @@ cargo test  --workspace   # 28 tests across the 8 member crates
   (embedding × projection → quantised milli-logits at the ACL) and drives the
   `el-runtime` decode loop end-to-end. Built on a toy in-code model; production
   GGUF/safetensors loading + transformer is the documented follow-up.
+- **Grammar-constrained decoding (Grammar Constraint context):** `el-grammar`
+  compiles a regular grammar to a token-level DFA and masks each decode step; a
+  test shows it forcing a specific output sequence despite uniform engine
+  logits. Full CFG/JSON-schema via llguidance is the scale-up.
 - Tiered safety with `SecDecoding`→`Lightweight` downgrade on mid-range + a real
   blacklist filter (ADR-005).
 - Session state machine + decode orchestrator enforcing the invariant order

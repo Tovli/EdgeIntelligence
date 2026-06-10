@@ -16,6 +16,8 @@ members = [
     "crates/el-provenance",
     "crates/el-safety",
     "crates/el-runtime",
+    # Increment 4: pure-Rust DFA token masker (Grammar Constraint context).
+    "crates/el-grammar",
     # Increment 2: crates.io verified reachable, so the small/complete ed25519
     # adapter is now a first-class member (ADR-006).
     "crates/adapters/el-provenance-ed25519",

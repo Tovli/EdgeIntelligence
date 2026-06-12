@@ -1,3 +1,5 @@
+![Edge Intelligence banner](docs/assets/edge-intelligence-banner.png)
+
 # Edge Intelligence
 
 ![Rust](https://img.shields.io/badge/Rust-2021-f46623?style=for-the-badge&logo=rust&logoColor=white)

@@ -14,6 +14,13 @@ on:
   pull_request:
     paths:
       - 'crates/adapters/el-ffi/**'
+      - 'crates/el-core/**'
+      - 'crates/el-runtime/**'
+      - 'crates/adapters/el-engine-candle/**'
+      - '.cargo/config.toml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'Makefile'
       - '.github/workflows/bindings.yml'
 
 jobs:

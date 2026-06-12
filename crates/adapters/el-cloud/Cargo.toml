@@ -1,0 +1,27 @@
+# `el-cloud` — opt-in frontier LLM cloud backend (ADR-010).
+# Excluded from the offline workspace: depends on reqwest (network crate).
+# Activate by adding to workspace members once network is confirmed available.
+[package]
+name = "el-cloud"
+description = "Frontier LLM cloud backend over reqwest — OpenAI, Anthropic, Gemini, Ollama (ADR-010)."
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+el-core = { path = "../../el-core" }
+
+# reqwest::blocking is only available on native targets; wasm32-unknown-unknown
+# uses the async fetch API which requires a different crate surface. Since
+# LlmProvider::chat() is a synchronous trait and el-ffi already gates el-cloud
+# usage to non-wasm32, we restrict the network deps to native as well.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[lints.rust]
+unsafe_code = "forbid"

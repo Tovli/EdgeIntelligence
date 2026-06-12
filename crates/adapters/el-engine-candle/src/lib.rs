@@ -13,8 +13,12 @@
 #![forbid(unsafe_code)]
 
 use candle_core::{Device, Tensor};
-use el_core::{EdgeError, Result, Token};
-use el_runtime::InferenceEngine;
+use el_core::{
+    ChatMessage, ChatRequest, ChatResponse, ChatRole, ChatToken, EdgeError, LlmProvider, Result,
+    SessionConfig, SessionId, Token,
+};
+use el_provenance::LoadPermit;
+use el_runtime::{InferenceEngine, InferenceSession, Ports};
 
 /// Candle-backed engine. The toy model is `embed: [vocab, dim]` and
 /// `w_out: [dim, vocab]`; next-token logits = `embed[last] · w_out`.
@@ -50,7 +54,12 @@ impl CandleEngine {
         let w_out = Tensor::from_vec(wout_data, (dim, vocab), &device)
             .map_err(|_| EdgeError::Engine("candle: w_out tensor build failed"))?;
 
-        Ok(Self { embed, w_out, vocab, eos })
+        Ok(Self {
+            embed,
+            w_out,
+            vocab,
+            eos,
+        })
     }
 
     /// Production model loading — the ADR-002 follow-up.
@@ -97,6 +106,111 @@ impl InferenceEngine for CandleEngine {
     }
 }
 
+// ── LlmProvider (text-level) wrapper (ADR-010) ───────────────────────────────
+
+/// Wraps an `InferenceSession<CandleEngine>` behind the `LlmProvider` trait,
+/// bridging the text API down to token IDs via a byte-level tokenizer.
+///
+/// The byte tokenizer maps each UTF-8 byte → `byte % vocab` so it works with
+/// any vocab size. This is intentionally minimal — a production build would
+/// swap in a HuggingFace `tokenizers::Tokenizer` loaded from the model file.
+pub struct LocalLlmProvider {
+    session: std::sync::Mutex<InferenceSession<CandleEngine>>,
+    vocab: usize,
+}
+
+impl LocalLlmProvider {
+    /// Build a toy provider for testing — same fixed weights as [`CandleEngine::toy`].
+    pub fn toy(vocab: usize, dim: usize, eos: Token, permit: LoadPermit) -> Result<Self> {
+        let engine = CandleEngine::toy(vocab, dim, eos)?;
+        let session = InferenceSession::new(SessionId(1), SessionConfig::default(), engine, permit);
+        Ok(Self {
+            session: std::sync::Mutex::new(session),
+            vocab,
+        })
+    }
+
+    /// Encode text → token IDs using a byte-level mapping (byte % vocab).
+    fn encode(&self, text: &str) -> Vec<Token> {
+        text.bytes()
+            .map(|b| (b as Token) % self.vocab as Token)
+            .collect()
+    }
+
+    /// Decode token IDs → text: printable ASCII bytes pass through; others → '?'.
+    fn decode(tokens: &[Token]) -> String {
+        tokens
+            .iter()
+            .map(|&t| {
+                let b = (t & 0xFF) as u8;
+                if b.is_ascii_graphic() || b == b' ' {
+                    b as char
+                } else {
+                    '?'
+                }
+            })
+            .collect()
+    }
+
+    /// Format messages into a single prompt string (role: content\n).
+    fn format_messages(messages: &[ChatMessage]) -> String {
+        messages
+            .iter()
+            .map(|m| {
+                let role = match m.role {
+                    ChatRole::System => "system",
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                };
+                format!("{role}: {}", m.content)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+impl LlmProvider for LocalLlmProvider {
+    fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
+        let prompt = Self::format_messages(&req.messages);
+        let prompt_tokens = self.encode(&prompt);
+        let prompt_len = prompt_tokens.len() as u32;
+        let max = req.max_tokens.unwrap_or(64);
+
+        let mut session = self.session.lock().unwrap();
+        session.reset();
+        let ports = Ports::permissive();
+        session.load_prompt(&ports, &prompt_tokens)?;
+        session.generate(&ports, max)?;
+
+        let output = session.output().to_vec();
+        let completion_len = output.len() as u32;
+
+        Ok(ChatResponse {
+            content: Self::decode(&output),
+            model: "local/candle".into(),
+            prompt_tokens: prompt_len,
+            completion_tokens: completion_len,
+        })
+    }
+
+    fn chat_stream(&self, req: &ChatRequest, on_token: &mut dyn FnMut(ChatToken)) -> Result<()> {
+        let resp = self.chat(req)?;
+        // The Candle session generates all tokens in one pass; simulate streaming
+        // by emitting one character at a time so the callback contract holds.
+        for ch in resp.content.chars() {
+            on_token(ChatToken {
+                text: ch.to_string(),
+                is_final: false,
+            });
+        }
+        on_token(ChatToken {
+            text: String::new(),
+            is_final: true,
+        });
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,18 +240,76 @@ mod tests {
                 true
             }
         }
-        let mut art = ModelArtifact::new(ModelId(1), ModelVersion::new(0, 1, 0), ModelFormat::Safetensors);
+        let mut art = ModelArtifact::new(
+            ModelId(1),
+            ModelVersion::new(0, 1, 0),
+            ModelFormat::Safetensors,
+        );
         art.verify(&OkVerifier, b"w", b"s", 1);
         let permit = art.ensure_loadable().unwrap();
 
         // eos out of range → runs to max_tokens, producing real Candle tokens.
         let eng = CandleEngine::toy(16, 8, 9999).unwrap();
-        let mut session = InferenceSession::new(SessionId(1), SessionConfig::default(), eng, permit);
+        let mut session =
+            InferenceSession::new(SessionId(1), SessionConfig::default(), eng, permit);
         let ports = Ports::permissive();
         session.load_prompt(&ports, &[1, 2, 3]).unwrap();
 
         let stop = session.generate(&ports, 4).unwrap();
         assert_eq!(stop, StopReason::MaxTokens);
-        assert_eq!(session.output().len(), 4, "4 tokens decoded via a real Candle forward");
+        assert_eq!(
+            session.output().len(),
+            4,
+            "4 tokens decoded via a real Candle forward"
+        );
+    }
+
+    fn ok_permit() -> LoadPermit {
+        use el_core::{ModelFormat, ModelId, ModelVersion};
+        use el_provenance::{ModelArtifact, SignatureVerifier};
+        struct OkV;
+        impl SignatureVerifier for OkV {
+            fn verify(&self, _: &[u8], _: &[u8], _: u32) -> bool {
+                true
+            }
+        }
+        let mut a = ModelArtifact::new(ModelId(1), ModelVersion::new(0, 1, 0), ModelFormat::Gguf);
+        a.verify(&OkV, b"w", b"s", 0);
+        a.ensure_loadable().unwrap()
+    }
+
+    #[test]
+    fn local_provider_chat_returns_response() {
+        let p = LocalLlmProvider::toy(32, 8, 31, ok_permit()).unwrap();
+        let req = el_core::ChatRequest::new("local", vec![el_core::ChatMessage::user("hello")])
+            .with_max_tokens(4);
+        let resp = p.chat(&req).unwrap();
+        assert_eq!(resp.model, "local/candle");
+        assert_eq!(resp.completion_tokens, 4);
+        assert!(!resp.content.is_empty());
+    }
+
+    #[test]
+    fn local_provider_stream_ends_with_final_token() {
+        let p = LocalLlmProvider::toy(32, 8, 31, ok_permit()).unwrap();
+        let req = el_core::ChatRequest::new("local", vec![el_core::ChatMessage::user("hi")])
+            .with_max_tokens(3);
+        let mut tokens: Vec<el_core::ChatToken> = Vec::new();
+        p.chat_stream(&req, &mut |t| tokens.push(t)).unwrap();
+        assert!(tokens.last().unwrap().is_final, "last token must be final");
+        assert!(tokens.len() > 1, "at least one content token before final");
+    }
+
+    #[test]
+    fn local_provider_session_resets_between_calls() {
+        let p = LocalLlmProvider::toy(32, 8, 31, ok_permit()).unwrap();
+        let req = el_core::ChatRequest::new("local", vec![el_core::ChatMessage::user("a")])
+            .with_max_tokens(4);
+        let r1 = p.chat(&req).unwrap();
+        let r2 = p.chat(&req).unwrap();
+        assert_eq!(
+            r1.content, r2.content,
+            "same input → same output (deterministic weights)"
+        );
     }
 }

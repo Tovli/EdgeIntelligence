@@ -81,7 +81,9 @@ impl DfaMasker {
     /// Whether the committed sequence is in an accepting state (i.e. it would be
     /// valid to stop now).
     pub fn accepts(&self, committed: &[Token]) -> bool {
-        self.dfa.run(committed).is_some_and(|s| self.dfa.is_accepting(s))
+        self.dfa
+            .run(committed)
+            .is_some_and(|s| self.dfa.is_accepting(s))
     }
 }
 
@@ -117,7 +119,11 @@ mod tests {
     fn mask_allows_only_valid_next_tokens_per_state() {
         let m = DfaMasker::new(grammar_5_5_9());
         let only = |mask: Vec<bool>| -> Vec<usize> {
-            mask.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| i).collect()
+            mask.iter()
+                .enumerate()
+                .filter(|(_, b)| **b)
+                .map(|(i, _)| i)
+                .collect()
         };
         assert_eq!(only(m.mask(&[], 10)), vec![5]);
         assert_eq!(only(m.mask(&[5], 10)), vec![5]);
@@ -135,7 +141,9 @@ mod tests {
 
     #[test]
     fn grammar_constrains_real_decoding_in_the_runtime() {
-        use el_core::{ModelFormat, ModelId, ModelVersion, SessionConfig, SessionId, StopReason, Token};
+        use el_core::{
+            ModelFormat, ModelId, ModelVersion, SessionConfig, SessionId, StopReason, Token,
+        };
         use el_provenance::{ModelArtifact, SignatureVerifier};
         use el_runtime::{InferenceEngine, InferenceSession, Ports};
 
@@ -166,8 +174,12 @@ mod tests {
         art.verify(&OkVerifier, b"w", b"s", 1);
         let permit = art.ensure_loadable().unwrap();
 
-        let mut session =
-            InferenceSession::new(SessionId(1), SessionConfig::default(), UniformEngine { vocab: 10 }, permit);
+        let mut session = InferenceSession::new(
+            SessionId(1),
+            SessionConfig::default(),
+            UniformEngine { vocab: 10 },
+            permit,
+        );
         let ports = Ports {
             grammar: Box::new(DfaMasker::new(grammar_5_5_9())),
             ..Ports::permissive()

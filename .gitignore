@@ -2,3 +2,5 @@
 ruvector.db
 .claude-flow/
 target/
+# Claude Code local state (worktrees, settings.local.json)
+.claude/

@@ -7,7 +7,9 @@
 //! (e.g. `*_milli`) stand in for ratios/scores so the type stays `Copy` + `Eq`.
 
 use crate::ids::{ModelId, ModelVersion, SessionId};
-use crate::value_objects::{DeviceTarget, ModelFormat, RuntimeKind, SafetyMode, SpeculationMode, StopReason};
+use crate::value_objects::{
+    DeviceTarget, ModelFormat, RuntimeKind, SafetyMode, SpeculationMode, StopReason,
+};
 
 /// Why an optional pipeline stage was degraded (PRD risk policy made
 /// observable).
@@ -143,6 +145,16 @@ pub enum DomainEvent {
         ttft_ms: u32,
         peak_bytes: u64,
     },
+
+    // --- 10. Frontier LLM (ADR-010 opt-in cloud egress) ---
+    /// Emitted when the opt-in cloud backend is consulted (parallel to
+    /// `HybridRelayConsulted`). `provider_hash` is a CRC32 of the provider
+    /// prefix — not the API key or any content.
+    FrontierLlmConsulted {
+        provider_hash: u32,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+    },
 }
 
 /// Standard envelope (`docs/ddd/domain-events.md`): every event is correlated by
@@ -156,7 +168,11 @@ pub struct EventEnvelope {
 
 impl EventEnvelope {
     pub fn new(session: SessionId, step: u32, event: DomainEvent) -> Self {
-        Self { session, step, event }
+        Self {
+            session,
+            step,
+            event,
+        }
     }
 }
 
@@ -175,7 +191,11 @@ mod tests {
 
     #[test]
     fn envelope_carries_step_and_session() {
-        let e = EventEnvelope::new(SessionId(1), 4, DomainEvent::TokenGenerated { sampled: true });
+        let e = EventEnvelope::new(
+            SessionId(1),
+            4,
+            DomainEvent::TokenGenerated { sampled: true },
+        );
         assert_eq!(e.step, 4);
         assert_eq!(e.session, SessionId(1));
     }

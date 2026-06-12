@@ -23,10 +23,14 @@ members = [
     "crates/adapters/el-provenance-ed25519",
     # Increment 3: real Candle CPU forward verified on host (ADR-002).
     "crates/adapters/el-engine-candle",
+    # Increment 7: opt-in frontier LLM cloud backend (ADR-010).
+    "crates/adapters/el-cloud",
 ]
 exclude = [
-    # Still excluded: not yet implemented (skeletons) / need cross-targets.
+    # Excluded: need crates.io (llguidance/toktrie) + native tokenizer build deps.
     "crates/adapters/el-grammar-llguidance",
+    # Excluded: needs crates.io (uniffi/flutter_rust_bridge/wasm-bindgen) +
+    # cross-targets (wasm32/aarch64-mobile). ADR-001/009.
     "crates/adapters/el-ffi",
 ]
 

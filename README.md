@@ -1,68 +1,179 @@
-# Edge-Native LLM SDK (Rust)
+# Edge Intelligence
 
-A private, offline-capable, on-device LLM SDK for ~0.5B models. Pure **Rust**, no
-C/C++ (ADR-008), targeting native ARM and `wasm32`. See [`docs/prd.md`](docs/prd.md),
-the DDD model in [`docs/ddd/`](docs/ddd/README.md), and the decision records in
-[`docs/adr/`](docs/adr/README.md).
+![Rust](https://img.shields.io/badge/Rust-2021-f46623?style=for-the-badge&logo=rust&logoColor=white)
+![Status](https://img.shields.io/badge/status-active%20prototype-2563eb?style=for-the-badge)
+![Privacy](https://img.shields.io/badge/default-air--gapped-10b981?style=for-the-badge)
+![Targets](https://img.shields.io/badge/targets-native%20ARM%20%2B%20WASM-7c3aed?style=for-the-badge)
+![License](https://img.shields.io/badge/license-Apache--2.0-f59e0b?style=for-the-badge)
 
-## Workspace layout
+**A Rust SDK for private, edge-native LLM applications.**
 
-Member crates are **pure Rust (std-only)** — they build and test offline on the
-host. Adapters that need external crates or cross-targets are **excluded** until
-network + targets are available.
+Edge Intelligence is an offline-first runtime for small language models on phones,
+embedded devices, and portable WASM hosts. It is built around one constraint:
+the useful parts of an LLM app should keep working when the network disappears
+and sensitive user data should not need to leave the device.
 
-| Crate | Realizes | Bounded context | Status |
-|-------|----------|-----------------|--------|
-| `crates/el-core` | ADR-007/008 | (shared) ubiquitous language, content-free events | ✅ implemented + tested |
-| `crates/el-memory` | ADR-003 | Memory Management | ✅ implemented + tested |
-| `crates/el-telemetry` | ADR-007 | Telemetry & Privacy | ✅ implemented + tested |
-| `crates/el-provenance` | ADR-006 | Model Provenance (gate logic) | ✅ implemented + tested |
-| `crates/el-safety` | ADR-005 | Safety (Lightweight real) | ◑ partial |
-| `crates/el-runtime` | ADR-001/004 | Inference Runtime + air-gap | ✅ implemented + tested |
-| `crates/el-grammar` | context 4 (grammar) | DFA token masking | ✅ in workspace — real, 3 tests |
-| `crates/adapters/el-provenance-ed25519` | ADR-006 | real ED25519 (`ed25519-dalek`) | ✅ in workspace — real crypto, 3 tests |
-| `crates/adapters/el-engine-candle` | ADR-002 | Candle inference engine | ✅ in workspace — real Candle CPU forward (toy model), 2 tests |
-| `crates/adapters/el-grammar-llguidance` | context 4 (grammar) | llguidance (CFG/JSON-schema) | ▢ excluded — scale-up (needs tokenizer env) |
-| `crates/adapters/el-ffi` | ADR-001 | UniFFI / wasm-bindgen host bindings | ▢ excluded — skeleton |
+The SDK targets approximately 0.5B parameter models, with a pure Rust core,
+static memory planning, signed model loading, grammar-constrained decoding,
+privacy-preserving telemetry, and host bindings for mobile and web runtimes.
+Local inference is the default path. Frontier and OpenAI-compatible providers
+exist only behind an explicit opt-in backend.
 
-## Build & test (host)
+## Why Edge Intelligence?
 
-```sh
-cargo build --workspace   # 6 core crates are dep-free; ed25519 + candle adapters pull (cached) trees
-cargo test  --workspace   # 31 tests across the 9 member crates
+Most mobile LLM stacks start in the cloud and add local features later. This
+project starts at the edge:
+
+| Principle | What it means in the SDK |
+|-----------|--------------------------|
+| **Local first** | The runtime, memory planner, safety checks, and telemetry core have no network dependency. |
+| **Rust all the way down** | Project-owned SDK code avoids C/C++ and keeps unsafe code out of the core crates. |
+| **Predictable memory** | The decode loop uses pre-planned arenas and descriptor-based KV-cache management. |
+| **Structured output** | Grammar masks run before sampling so tool calls and JSON outputs stay valid. |
+| **Provable provenance** | Model signatures are verified before a session can be constructed. |
+| **Opt-in egress** | Cloud/frontier providers are a separate adapter and must be wired deliberately by the host app. |
+
+## What It Does
+
+```text
+Host app
+  |
+  v
+LlmProvider trait
+  |------------------------------|
+  v                              v
+Local Candle runtime         Opt-in cloud adapter
+  |
+  v
+load gate -> memory plan -> prefill -> decode loop
+                                      |
+                                      v
+                         grammar mask -> safety adjust -> sample -> commit KV
+                                      |
+                                      v
+                         content-free events and metrics
 ```
 
-## What's implemented vs. follow-up
+The current workspace proves the main seams of the SDK:
 
-**Implemented & host-verified (this increment):**
-- Rust workspace, two-target config (`.cargo/config.toml` ARM target-features).
-- Domain vocabulary + **content-free events enforced at compile time** (events
-  derive `Copy`, so no `String`/heap field can ride on an event — ADR-007).
-- Static memory planner with lifetime-based offset reuse, allocate-once arena,
-  descriptor-only KV compaction (ADR-003).
-- Provenance **hard load gate**: no `Verified` → no `LoadPermit` → can't build a
-  session (ADR-006); a real `ed25519-dalek` verifier is now a tested workspace
-  member (`el-provenance-ed25519`) — genuine signatures verify, tampered/forged/
-  unknown-key inputs are hard-stopped.
-- **Candle engine (ADR-002):** `CandleEngine` runs a real Candle CPU forward
-  (embedding × projection → quantised milli-logits at the ACL) and drives the
-  `el-runtime` decode loop end-to-end. Built on a toy in-code model; production
-  GGUF/safetensors loading + transformer is the documented follow-up.
-- **Grammar-constrained decoding (Grammar Constraint context):** `el-grammar`
-  compiles a regular grammar to a token-level DFA and masks each decode step; a
-  test shows it forcing a specific output sequence despite uniform engine
-  logits. Full CFG/JSON-schema via llguidance is the scale-up.
-- Tiered safety with `SecDecoding`→`Lightweight` downgrade on mid-range + a real
-  blacklist filter (ADR-005).
-- Session state machine + decode orchestrator enforcing the invariant order
-  **grammar-mask → safety-adjust → sample → commit**, plus air-gap (no network
-  dependency; opt-in `HybridRelay` blocked unless `hybrid_mode`) (ADR-001/004).
+- **Runtime orchestration:** `el-runtime` owns the session state machine and
+  enforces the decode order: grammar mask, safety adjustment, sampling, commit.
+- **Static memory:** `el-memory` plans tensor lifetimes into a reusable arena and
+  models descriptor-only KV-cache compaction.
+- **Model provenance:** `el-provenance` and `el-provenance-ed25519` implement the
+  hard load gate: no verified signature, no load permit, no session.
+- **Grammar constraints:** `el-grammar` compiles regular grammars into a
+  token-level DFA masker; the `el-grammar-llguidance` adapter provides real
+  JSON-schema masking over llguidance with a HuggingFace tokenizer bridge.
+- **Safety:** `el-safety` provides the tiered policy model and lightweight
+  blacklist steering path, with SecDecoding-style model-backed safety tracked as
+  follow-up work.
+- **Inference engine seam:** `el-engine-candle` runs a real Candle CPU forward
+  on a toy in-code model and drives the runtime loop end to end.
+- **Provider seam:** `el-core::LlmProvider` gives local and frontier backends one
+  host-facing API; `el-cloud` implements the opt-in OpenAI-compatible path.
 
-**Follow-up (tracked tasks):** production GGUF/safetensors loading + real
-transformer + KV wiring for Candle (ADR-002 — the engine seam itself is now
-proven); llguidance JSON-schema masking (ADR-004); SecDecoding/CSD model-backed
-safety with runtime backtracking (ADR-005); UniFFI/wasm-bindgen binding
-generation + `wasm32`/mobile cross-compilation (ADR-001). crates.io is confirmed reachable (Increment 2
-promoted the ed25519 adapter into the workspace); Candle additionally needs a
-quantized model + real inference work, and `wasm32`/mobile targets must be
-installed for the FFI bindings.
+## Quick Start
+
+Prerequisite: Rust 1.96 or newer, matching the workspace `rust-version`.
+
+```sh
+cargo build --workspace
+cargo test --workspace
+```
+
+Build just the dependency-light local core:
+
+```sh
+cargo test -p el-core -p el-memory -p el-telemetry -p el-provenance -p el-safety -p el-runtime -p el-grammar
+```
+
+Cross-compile the pure Rust core for WASM:
+
+```sh
+rustup target add wasm32-wasip1 wasm32-unknown-unknown
+
+cargo build --target wasm32-wasip1 -p el-core -p el-memory -p el-telemetry -p el-provenance -p el-safety -p el-runtime -p el-grammar
+```
+
+## Workspace Map
+
+| Crate | Role | Current state |
+|-------|------|---------------|
+| [`crates/el-core`](crates/el-core) | Shared types, IDs, errors, events, provider trait | Implemented and tested |
+| [`crates/el-memory`](crates/el-memory) | Static arena planning and KV-cache descriptors | Implemented and tested |
+| [`crates/el-telemetry`](crates/el-telemetry) | Content-free event handling and privacy metrics | Implemented and tested |
+| [`crates/el-provenance`](crates/el-provenance) | Verified model load permits | Implemented and tested |
+| [`crates/el-safety`](crates/el-safety) | Tiered decoder-time safety policy | Partial, lightweight path implemented |
+| [`crates/el-runtime`](crates/el-runtime) | Session lifecycle and decode-loop orchestration | Implemented and tested |
+| [`crates/el-grammar`](crates/el-grammar) | DFA grammar masking | Implemented and tested |
+| [`crates/adapters/el-provenance-ed25519`](crates/adapters/el-provenance-ed25519) | Real ED25519 signature verification | Implemented and tested |
+| [`crates/adapters/el-engine-candle`](crates/adapters/el-engine-candle) | Candle inference adapter | Host CPU proof implemented |
+| [`crates/adapters/el-cloud`](crates/adapters/el-cloud) | Opt-in OpenAI-compatible provider backend | Implemented as an explicit egress adapter |
+| [`crates/adapters/el-grammar-llguidance`](crates/adapters/el-grammar-llguidance) | llguidance JSON-schema token masking | Implemented and tested; workspace-excluded (crates.io deps) |
+| [`crates/adapters/el-ffi`](crates/adapters/el-ffi) | Flutter/UniFFI/wasm-bindgen binding surfaces | Implemented and tested (native + wasm32 compile); workspace-excluded (cross toolchains) |
+
+## Architecture Decisions
+
+The project is intentionally decision-heavy because mobile LLM runtimes are easy
+to overfit to one device, model, or provider. The core choices are recorded as
+ADRs:
+
+| ADR | Decision |
+|-----|----------|
+| [ADR-001](docs/adr/ADR-001-adopt-webassembly-as-cross-platform-sdk-runtime.md) | Native ARM plus WASM as first-class runtime targets |
+| [ADR-002](docs/adr/ADR-002-candle-as-rust-native-inference-engine.md) | Candle as the Rust-native inference engine |
+| [ADR-003](docs/adr/ADR-003-static-memory-planning-with-zero-allocation-arena.md) | Static memory planning with a zero-allocation arena |
+| [ADR-004](docs/adr/ADR-004-air-gapped-by-default-with-opt-in-hybrid-mode.md) | Air-gapped by default |
+| [ADR-005](docs/adr/ADR-005-on-device-only-tiered-decoder-time-safety.md) | On-device decoder-time safety |
+| [ADR-006](docs/adr/ADR-006-mandatory-ed25519-model-signature-verification-load-gate.md) | Mandatory ED25519 model-signature verification |
+| [ADR-007](docs/adr/ADR-007-content-free-domain-events-privacy-by-construction-telemetry.md) | Content-free domain events for privacy-preserving telemetry |
+| [ADR-008](docs/adr/ADR-008-implement-the-sdk-in-rust-instead-of-c-cpp.md) | Rust instead of C/C++ |
+| [ADR-009](docs/adr/ADR-009-flutter-rust-bridge-for-dart-bindings.md) | Flutter Rust Bridge for Dart bindings |
+| [ADR-010](docs/adr/ADR-010-unified-llm-provider-trait-with-opt-in-frontier-egress.md) | Unified local/cloud `LlmProvider` trait |
+
+See the full index in [`docs/adr/README.md`](docs/adr/README.md).
+
+## Domain Model
+
+The DDD model lives in [`docs/ddd`](docs/ddd/README.md). It breaks the SDK into
+nine bounded contexts:
+
+1. Inference Runtime
+2. Prompt Compression
+3. Speculative Decoding
+4. Grammar Constraint
+5. Safety
+6. Memory Management
+7. Hardware and Delegate
+8. Model Provenance and Security
+9. Telemetry and Privacy
+
+The key invariant across those contexts: **air-gap is the default runtime shape,
+not a feature flag sprinkled through the code.** Any outbound behavior must be
+modeled as an explicit port or adapter.
+
+## What Is Next
+
+The prototype has proven the architectural seams. The next engineering work is
+to replace toy proofs with production-grade runtime pieces:
+
+- Production GGUF/safetensors loading and transformer execution in
+  `el-engine-candle`.
+- Lark/CFG grammars in the llguidance adapter (JSON-schema masking is done).
+- SecDecoding/CSD-style model-backed safety with runtime backtracking.
+- Binding codegen and packaging — FRB Dart codegen, uniffi-bindgen-react-native,
+  wasm-pack npm publishing (the Rust binding surfaces exist in `el-ffi`).
+- Mobile toolchain validation for Android and iOS `aarch64` targets.
+- On-device benchmarks for time-to-first-token, decode throughput, memory
+  high-water marks, and thermal behavior.
+
+## Documentation
+
+- Product and technical rationale: [`docs/prd.md`](docs/prd.md)
+- Domain model: [`docs/ddd/README.md`](docs/ddd/README.md)
+- Architecture decisions: [`docs/adr/README.md`](docs/adr/README.md)
+
+Edge Intelligence is still early, but the direction is deliberate: a small,
+auditable, Rust-native SDK that lets app developers choose local inference first
+and add remote intelligence only when the product explicitly calls for it.

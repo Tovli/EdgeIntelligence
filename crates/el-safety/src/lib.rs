@@ -42,10 +42,7 @@ impl LogitAdjustment {
     /// L1 norm in milli-units — what `LogitsSteered.adjustment_norm_milli`
     /// reports to telemetry.
     pub fn l1_norm_milli(&self) -> u32 {
-        self.penalties
-            .iter()
-            .map(|(_, d)| d.unsigned_abs())
-            .sum()
+        self.penalties.iter().map(|(_, d)| d.unsigned_abs()).sum()
     }
 }
 

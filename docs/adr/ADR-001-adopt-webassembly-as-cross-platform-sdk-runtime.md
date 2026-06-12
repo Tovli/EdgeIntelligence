@@ -34,10 +34,19 @@ Compile the Rust core to **two targets from one codebase**:
    via `wgpu`.
 
 The Published Language `init / load_prompt / generate / commit / reset` is
-identical across targets. Host bindings are generated with **UniFFI** (Kotlin for
-Android, Swift for iOS) and **`wasm-bindgen`/`wit-bindgen`** for the web — no
-hand-written JNI or Objective-C. Data crosses the boundary via shared linear
-memory (WASM) or shared `Arc<[u8]>` buffers (native) to avoid marshalling.
+identical across targets. Host bindings are generated from **one Rust API in
+`el-ffi`** across three surfaces — no hand-written JNI, Objective-C, or Dart FFI:
+
+| Consumer | Tool | Output |
+|----------|------|--------|
+| React Native (Android + iOS) | **`uniffi-bindgen-react-native`** | TypeScript + JSI C++ + Turbo Module |
+| Flutter (Android + iOS + desktop) | **`flutter_rust_bridge` v2** | Dart package + Rust glue (see [ADR-009](./ADR-009-flutter-rust-bridge-for-dart-bindings.md)) |
+| Web / npm | **`wasm-bindgen`** | TypeScript ESM package |
+
+`uniffi-bindgen-react-native` (Mozilla/Filament, 2024) generates TypeScript and
+JSI C++ directly from the same UniFFI definitions — bypassing the older
+UniFFI → Kotlin/Swift → hand-wired RN native module path. Data crosses the
+boundary via shared linear memory (WASM) or shared `Arc<[u8]>` buffers (native).
 
 ## Consequences
 
@@ -45,7 +54,10 @@ memory (WASM) or shared `Arc<[u8]>` buffers (native) to avoid marshalling.
 - One Rust codebase serves native ARM, mobile, and web; native gives full speed,
   `wasm32` gives sandboxing and an OTA-updatable logic path.
 - Wasmtime keeps the entire stack in Rust (no C++ runtime dependency).
-- UniFFI eliminates hand-written, error-prone JNI/Obj-C glue.
+- `uniffi-bindgen-react-native` generates TypeScript + JSI C++ directly —
+  no hand-written JNI, Obj-C, or intermediate Kotlin/Swift bridge layer.
+- `flutter_rust_bridge` v2 gives Flutter a `Stream<String>` token callback
+  and opaque handles without any hand-written `dart:ffi`.
 
 ### Negative
 - Two active targets (native + wasm32) widen the test matrix and require
@@ -62,4 +74,5 @@ memory (WASM) or shared `Arc<[u8]>` buffers (native) to avoid marshalling.
 - PRD: `docs/prd.md` §"Proposed Edge-Native Pipeline" → "Runtime & Target Selection"
 - DDD: [Inference Runtime context](../ddd/bounded-contexts/01-inference-runtime.md)
 - Driven by: [ADR-008](./ADR-008-implement-the-sdk-in-rust-instead-of-c-cpp.md)
+- Extended by: [ADR-009](./ADR-009-flutter-rust-bridge-for-dart-bindings.md) (Flutter bindings)
 - Related: [ADR-002](./ADR-002-candle-as-rust-native-inference-engine.md), [ADR-003](./ADR-003-static-memory-planning-with-zero-allocation-arena.md)

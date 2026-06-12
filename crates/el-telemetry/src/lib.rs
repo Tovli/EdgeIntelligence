@@ -80,10 +80,24 @@ mod tests {
     #[test]
     fn folds_events_into_counters() {
         let mut c = MetricsCollector::new();
-        c.observe(&env(0, DomainEvent::PrefillCompleted { prompt_tokens: 100, kv_len: 100, prefill_tps: 480 }));
+        c.observe(&env(
+            0,
+            DomainEvent::PrefillCompleted {
+                prompt_tokens: 100,
+                kv_len: 100,
+                prefill_tps: 480,
+            },
+        ));
         c.observe(&env(1, DomainEvent::TokenCommitted { kv_len: 101 }));
         c.observe(&env(2, DomainEvent::TokenCommitted { kv_len: 102 }));
-        c.observe(&env(3, DomainEvent::MetricsSampled { decode_tps: 55, ttft_ms: 180, peak_bytes: 600_000_000 }));
+        c.observe(&env(
+            3,
+            DomainEvent::MetricsSampled {
+                decode_tps: 55,
+                ttft_ms: 180,
+                peak_bytes: 600_000_000,
+            },
+        ));
 
         let s = c.snapshot();
         assert_eq!(s.prefill_tps, 480);
@@ -95,8 +109,22 @@ mod tests {
     #[test]
     fn peak_bytes_is_monotonic() {
         let mut c = MetricsCollector::new();
-        c.observe(&env(0, DomainEvent::MemoryPlanCreated { total_bytes: 500, sram_bytes: 100, dram_bytes: 400 }));
-        c.observe(&env(1, DomainEvent::MetricsSampled { decode_tps: 1, ttft_ms: 1, peak_bytes: 200 }));
+        c.observe(&env(
+            0,
+            DomainEvent::MemoryPlanCreated {
+                total_bytes: 500,
+                sram_bytes: 100,
+                dram_bytes: 400,
+            },
+        ));
+        c.observe(&env(
+            1,
+            DomainEvent::MetricsSampled {
+                decode_tps: 1,
+                ttft_ms: 1,
+                peak_bytes: 200,
+            },
+        ));
         assert_eq!(c.snapshot().peak_bytes, 500, "high-water mark only rises");
     }
 }

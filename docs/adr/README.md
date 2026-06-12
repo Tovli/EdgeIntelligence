@@ -16,6 +16,8 @@ the `adr-patterns` namespace.
 | [006](./ADR-006-mandatory-ed25519-model-signature-verification-load-gate.md) | Mandatory ED25519 model-signature verification as a hard load gate | accepted | security, provenance, generic |
 | [007](./ADR-007-content-free-domain-events-privacy-by-construction-telemetry.md) | Content-free domain events for privacy-by-construction telemetry | accepted | privacy, telemetry, generic |
 | [008](./ADR-008-implement-the-sdk-in-rust-instead-of-c-cpp.md) | Implement the SDK in Rust instead of C/C++ | accepted | language, rust, foundational |
+| [009](./ADR-009-flutter-rust-bridge-for-dart-bindings.md) | flutter_rust_bridge v2 for Dart/Flutter bindings | accepted | ffi, flutter, dart, mobile |
+| [010](./ADR-010-unified-llm-provider-trait-with-opt-in-frontier-egress.md) | Unified LlmProvider trait with opt-in frontier LLM cloud egress | accepted | llm, cloud, networking, trait |
 
 ## Decision relationships
 
@@ -25,10 +27,13 @@ flowchart LR
     A008 --> A002[002 Candle engine]
     A008 --> A006[006 ed25519-dalek load gate]
     A001 --> A002
+    A001 --> A009[009 flutter_rust_bridge]
     A002 --> A003[003 Static memory / Shared Kernel]
+    A002 --> A010[010 LlmProvider + el-cloud]
     A004[004 Air-gap + HybridMode] --> A005[005 On-device tiered safety]
     A004 --> A006
     A004 --> A007[007 Content-free telemetry]
+    A004 -. partially amended by .-> A010
     A003 -. budget triggers degradation .-> A005
 ```
 

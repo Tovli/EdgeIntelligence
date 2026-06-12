@@ -75,7 +75,8 @@ impl<E: InferenceEngine> InferenceSession<E> {
     }
 
     fn emit(&mut self, event: DomainEvent) {
-        self.events.push(EventEnvelope::new(self.id, self.step, event));
+        self.events
+            .push(EventEnvelope::new(self.id, self.step, event));
     }
 
     /// Compress (optional) → prefill → build KV. Valid only from `Initialized`.
@@ -159,7 +160,9 @@ impl<E: InferenceEngine> InferenceSession<E> {
             self.output.push(token);
             self.kv.push(self.output.len() as u64);
             self.step += 1;
-            self.emit(DomainEvent::TokenCommitted { kv_len: self.kv.len() });
+            self.emit(DomainEvent::TokenCommitted {
+                kv_len: self.kv.len(),
+            });
 
             if token == eos {
                 break StopReason::Eos;
@@ -267,7 +270,12 @@ mod tests {
 
     #[test]
     fn full_lifecycle_init_prefill_decode_complete_reset() {
-        let mut s = InferenceSession::new(SessionId(1), SessionConfig::default(), NullEngine::new(3, 8), permit());
+        let mut s = InferenceSession::new(
+            SessionId(1),
+            SessionConfig::default(),
+            NullEngine::new(3, 8),
+            permit(),
+        );
         assert_eq!(s.phase(), Phase::Initialized);
 
         let ports = Ports::permissive();
@@ -287,7 +295,9 @@ mod tests {
     #[test]
     fn decode_applies_grammar_before_safety_before_sampling() {
         // logits favour token 0 (10), then 1 (9), then 2 (8), then 3 (7).
-        let engine = FixedEngine { logits: vec![10, 9, 8, 7] };
+        let engine = FixedEngine {
+            logits: vec![10, 9, 8, 7],
+        };
         let mut s = InferenceSession::new(SessionId(2), SessionConfig::default(), engine, permit());
 
         let ports = Ports {
@@ -307,7 +317,12 @@ mod tests {
 
     #[test]
     fn generate_before_load_prompt_is_invalid_phase() {
-        let mut s = InferenceSession::new(SessionId(3), SessionConfig::default(), NullEngine::new(0, 4), permit());
+        let mut s = InferenceSession::new(
+            SessionId(3),
+            SessionConfig::default(),
+            NullEngine::new(0, 4),
+            permit(),
+        );
         let ports = Ports::permissive();
         let err = s.generate(&ports, 4).unwrap_err();
         assert!(matches!(err, EdgeError::InvalidPhase { .. }));
@@ -323,28 +338,50 @@ mod tests {
         }
 
         // Air-gapped by default: even with a relay wired, consulting fails.
-        let mut s = InferenceSession::new(SessionId(4), SessionConfig::default(), NullEngine::new(0, 4), permit());
+        let mut s = InferenceSession::new(
+            SessionId(4),
+            SessionConfig::default(),
+            NullEngine::new(0, 4),
+            permit(),
+        );
         let ports = Ports {
             relay: Some(Box::new(EchoRelay)),
             ..Ports::permissive()
         };
-        assert_eq!(s.consult_relay(&ports, &[1, 2]).unwrap_err(), EdgeError::AirGapViolation);
+        assert_eq!(
+            s.consult_relay(&ports, &[1, 2]).unwrap_err(),
+            EdgeError::AirGapViolation
+        );
 
         // Opt in → allowed.
-        let cfg = SessionConfig { hybrid_mode: true, ..SessionConfig::default() };
+        let cfg = SessionConfig {
+            hybrid_mode: true,
+            ..SessionConfig::default()
+        };
         let mut s2 = InferenceSession::new(SessionId(5), cfg, NullEngine::new(0, 4), permit());
         assert_eq!(s2.consult_relay(&ports, &[1, 2]).unwrap(), vec![1, 2]);
 
         // Opted in but no relay wired → still air-gapped.
         let no_relay = Ports::permissive();
-        assert_eq!(s2.consult_relay(&no_relay, &[1]).unwrap_err(), EdgeError::AirGapViolation);
+        assert_eq!(
+            s2.consult_relay(&no_relay, &[1]).unwrap_err(),
+            EdgeError::AirGapViolation
+        );
     }
 
     #[test]
     fn first_events_are_init_then_model_loaded() {
-        let mut s = InferenceSession::new(SessionId(6), SessionConfig::default(), NullEngine::new(0, 4), permit());
+        let mut s = InferenceSession::new(
+            SessionId(6),
+            SessionConfig::default(),
+            NullEngine::new(0, 4),
+            permit(),
+        );
         let evs = s.drain_events();
-        assert!(matches!(evs[0].event, DomainEvent::SessionInitialized { .. }));
+        assert!(matches!(
+            evs[0].event,
+            DomainEvent::SessionInitialized { .. }
+        ));
         assert!(matches!(evs[1].event, DomainEvent::ModelLoaded { .. }));
     }
 }

@@ -105,7 +105,10 @@ mod tests {
 
     #[test]
     fn unverified_cannot_load() {
-        assert_eq!(artifact().ensure_loadable().unwrap_err(), EdgeError::UnverifiedModel);
+        assert_eq!(
+            artifact().ensure_loadable().unwrap_err(),
+            EdgeError::UnverifiedModel
+        );
     }
 
     #[test]
@@ -113,7 +116,10 @@ mod tests {
         let mut a = artifact();
         a.verify(&Stub(false), b"weights", b"badsig", 7);
         assert_eq!(a.status, VerificationStatus::Rejected);
-        assert_eq!(a.ensure_loadable().unwrap_err(), EdgeError::SignatureRejected);
+        assert_eq!(
+            a.ensure_loadable().unwrap_err(),
+            EdgeError::SignatureRejected
+        );
     }
 
     #[test]

@@ -40,6 +40,10 @@ mod tests {
     fn defaults_are_air_gapped_and_conservative() {
         let c = SessionConfig::default();
         assert!(!c.hybrid_mode, "must be air-gapped by default (ADR-004)");
-        assert_eq!(c.speculation, SpeculationMode::Off, "speculation off by default");
+        assert_eq!(
+            c.speculation,
+            SpeculationMode::Off,
+            "speculation off by default"
+        );
     }
 }

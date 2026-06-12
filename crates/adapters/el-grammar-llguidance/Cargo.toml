@@ -1,16 +1,24 @@
-# EXCLUDED from the workspace — needs crates.io (llguidance). ADR-004 grammar
-# follow-up. Activate inside this directory once network is available.
+# `el-grammar-llguidance` — real grammar masker over llguidance (ADR-004).
+# Excluded from offline workspace: depends on llguidance + toktrie_hf_tokenizers
+# (require crates.io). Activate by adding to workspace members.
 [package]
 name = "el-grammar-llguidance"
-description = "GrammarMasker over llguidance — JSON-schema constrained decoding (ADR-004)."
+description = "GrammarMasker over llguidance with HuggingFace tokenizer bridge (ADR-004)."
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
+# Standalone: this crate is workspace-excluded; the empty table stops cargo's
+# workspace walk-up so `--manifest-path` builds work from any checkout layout.
+[workspace]
+
 [dependencies]
 el-core = { path = "../../el-core" }
 el-runtime = { path = "../../el-runtime" }
-llguidance = "0.7"
+llguidance = "1.7"
+toktrie_hf_tokenizers = "1.7"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+serde_json = "1"
 
 [lints.rust]
 unsafe_code = "forbid"

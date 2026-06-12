@@ -1,6 +1,6 @@
 # ADR-004: Air-gapped by default with opt-in local-network HybridMode
 
-- **Status**: accepted
+- **Status**: accepted — partially amended by [ADR-010](./ADR-010-unified-llm-provider-trait-with-opt-in-frontier-egress.md)
 - **Date**: 2026-06-10
 - **Deciders**:
 - **Tags**: privacy, networking, compliance, invariant
@@ -48,4 +48,7 @@ auditability.
 ## Links
 - PRD: `docs/prd.md` Executive Summary, §"Air-Gap Compliance", §"Privacy"
 - DDD: [Inference Runtime](../ddd/bounded-contexts/01-inference-runtime.md), [Telemetry & Privacy](../ddd/bounded-contexts/09-telemetry-privacy.md), [context-map](../ddd/context-map.md)
+- Partially amended by: [ADR-010](./ADR-010-unified-llm-provider-trait-with-opt-in-frontier-egress.md) — adds a
+  second opt-in egress for cloud LLM APIs (distinct from `HybridRelayPort`);
+  the "LAN relay only" restriction applies to the default path only
 - Related: [ADR-005](./ADR-005-on-device-only-tiered-decoder-time-safety.md), [ADR-006](./ADR-006-mandatory-ed25519-model-signature-verification-load-gate.md), [ADR-007](./ADR-007-content-free-domain-events-privacy-by-construction-telemetry.md)

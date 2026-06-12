@@ -24,7 +24,11 @@ impl Ed25519Verifier {
     }
 
     /// Register a trusted 32-byte public key under `id`.
-    pub fn register(&mut self, id: u32, key_bytes: [u8; 32]) -> Result<(), ed25519_dalek::SignatureError> {
+    pub fn register(
+        &mut self,
+        id: u32,
+        key_bytes: [u8; 32],
+    ) -> Result<(), ed25519_dalek::SignatureError> {
         let vk = VerifyingKey::from_bytes(&key_bytes)?;
         self.keys.insert(id, vk);
         Ok(())
@@ -65,10 +69,22 @@ mod tests {
         let mut verifier = Ed25519Verifier::new();
         verifier.register(1, sk.verifying_key().to_bytes()).unwrap();
 
-        assert!(verifier.verify(weights, &sig, 1), "genuine signature must verify");
-        assert!(!verifier.verify(b"tampered-weights", &sig, 1), "tampered bytes must fail");
-        assert!(!verifier.verify(weights, &sig, 999), "unknown key id must fail");
-        assert!(!verifier.verify(weights, b"short-sig", 1), "malformed signature must fail");
+        assert!(
+            verifier.verify(weights, &sig, 1),
+            "genuine signature must verify"
+        );
+        assert!(
+            !verifier.verify(b"tampered-weights", &sig, 1),
+            "tampered bytes must fail"
+        );
+        assert!(
+            !verifier.verify(weights, &sig, 999),
+            "unknown key id must fail"
+        );
+        assert!(
+            !verifier.verify(weights, b"short-sig", 1),
+            "malformed signature must fail"
+        );
     }
 
     #[test]
@@ -81,7 +97,10 @@ mod tests {
 
         let mut art = ModelArtifact::new(ModelId(1), ModelVersion::new(0, 1, 0), ModelFormat::Gguf);
         art.verify(&verifier, weights, &sig, 2);
-        assert!(art.ensure_loadable().is_ok(), "verified artifact yields a LoadPermit");
+        assert!(
+            art.ensure_loadable().is_ok(),
+            "verified artifact yields a LoadPermit"
+        );
     }
 
     #[test]
@@ -93,10 +112,15 @@ mod tests {
         let forged = attacker.sign(weights).to_bytes();
 
         let mut verifier = Ed25519Verifier::new();
-        verifier.register(3, real.verifying_key().to_bytes()).unwrap();
+        verifier
+            .register(3, real.verifying_key().to_bytes())
+            .unwrap();
 
         let mut art = ModelArtifact::new(ModelId(1), ModelVersion::new(0, 1, 0), ModelFormat::Gguf);
         art.verify(&verifier, weights, &forged, 3);
-        assert!(art.ensure_loadable().is_err(), "forged signature must block loading");
+        assert!(
+            art.ensure_loadable().is_err(),
+            "forged signature must block loading"
+        );
     }
 }

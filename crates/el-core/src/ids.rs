@@ -20,7 +20,11 @@ pub struct ModelVersion {
 
 impl ModelVersion {
     pub const fn new(major: u16, minor: u16, patch: u16) -> Self {
-        Self { major, minor, patch }
+        Self {
+            major,
+            minor,
+            patch,
+        }
     }
 }
 

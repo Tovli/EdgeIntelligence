@@ -26,7 +26,10 @@ pub struct BufferLifetime {
 impl BufferLifetime {
     pub fn new(first_use: u32, last_use: u32) -> Self {
         debug_assert!(first_use <= last_use);
-        Self { first_use, last_use }
+        Self {
+            first_use,
+            last_use,
+        }
     }
 
     /// Closed-interval overlap.
@@ -189,7 +192,11 @@ mod tests {
             spec(2, 100, MemoryTier::Dram, 3, 5),
         ];
         let plan = StaticMemoryPlanner::plan(&t, 10_000).unwrap();
-        assert_eq!(plan.dram_bytes(), 100, "disjoint lifetimes must reuse space");
+        assert_eq!(
+            plan.dram_bytes(),
+            100,
+            "disjoint lifetimes must reuse space"
+        );
         assert_eq!(
             plan.placement(1).unwrap().offset,
             plan.placement(2).unwrap().offset

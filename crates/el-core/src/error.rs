@@ -22,21 +22,35 @@ pub enum EdgeError {
     AirGapViolation,
     /// Engine/adapter failure (message is a static descriptor, not user data).
     Engine(&'static str),
+    /// Cloud request failed (ADR-010). Carries a heap-allocated message so
+    /// dynamic error strings (HTTP status, URL) can be included without leaking.
+    CloudRequest(Box<str>),
+    /// Grammar constraint error (ADR-004). Heap-allocated for the same reason.
+    Grammar(Box<str>),
 }
 
 impl fmt::Display for EdgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            EdgeError::UnverifiedModel => write!(f, "model is not verified; refusing to load (ADR-006)"),
+            EdgeError::UnverifiedModel => {
+                write!(f, "model is not verified; refusing to load (ADR-006)")
+            }
             EdgeError::SignatureRejected => write!(f, "model signature rejected (ADR-006)"),
             EdgeError::InvalidPhase { expected, found } => {
                 write!(f, "invalid phase: expected {expected}, found {found}")
             }
             EdgeError::MemoryBudgetExceeded { requested, budget } => {
-                write!(f, "memory plan needs {requested} bytes > budget {budget} (ADR-003)")
+                write!(
+                    f,
+                    "memory plan needs {requested} bytes > budget {budget} (ADR-003)"
+                )
             }
-            EdgeError::AirGapViolation => write!(f, "network egress attempted while air-gapped (ADR-004)"),
+            EdgeError::AirGapViolation => {
+                write!(f, "network egress attempted while air-gapped (ADR-004)")
+            }
             EdgeError::Engine(msg) => write!(f, "engine error: {msg}"),
+            EdgeError::CloudRequest(msg) => write!(f, "cloud request: {msg}"),
+            EdgeError::Grammar(msg) => write!(f, "grammar constraint: {msg}"),
         }
     }
 }

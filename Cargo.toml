@@ -2,11 +2,8 @@
 # Realizes the ADRs in docs/adr (see docs/adr/README.md). Per ADR-008 the entire
 # SDK is Rust with no C/C++ in our code or default dependency set.
 #
-# The MEMBER crates below are pure-Rust (std-only) and build/test offline on the
-# host. Integration adapters that pull external crates (Candle, llguidance,
-# ed25519-dalek) or need cross-targets (wasm32/aarch64-mobile) live under
-# crates/adapters/ and are EXCLUDED until network + targets are available — so a
-# default `cargo build` always succeeds. See docs/adr ADR-002.
+# The MEMBER crates below build and test on the host. Cross-target builds
+# (aarch64-android/ios, wasm32) run separately via `make build-android` etc.
 [workspace]
 resolver = "2"
 members = [
@@ -18,20 +15,19 @@ members = [
     "crates/el-runtime",
     # Increment 4: pure-Rust DFA token masker (Grammar Constraint context).
     "crates/el-grammar",
-    # Increment 2: crates.io verified reachable, so the small/complete ed25519
-    # adapter is now a first-class member (ADR-006).
+    # Increment 2: crates.io verified reachable — ed25519 adapter (ADR-006).
     "crates/adapters/el-provenance-ed25519",
     # Increment 3: real Candle CPU forward verified on host (ADR-002).
     "crates/adapters/el-engine-candle",
     # Increment 7: opt-in frontier LLM cloud backend (ADR-010).
     "crates/adapters/el-cloud",
+    # Increment 9: FFI binding surfaces — pure-Rust deps compile on host;
+    # cross-target builds run via `make build-android / build-ios / build-wasm`.
+    "crates/adapters/el-ffi",
 ]
 exclude = [
-    # Excluded: need crates.io (llguidance/toktrie) + native tokenizer build deps.
+    # Excluded: needs crates.io (llguidance/toktrie) + native tokenizer build deps.
     "crates/adapters/el-grammar-llguidance",
-    # Excluded: needs crates.io (uniffi/flutter_rust_bridge/wasm-bindgen) +
-    # cross-targets (wasm32/aarch64-mobile). ADR-001/009.
-    "crates/adapters/el-ffi",
 ]
 
 [workspace.package]

@@ -1,0 +1,111 @@
+name: Bindings & Mobile Cross-Compile
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'crates/adapters/el-ffi/**'
+      - 'crates/el-core/**'
+      - 'crates/el-runtime/**'
+      - 'crates/adapters/el-engine-candle/**'
+      - '.cargo/config.toml'
+      - 'Makefile'
+      - '.github/workflows/bindings.yml'
+  pull_request:
+    paths:
+      - 'crates/adapters/el-ffi/**'
+      - '.github/workflows/bindings.yml'
+
+jobs:
+  # ── Host: compile + test el-ffi on the native target ─────────────────────
+  host:
+    name: Host compile & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test el-ffi (host target)
+        run: cargo test -p el-ffi
+
+  # ── Android: aarch64-linux-android cross-compile ──────────────────────────
+  android:
+    name: Android aarch64 cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+      - name: Cross-compile el-ffi → aarch64-linux-android
+        env:
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+        run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target aarch64-linux-android --release
+
+      - name: Install uniffi-bindgen-react-native
+        run: cargo install uniffi-bindgen-react-native --locked
+      - name: Codegen — React Native (TypeScript + JSI)
+        env:
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+        run: make codegen-rn
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rn-bindings
+          path: out/rn/
+
+  # ── iOS: aarch64-apple-ios cross-compile ──────────────────────────────────
+  ios:
+    name: iOS aarch64 cross-compile
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+      - name: Cross-compile el-ffi → aarch64-apple-ios
+        run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target aarch64-apple-ios --release
+
+  # ── Web: wasm32-unknown-unknown + wasm-pack ───────────────────────────────
+  wasm:
+    name: Web (wasm32 + wasm-bindgen codegen)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+      - name: Build WASM ESM package
+        run: make build-wasm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-bindings
+          path: out/web/
+
+  # ── Flutter: Dart binding codegen ────────────────────────────────────────
+  flutter:
+    name: Flutter/Dart codegen
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install flutter_rust_bridge_codegen
+        run: cargo install flutter_rust_bridge_codegen --locked
+      - name: Codegen — Flutter/Dart
+        run: make codegen-flutter
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flutter-bindings
+          path: out/flutter/

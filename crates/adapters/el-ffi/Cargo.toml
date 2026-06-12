@@ -1,16 +1,10 @@
-# EXCLUDED from the workspace — host bindings need crates.io and cross-targets.
-# ADR-001 / ADR-009 / ADR-010 bindings.
-# Activate by adding to workspace members once network + toolchains are available.
+# ADR-001 / ADR-009 / ADR-010 host bindings.
 [package]
 name = "el-ffi"
 description = "Host bindings: uniffi-bindgen-react-native (RN), flutter_rust_bridge v2 (Flutter), wasm-bindgen (web) — ADR-001/009."
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-
-# Standalone: this crate is workspace-excluded; the empty table stops cargo's
-# workspace walk-up so `--manifest-path` builds work from any checkout layout.
-[workspace]
 
 [lib]
 crate-type = ["lib", "cdylib", "staticlib"]
@@ -20,7 +14,7 @@ el-core = { path = "../../el-core" }
 el-runtime = { path = "../../el-runtime" }
 
 # Native path: uniffi-bindgen-react-native uses UniFFI proc-macros.
-# flutter_rust_bridge v2 also works with plain Rust — codegen runs externally.
+# flutter_rust_bridge v2 works with plain Rust — codegen runs externally.
 # el-engine-candle and el-cloud wire the real LlmProvider backends (ADR-010).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 uniffi = { version = "0.28", features = ["tokio"] }
@@ -32,3 +26,8 @@ el-provenance = { path = "../../el-provenance" }
 # WASM path: wasm-bindgen for the npm/web surface.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
+
+[lints.rust]
+# flutter_rust_bridge uses `frb_expand` as an internal cfg gate; allow it so
+# the `#[cfg_attr(..., frb(opaque))]` attribute doesn't emit a warning.
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(frb_expand)'] }

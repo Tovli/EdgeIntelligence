@@ -33,6 +33,9 @@ use el_core::{ChatMessage, ChatRequest, ChatToken, LlmProvider};
 #[cfg(not(target_arch = "wasm32"))]
 uniffi::setup_scaffolding!("el_ffi");
 
+#[cfg(not(target_arch = "wasm32"))]
+use flutter_rust_bridge::frb;
+
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
@@ -88,11 +91,13 @@ pub trait StreamHandler: Send + Sync {
 
 /// The flat FFI-friendly facade (ADR-001, ADR-009, ADR-010).
 ///
-/// The struct needs **two** separate annotations:
-/// - `uniffi::Object` on native → opaque UniFFI/FRB handle
-/// - `wasm_bindgen` on wasm32 → satisfies `IntoWasmAbi`/`WasmDescribe` so
+/// Annotated for all three binding surfaces:
+/// - `uniffi::Object` (native) → opaque UniFFI / React Native handle
+/// - `frb(opaque)` (native) → opaque Flutter/Dart handle via FRB v2
+/// - `wasm_bindgen` (wasm32) → satisfies `IntoWasmAbi`/`WasmDescribe` so
 ///   that `#[wasm_bindgen] impl EdgeLlm { ... }` compiles
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Object))]
+#[cfg_attr(not(target_arch = "wasm32"), frb(opaque))]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct EdgeLlm {
     provider: Box<dyn LlmProvider>,
@@ -109,18 +114,22 @@ pub struct EdgeLlm {
 impl EdgeLlm {
     /// Construct with the local Candle engine (air-gapped, ADR-002/004).
     ///
-    /// **Development note**: until production GGUF/safetensors loading is
-    /// wired (ADR-002 follow-up), `model_uri` is ignored and a deterministic
-    /// toy Candle model is used. The toy model exercises the full binding
-    /// layer — LocalLlmProvider → InferenceSession → CandleEngine — but
-    /// generates gibberish tokens. Real GGUF loading will replace this
-    /// once `CandleEngine::load()` is implemented and the provenance gate
-    /// reads a real ed25519 signature from the model file.
+    /// If `model_uri` is non-empty, loads the GGUF at that path via
+    /// `CandleEngine::from_path` (consumer-supplied model, ADR-002).
+    /// Pass an empty string to use a deterministic toy model for development
+    /// and testing — the toy generates gibberish but exercises the full
+    /// binding layer end-to-end.
     ///
-    /// The permissive verifier used here is intentional for this stage: it
-    /// allows the binding layer to be tested without a signed model artifact.
+    /// Returns `Err(SdkError)` if `model_uri` is non-empty but the file
+    /// cannot be parsed (missing, malformed GGUF, incompatible tensor shapes).
+    /// An empty `model_uri` never fails.
+    ///
+    /// The permissive signature verifier used here is intentional: it lets the
+    /// binding layer be exercised without a signed model artifact. A production
+    /// deployment should substitute a real `SignatureVerifier` backed by the
+    /// platform keystore.
     #[cfg_attr(not(target_arch = "wasm32"), uniffi::constructor)]
-    pub fn local(_model_uri: String) -> Self {
+    pub fn local(model_uri: String) -> Result<Self, SdkError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             use el_core::{ModelFormat, ModelId, ModelVersion};
@@ -132,26 +141,36 @@ impl EdgeLlm {
                     true
                 }
             }
+
             let mut art =
                 ModelArtifact::new(ModelId(1), ModelVersion::new(0, 1, 0), ModelFormat::Gguf);
             art.verify(&PermissiveVerifier, b"placeholder", b"sig", 0);
-            let permit = art
-                .ensure_loadable()
-                .expect("permissive verify never fails");
+            let permit = art.ensure_loadable().map_err(SdkError::from)?;
 
-            let provider = el_engine_candle::LocalLlmProvider::toy(256, 64, 255, permit)
-                .expect("toy model always builds");
+            let provider: Box<dyn LlmProvider> = if model_uri.is_empty() {
+                // No path — toy model for development/tests.
+                Box::new(
+                    el_engine_candle::LocalLlmProvider::toy(256, 64, 255, permit)
+                        .map_err(SdkError::from)?,
+                )
+            } else {
+                // Consumer-supplied GGUF path.
+                Box::new(
+                    el_engine_candle::LocalLlmProvider::from_path(&model_uri, 1, permit)
+                        .map_err(SdkError::from)?,
+                )
+            };
 
-            Self {
-                provider: Box::new(provider),
+            Ok(Self {
+                provider,
                 default_model: "local".into(),
-            }
+            })
         }
         #[cfg(target_arch = "wasm32")]
-        Self {
+        Ok(Self {
             provider: Box::new(EchoProvider),
             default_model: "local".into(),
-        }
+        })
     }
 
     /// Construct with a frontier cloud backend (opt-in, ADR-010).
@@ -255,8 +274,8 @@ impl EdgeLlm {
 #[wasm_bindgen]
 impl EdgeLlm {
     #[wasm_bindgen(constructor)]
-    pub fn new_local(model_uri: String) -> EdgeLlm {
-        EdgeLlm::local(model_uri)
+    pub fn new_local(model_uri: String) -> Result<EdgeLlm, JsValue> {
+        EdgeLlm::local(model_uri).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Blocking chat; throws a JS Error on provider failure.
@@ -367,8 +386,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_ask_returns_non_empty_response() {
-        let sdk = EdgeLlm::local("".into());
+    fn local_toy_ask_returns_non_empty_response() {
+        let sdk = EdgeLlm::local("".into()).expect("toy model never fails");
         let response = sdk
             .ask("hello".into())
             .expect("local toy model should not error");
@@ -377,7 +396,7 @@ mod tests {
 
     #[test]
     fn stream_ends_with_final_and_has_content() {
-        let sdk = EdgeLlm::local("".into());
+        let sdk = EdgeLlm::local("".into()).expect("toy model never fails");
         let mut parts: Vec<String> = Vec::new();
         sdk.ask_stream("hi".into(), |t| parts.push(t))
             .expect("local toy model stream should not error");
@@ -386,20 +405,21 @@ mod tests {
 
     #[test]
     fn ask_error_is_distinguishable_from_content() {
-        // EchoProvider (the wasm32 / test path) always succeeds. This test
-        // verifies the Result shape: an Ok variant carries actual text, not
-        // the string "error: …" that the old implementation produced.
-        let sdk = EdgeLlm::local("".into());
+        let sdk = EdgeLlm::local("".into()).expect("toy model never fails");
         let r = sdk.ask("ping".into());
+        assert!(r.is_ok(), "toy local provider must not error on a plain prompt");
         assert!(
-            r.is_ok(),
-            "toy local provider must not error on a plain prompt"
-        );
-        let content = r.unwrap();
-        // The content must not start with "error:" (the old silent-failure marker)
-        assert!(
-            !content.starts_with("error:"),
+            !r.unwrap().starts_with("error:"),
             "response must not look like a swallowed error"
+        );
+    }
+
+    #[test]
+    fn local_missing_gguf_path_returns_sdk_error() {
+        let r = EdgeLlm::local("/nonexistent/model.gguf".into());
+        assert!(
+            matches!(r, Err(SdkError::ProviderError { .. })),
+            "non-empty path that doesn't exist must return SdkError"
         );
     }
 }

@@ -1,13 +1,16 @@
 # ARM target-features per ADR-002 / PRD §"Model Format & Quantization".
-# These only take effect when building for the named targets (installed via
-# `rustup target add aarch64-linux-android aarch64-apple-ios wasm32-wasip1`).
-# They are inert for the host (x86_64) build used to verify the foundation.
+# Inert for the host build; activate by running `rustup target add <target>`.
 
 [target.aarch64-linux-android]
 rustflags = ["-C", "target-feature=+neon,+dotprod,+i8mm"]
+# Linker: set CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER to the NDK clang path.
+# In CI this is set by nttld/setup-ndk; locally:
+#   export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=\
+#     $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/<host-os>-x86_64/bin/aarch64-linux-android35-clang
 
 [target.aarch64-apple-ios]
 rustflags = ["-C", "target-feature=+neon,+dotprod,+i8mm"]
+# Linker: uses the system Xcode linker automatically when targeting ios.
 
 # wasm32 portable/sandboxed path (run via Wasmtime — ADR-001).
 [target.wasm32-wasip1]

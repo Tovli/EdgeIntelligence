@@ -109,8 +109,8 @@ jobs:
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
         run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target aarch64-linux-android --release
       - name: Install uniffi-bindgen-react-native
-        run: cargo install uniffi-bindgen-react-native --locked
-      - name: Codegen — React Native (TypeScript + JSI + Turbo Module)
+        run: npm install --global uniffi-bindgen-react-native@0.31.0-3
+      - name: Codegen — React Native (TypeScript + JSI)
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
@@ -235,7 +235,7 @@ jobs:
               exports: {
                 ".": {
                   browser: "./src/web/el_ffi.js",
-                  "react-native": "./src/rn/EdgeLlm.ts"
+                  "react-native": "./src/rn/el_ffi.ts"
                 }
               },
               types: "./src/web/el_ffi.d.ts",

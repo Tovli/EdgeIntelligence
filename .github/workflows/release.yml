@@ -1,0 +1,360 @@
+name: Release — crates.io · npm · pub.dev
+
+# Triggered by an explicit semver tag pushed to the repository.
+# Workflow: verify → build artefacts (parallel) → assemble packages → publish (serialized: crates → npm → pub).
+# Prerequisites before tagging:
+#   1. cargo install cargo-edit   # one-time local install
+#   2. cargo set-version --workspace <ver>   # bumps all Cargo.toml versions at once
+#   3. git commit -am "chore: release <ver>"
+#   4. git tag v<ver> && git push --tags
+# Required secrets: CARGO_REGISTRY_TOKEN, NPM_TOKEN, PUB_CREDENTIALS (JSON).
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Stage 1: Verify ────────────────────────────────────────────────────────
+  verify:
+    name: Verify (tests · fmt · version check)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Extract semver from tag
+        id: tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $VERSION"
+
+      # Fail fast: Cargo.toml version must already match the tag.
+      # Fix: cargo set-version --workspace <ver>, commit, then re-tag.
+      - name: Assert Cargo workspace version matches tag
+        run: |
+          CARGO_VER=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "el-core") | .version')
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          if [ "$CARGO_VER" != "$TAG_VER" ]; then
+            echo "ERROR: Cargo workspace version ($CARGO_VER) != tag ($TAG_VER)"
+            echo "Run: cargo set-version --workspace $TAG_VER"
+            echo "Then commit, and push a corrected tag."
+            exit 1
+          fi
+
+      # All internal dep version requirements live exclusively in [workspace.dependencies].
+      # Verify every one of them matches the tag before touching any registry.
+      - name: Assert all internal dep versions match tag
+        env:
+          TAG_VER: ${{ steps.tag.outputs.version }}
+        run: |
+          python3 << 'PYEOF'
+          import re, os, sys
+          tag = os.environ['TAG_VER']
+          with open('Cargo.toml') as f:
+              text = f.read()
+          m = re.search(r'\[workspace\.dependencies\](.*?)(?=\n\[|\Z)', text, re.DOTALL)
+          if not m:
+              sys.exit('ERROR: [workspace.dependencies] section not found in Cargo.toml')
+          found = re.findall(r'version\s*=\s*"([^"]+)"', m.group(1))
+          bad = [v for v in found if v != tag]
+          if bad:
+              print(f'ERROR: workspace.dependencies has stale version(s) {bad!r}, expected {tag!r}')
+              print(f'Fix: cargo set-version --workspace {tag}')
+              sys.exit(1)
+          print(f'OK: all {len(found)} internal dep versions in [workspace.dependencies] = "{tag}"')
+          PYEOF
+
+      - name: cargo test --locked --workspace
+        run: cargo test --locked --workspace
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+  # ── Stage 2: Build artefacts ───────────────────────────────────────────────
+
+  build-android:
+    name: Build Android (aarch64) + RN codegen
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+      - name: Cross-compile el-ffi → aarch64-linux-android
+        env:
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+          CC_aarch64_linux_android: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+        run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target aarch64-linux-android --release
+      - name: Install uniffi-bindgen-react-native
+        run: cargo install uniffi-bindgen-react-native --locked
+      - name: Codegen — React Native (TypeScript + JSI + Turbo Module)
+        env:
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+          CC_aarch64_linux_android: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+        run: make codegen-rn
+      - name: Upload RN bindings (TypeScript + JSI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rn-bindings
+          path: out/rn/
+      - name: Upload Android native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-lib
+          path: target/aarch64-linux-android/release/libel_ffi.so
+
+  build-ios:
+    name: Build iOS (aarch64)
+    needs: verify
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+      - name: Cross-compile el-ffi → aarch64-apple-ios
+        run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target aarch64-apple-ios --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-lib
+          path: target/aarch64-apple-ios/release/libel_ffi.a
+
+  build-wasm:
+    name: Build WASM (web surface)
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+      - name: Build WASM ESM package
+        run: make build-wasm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-output
+          path: out/web/
+
+  build-flutter:
+    name: Flutter/Dart codegen
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: dart-lang/setup-dart@v1
+      - name: Install flutter_rust_bridge_codegen
+        run: cargo install flutter_rust_bridge_codegen --version 2.12.0 --locked
+      - name: Codegen — Flutter/Dart
+        run: make codegen-flutter
+      - name: Stamp pub.dev version from tag
+        run: |
+          sed -i "s/^version: .*/version: $VERSION/" pubspec.yaml
+        working-directory: out/flutter
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flutter-bindings
+          path: out/flutter/
+
+  # ── Stage 2b: Assemble distribution packages ──────────────────────────────
+  # Both assembly jobs wait for the native build jobs so each package contains
+  # real native libraries alongside the generated language bindings.
+
+  assemble-npm:
+    name: Assemble @edge-intelligence/sdk npm package
+    needs: [verify, build-android, build-ios, build-wasm]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm-output
+          path: assembly/src/web/
+      - uses: actions/download-artifact@v4
+        with:
+          name: rn-bindings
+          path: assembly/src/rn/
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-lib
+          path: assembly/android/jniLibs/arm64-v8a/
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-lib
+          path: assembly/ios/
+      - name: Write package.json
+        run: |
+          jq -n \
+            --arg name "@edge-intelligence/sdk" \
+            --arg version "$VERSION" \
+            --arg desc "Edge-native LLM inference SDK — Web (WASM) + React Native" \
+            '{
+              name: $name,
+              version: $version,
+              description: $desc,
+              exports: {
+                ".": {
+                  browser: "./src/web/el_ffi.js",
+                  "react-native": "./src/rn/EdgeLlm.ts"
+                }
+              },
+              types: "./src/web/el_ffi.d.ts",
+              files: ["src/", "android/", "ios/"],
+              license: "Apache-2.0"
+            }' > assembly/package.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: assembly/
+
+  assemble-flutter:
+    name: Assemble edge_intelligence pub.dev package
+    needs: [verify, build-android, build-ios, build-flutter]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: flutter-bindings
+          path: assembly/
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-lib
+          path: assembly/android/src/main/jniLibs/arm64-v8a/
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-lib
+          path: assembly/ios/
+      - uses: dart-lang/setup-dart@v1
+      - name: dart pub publish --dry-run (validation gate)
+        run: dart pub publish --dry-run
+        working-directory: assembly/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pub-package
+          path: assembly/
+
+  # ── Stage 3: Publish (serialized: crates → npm → pub) ─────────────────────
+  # crates.io is immutable, so it must be the LAST thing validated before the
+  # first publish — gate it on BOTH assembly jobs (which include the pub.dev
+  # dry-run and npm package assembly). Each registry then gates on the previous
+  # one: if crates fails, npm and pub are not touched; if npm fails, pub is not.
+  # publish-crates → assemble-{npm,flutter} transitively covers all build jobs.
+
+  publish-crates:
+    name: Publish → crates.io
+    needs: [verify, assemble-npm, assemble-flutter]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # --no-verify: tests already passed in Stage 1.
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          UA="edge-intelligence-release/ci"
+
+          # Poll crates.io until $1@$VERSION appears in the index (max 6 min).
+          wait_indexed() {
+            local crate="$1"
+            local url="https://crates.io/api/v1/crates/${crate}/${VERSION}"
+            echo "  Waiting for ${crate} ${VERSION} in crates.io index..."
+            for i in $(seq 1 24); do
+              curl -sf -A "$UA" "$url" | jq -e '.version.num' >/dev/null 2>&1 \
+                && { echo "  ✓ ${crate} ${VERSION} indexed"; return 0; }
+              echo "    not yet (${i}/24), retrying in 15s..."
+              sleep 15
+            done
+            echo "ERROR: ${crate} ${VERSION} not indexed after 6 minutes"
+            return 1
+          }
+
+          pub() { cargo publish -p "$1" --no-verify; wait_indexed "$1"; }
+
+          # Tier 0 — no internal deps
+          pub el-core
+          pub el-memory
+          pub el-telemetry
+          pub el-provenance
+          pub el-safety
+
+          # Tier 1 — depends on tier 0
+          pub el-runtime
+          pub el-grammar
+
+          # Tier 2 — adapters
+          pub el-provenance-ed25519
+          pub el-engine-candle
+          pub el-cloud
+
+          # Tier 3 — FFI facade (depends on all adapters)
+          pub el-ffi
+
+  publish-npm:
+    name: Publish → npmjs.com
+    needs: [publish-crates, assemble-npm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: npm-package/
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Publish @edge-intelligence/sdk
+        run: npm publish npm-package/ --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-pub:
+    name: Publish → pub.dev
+    needs: [publish-npm, assemble-flutter]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pub-package
+          path: pub-package/
+      - uses: dart-lang/setup-dart@v1
+      - name: Configure pub.dev credentials
+        run: |
+          mkdir -p ~/.config/dart
+          echo '${{ secrets.PUB_CREDENTIALS }}' > ~/.config/dart/pub-credentials.json
+      - name: Publish edge_intelligence
+        run: dart pub publish --force
+        working-directory: pub-package/

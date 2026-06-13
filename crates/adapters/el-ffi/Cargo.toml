@@ -2,16 +2,16 @@
 [package]
 name = "el-ffi"
 description = "Host bindings: uniffi-bindgen-react-native (RN), flutter_rust_bridge v2 (Flutter), wasm-bindgen (web) — ADR-001/009."
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [lib]
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
-el-core = { path = "../../el-core" }
-el-runtime = { path = "../../el-runtime" }
+el-core = { workspace = true }
+el-runtime = { workspace = true }
 
 # Native path: uniffi-bindgen-react-native uses UniFFI proc-macros.
 # flutter_rust_bridge v2 works with plain Rust — codegen runs externally.
@@ -19,9 +19,9 @@ el-runtime = { path = "../../el-runtime" }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 uniffi = { version = "0.28", features = ["tokio"] }
 flutter_rust_bridge = "=2.12.0"
-el-engine-candle = { path = "../el-engine-candle" }
-el-cloud = { path = "../el-cloud" }
-el-provenance = { path = "../../el-provenance" }
+el-engine-candle = { workspace = true }
+el-cloud = { workspace = true }
+el-provenance = { workspace = true }
 
 # WASM path: wasm-bindgen for the npm/web surface.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

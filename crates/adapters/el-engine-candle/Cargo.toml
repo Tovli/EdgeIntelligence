@@ -4,14 +4,14 @@
 [package]
 name = "el-engine-candle"
 description = "RuntimeAcl: InferenceEngine over Candle — real CPU forward (ADR-002)."
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-el-core = { path = "../../el-core" }
-el-provenance = { path = "../../el-provenance" }
-el-runtime = { path = "../../el-runtime" }
+el-core = { workspace = true }
+el-provenance = { workspace = true }
+el-runtime = { workspace = true }
 candle-core = "0.8"
 
 [features]

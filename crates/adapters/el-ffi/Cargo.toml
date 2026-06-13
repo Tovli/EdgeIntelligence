@@ -18,7 +18,7 @@ el-runtime = { path = "../../el-runtime" }
 # el-engine-candle and el-cloud wire the real LlmProvider backends (ADR-010).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 uniffi = { version = "0.28", features = ["tokio"] }
-flutter_rust_bridge = "2"
+flutter_rust_bridge = "=2.12.0"
 el-engine-candle = { path = "../el-engine-candle" }
 el-cloud = { path = "../el-cloud" }
 el-provenance = { path = "../../el-provenance" }

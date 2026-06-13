@@ -2,5 +2,7 @@
 ruvector.db
 .claude-flow/
 target/
+out/
+crates/adapters/el-ffi/src/frb_generated.rs
 # Claude Code local state (worktrees, settings.local.json)
 .claude/

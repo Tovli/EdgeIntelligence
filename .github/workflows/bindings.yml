@@ -53,6 +53,8 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+          CC_aarch64_linux_android: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
         run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target aarch64-linux-android --release
 
       - name: Install uniffi-bindgen-react-native
@@ -60,6 +62,8 @@ jobs:
       - name: Codegen — React Native (TypeScript + JSI)
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+          CC_aarch64_linux_android: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
         run: make codegen-rn
       - uses: actions/upload-artifact@v4
@@ -109,7 +113,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install flutter_rust_bridge_codegen
-        run: cargo install flutter_rust_bridge_codegen --locked
+        run: cargo install flutter_rust_bridge_codegen --version 2.12.0 --locked
       - name: Codegen — Flutter/Dart
         run: make codegen-flutter
       - uses: actions/upload-artifact@v4

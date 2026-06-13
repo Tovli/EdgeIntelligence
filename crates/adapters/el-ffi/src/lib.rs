@@ -407,7 +407,10 @@ mod tests {
     fn ask_error_is_distinguishable_from_content() {
         let sdk = EdgeLlm::local("".into()).expect("toy model never fails");
         let r = sdk.ask("ping".into());
-        assert!(r.is_ok(), "toy local provider must not error on a plain prompt");
+        assert!(
+            r.is_ok(),
+            "toy local provider must not error on a plain prompt"
+        );
         assert!(
             !r.unwrap().starts_with("error:"),
             "response must not look like a swallowed error"

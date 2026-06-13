@@ -8,8 +8,13 @@ OUT            := out
 FRB_VERSION    := 2.12.0
 
 ifneq ($(strip $(CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER)),)
+ANDROID_TOOLCHAIN_BIN := $(dir $(CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER))
 CC_aarch64_linux_android ?= $(CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER)
+AR_aarch64_linux_android ?= $(ANDROID_TOOLCHAIN_BIN)llvm-ar
+RANLIB_aarch64_linux_android ?= $(ANDROID_TOOLCHAIN_BIN)llvm-ranlib
 export CC_aarch64_linux_android
+export AR_aarch64_linux_android
+export RANLIB_aarch64_linux_android
 endif
 
 .PHONY: check build-android build-ios build-wasm codegen-rn codegen-flutter codegen-web bindings
@@ -26,7 +31,7 @@ check:
 # Prerequisites
 #   Android:  rustup target add aarch64-linux-android
 #             set CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER to the NDK clang path
-#             (Make exports that path as CC_aarch64_linux_android for C build scripts)
+#             (Make exports CC/AR/RANLIB for C build scripts)
 #             (see .cargo/config.toml for the exact variable name)
 #   iOS:      rustup target add aarch64-apple-ios  (macOS + Xcode required)
 #   wasm:     cargo install wasm-pack

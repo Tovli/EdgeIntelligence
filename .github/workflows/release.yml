@@ -99,8 +99,14 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_AR: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
           CC_aarch64_linux_android: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+          AR_aarch64_linux_android: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          RANLIB_aarch64_linux_android: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
         run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target aarch64-linux-android --release
       - name: Install uniffi-bindgen-react-native
         run: cargo install uniffi-bindgen-react-native --locked
@@ -108,8 +114,14 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_AR: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
           CC_aarch64_linux_android: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+          AR_aarch64_linux_android: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          RANLIB_aarch64_linux_android: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
         run: make codegen-rn
       - name: Upload RN bindings (TypeScript + JSI)
         uses: actions/upload-artifact@v4

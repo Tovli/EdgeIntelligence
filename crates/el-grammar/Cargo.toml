@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 el-core = { workspace = true }
-el-runtime = { path = "../el-runtime" }
+el-runtime = { workspace = true }
 
 [dev-dependencies]
 el-provenance = { workspace = true }

@@ -38,12 +38,20 @@ rust-version = "1.96"
 repository = "Edge-Native LLM SDK"
 
 [workspace.dependencies]
-# Internal crates referenced by path.
-el-core = { path = "crates/el-core" }
-el-memory = { path = "crates/el-memory" }
-el-telemetry = { path = "crates/el-telemetry" }
-el-provenance = { path = "crates/el-provenance" }
-el-safety = { path = "crates/el-safety" }
+# ALL internal crates are declared here with path + version.
+# This is the single source of truth for internal dep version requirements;
+# member crates reference them with `{ workspace = true }` and add no inline
+# version fields. `cargo set-version --workspace <ver>` updates every entry.
+el-core               = { path = "crates/el-core",                             version = "0.1.0" }
+el-memory             = { path = "crates/el-memory",                           version = "0.1.0" }
+el-telemetry          = { path = "crates/el-telemetry",                        version = "0.1.0" }
+el-provenance         = { path = "crates/el-provenance",                       version = "0.1.0" }
+el-safety             = { path = "crates/el-safety",                           version = "0.1.0" }
+el-runtime            = { path = "crates/el-runtime",                          version = "0.1.0" }
+el-grammar            = { path = "crates/el-grammar",                          version = "0.1.0" }
+el-provenance-ed25519 = { path = "crates/adapters/el-provenance-ed25519",      version = "0.1.0" }
+el-engine-candle      = { path = "crates/adapters/el-engine-candle",           version = "0.1.0" }
+el-cloud              = { path = "crates/adapters/el-cloud",                   version = "0.1.0" }
 
 [profile.release]
 opt-level = 3

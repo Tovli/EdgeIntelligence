@@ -4,12 +4,12 @@
 [package]
 name = "el-cloud"
 description = "Frontier LLM cloud backend over reqwest — OpenAI, Anthropic, Gemini, Ollama (ADR-010)."
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-el-core = { path = "../../el-core" }
+el-core = { workspace = true }
 
 # reqwest::blocking is only available on native targets; wasm32-unknown-unknown
 # uses the async fetch API which requires a different crate surface. Since

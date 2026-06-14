@@ -8,8 +8,13 @@ OUT            := out
 FRB_VERSION    := 2.12.0
 
 ifneq ($(strip $(CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER)),)
+ANDROID_TOOLCHAIN_BIN := $(dir $(CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER))
 CC_aarch64_linux_android ?= $(CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER)
+AR_aarch64_linux_android ?= $(ANDROID_TOOLCHAIN_BIN)llvm-ar
+RANLIB_aarch64_linux_android ?= $(ANDROID_TOOLCHAIN_BIN)llvm-ranlib
 export CC_aarch64_linux_android
+export AR_aarch64_linux_android
+export RANLIB_aarch64_linux_android
 endif
 
 .PHONY: check build-android build-ios build-wasm codegen-rn codegen-flutter codegen-web bindings
@@ -26,7 +31,7 @@ check:
 # Prerequisites
 #   Android:  rustup target add aarch64-linux-android
 #             set CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER to the NDK clang path
-#             (Make exports that path as CC_aarch64_linux_android for C build scripts)
+#             (Make exports CC/AR/RANLIB for C build scripts)
 #             (see .cargo/config.toml for the exact variable name)
 #   iOS:      rustup target add aarch64-apple-ios  (macOS + Xcode required)
 #   wasm:     cargo install wasm-pack
@@ -48,18 +53,21 @@ build-wasm:
 # ─── Binding codegen ─────────────────────────────────────────────────────────
 #
 # Prerequisites (install once)
-#   RN:      cargo install uniffi-bindgen-react-native --locked
+#   RN:      npm install --global uniffi-bindgen-react-native@0.31.0-3
 #   Flutter: cargo install flutter_rust_bridge_codegen --version $(FRB_VERSION) --locked
 #   Web:     (wasm-pack, covered by build-wasm)
 
-## Generate React Native (TypeScript + JSI + Turbo Module) bindings.
+## Generate React Native JSI bindings (TypeScript + C++).
 ## Requires: build-android
 codegen-rn: build-android
-	@mkdir -p $(OUT)/rn
-	uniffi-bindgen-react-native generate \
-		--library target/$(ANDROID_TARGET)/release/libel_ffi.so \
-		--out-dir $(OUT)/rn \
-		--crate el-ffi
+	@mkdir -p $(OUT)/rn $(OUT)/rn/cpp
+	uniffi-bindgen-react-native generate jsi bindings \
+		--library \
+		--crate el-ffi \
+		--ts-dir $(OUT)/rn \
+		--cpp-dir $(OUT)/rn/cpp \
+		--no-format \
+		target/$(ANDROID_TARGET)/release/libel_ffi.so
 
 ## Generate Flutter/Dart bindings via flutter_rust_bridge v2 codegen.
 codegen-flutter:

@@ -1,6 +1,6 @@
 # ADR-011: Multi-Registry Release CI (crates.io, npm, pub.dev)
 
-- **Status**: proposed
+- **Status**: accepted
 - **Date**: 2026-06-12
 - **Deciders**:
 - **Tags**: ci, release, crates.io, npm, pub.dev, packaging

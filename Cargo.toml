@@ -24,6 +24,9 @@ members = [
     # Increment 9: FFI binding surfaces — pure-Rust deps compile on host;
     # cross-target builds run via `make build-android / build-ios / build-wasm`.
     "crates/adapters/el-ffi",
+    # Interactive local-LLM chat test client (app, not core) — real Qwen2
+    # forward over candle-transformers, drives the ADR-010 LlmProvider seam.
+    "apps/el-chat",
 ]
 exclude = [
     # Excluded: needs crates.io (llguidance/toktrie) + native tokenizer build deps.
@@ -58,3 +61,10 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# Optimize *dependencies* (candle math kernels, tokenizers) at opt-level 3 even
+# in dev builds, so the el-chat test client runs CPU inference at a usable speed
+# without paying the slow LTO release build. The app crates themselves stay at
+# the dev default for fast iterative recompiles.
+[profile.dev.package."*"]
+opt-level = 3

@@ -98,6 +98,49 @@ rustup target add wasm32-wasip1 wasm32-unknown-unknown
 cargo build --target wasm32-wasip1 -p el-core -p el-memory -p el-telemetry -p el-provenance -p el-safety -p el-runtime -p el-grammar
 ```
 
+## Local Chat Test Client
+
+[`apps/el-chat`](apps/el-chat) is an interactive REPL that holds a real
+multi-turn conversation with a small LLM running **entirely on-device**. Its
+purpose is to exercise the SDK end-to-end, so its only direct dependencies are
+SDK crates (`el-core`, `el-engine-candle`) — it contains no inference, model, or
+tokenizer code of its own. Every reply flows through the ADR-010
+`LlmProvider` seam:
+
+```
+el-chat  →  el_core::LlmProvider  →  el_engine_candle::QwenChatProvider
+                                       (real Qwen2 forward via candle-transformers)
+                                  →  el_runtime::InferenceSession
+                                       (provenance gate → prefill → decode loop)
+```
+
+Decoding is the runtime's deterministic greedy argmax, so replies are
+reproducible. The model is supplied as a local file — there is no runtime
+network egress (ADR-004 air-gap by default). Fetch a small instruct model once:
+
+```sh
+mkdir -p models
+curl -sSL -o models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+  https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+curl -sSL -o models/qwen2.5-0.5b-instruct.tokenizer.json \
+  https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer.json
+```
+
+Then chat (the defaults point at the files above):
+
+```sh
+cargo run -p el-chat                                  # interactive REPL
+cargo run -p el-chat -- --prompt "Hello!" --once      # one-shot
+cargo run -p el-chat -- --system "Be terse." --max-tokens 128
+```
+
+REPL commands: `/reset`, `/system <text>`, `/help`, `/exit`. Other flags:
+`--model`, `--tokenizer`, `--system`, `--max-tokens`. The `models/`
+directory is git-ignored. Decoding is deterministic (the SDK runtime decodes
+greedily), so the same prompt yields the same reply.
+
+See [`apps/el-chat/README.md`](apps/el-chat/README.md) for the full user guide.
+
 ## Workspace Map
 
 | Crate | Role | Current state |
@@ -110,10 +153,11 @@ cargo build --target wasm32-wasip1 -p el-core -p el-memory -p el-telemetry -p el
 | [`crates/el-runtime`](crates/el-runtime) | Session lifecycle and decode-loop orchestration | Implemented and tested |
 | [`crates/el-grammar`](crates/el-grammar) | DFA grammar masking | Implemented and tested |
 | [`crates/adapters/el-provenance-ed25519`](crates/adapters/el-provenance-ed25519) | Real ED25519 signature verification | Implemented and tested |
-| [`crates/adapters/el-engine-candle`](crates/adapters/el-engine-candle) | Candle inference adapter | Host CPU proof implemented |
+| [`crates/adapters/el-engine-candle`](crates/adapters/el-engine-candle) | Candle inference adapter: engine-seam proof plus a real Qwen2 transformer engine and chat provider | Implemented; real on-device chat |
 | [`crates/adapters/el-cloud`](crates/adapters/el-cloud) | Opt-in OpenAI-compatible provider backend | Implemented as an explicit egress adapter |
 | [`crates/adapters/el-grammar-llguidance`](crates/adapters/el-grammar-llguidance) | llguidance JSON-schema token masking | Implemented and tested; workspace-excluded (crates.io deps) |
 | [`crates/adapters/el-ffi`](crates/adapters/el-ffi) | Flutter/UniFFI/wasm-bindgen binding surfaces | Implemented and tested (native + wasm32 compile); workspace-excluded (cross toolchains) |
+| [`apps/el-chat`](apps/el-chat) | Interactive chat test client; SDK-only deps, drives the runtime end-to-end | Implemented; runs real on-device chat |
 
 ## Architecture Decisions
 

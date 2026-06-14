@@ -1,0 +1,24 @@
+# el-chat — interactive local-LLM chat test client.
+#
+# Its purpose is to TEST THE SDK end-to-end, so its only direct dependencies are
+# SDK crates. All inference goes through the SDK: `el_engine_candle::QwenChatProvider`
+# (a real Qwen2 transformer engine driven by `el_runtime::InferenceSession`)
+# behind the `el_core::LlmProvider` trait. The app contains no model/tokenizer
+# code of its own.
+[package]
+name = "el-chat"
+description = "Interactive local-LLM chat test client — exercises the SDK's LlmProvider/runtime end-to-end."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "el-chat"
+path = "src/main.rs"
+
+[dependencies]
+el-core = { workspace = true }
+el-engine-candle = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

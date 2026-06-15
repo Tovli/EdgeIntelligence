@@ -53,7 +53,9 @@ fn parse_args() -> Result<Args, String> {
             "--prompt" | "-p" => once = Some(next("--prompt")?),
             "--once" => once = once.or(Some(String::new())),
             "--max-tokens" => {
-                max_tokens = next("--max-tokens")?.parse().map_err(|_| "bad --max-tokens")?
+                max_tokens = next("--max-tokens")?
+                    .parse()
+                    .map_err(|_| "bad --max-tokens")?
             }
             "--help" | "-h" => return Err("help".to_string()),
             other => return Err(format!("unknown argument: {other}")),

@@ -623,9 +623,7 @@ fn report_breakdown(
     let per_tok = |d: std::time::Duration, n: u64| if n > 0 { ms(d) / n as f64 } else { 0.0 };
 
     eprintln!("\n┌─ EL_BENCH chat() breakdown ───────────────────────────────");
-    eprintln!(
-        "│ prompt_tokens={prompt_tokens}  completion_tokens={completion_tokens}"
-    );
+    eprintln!("│ prompt_tokens={prompt_tokens}  completion_tokens={completion_tokens}");
     eprintln!("│ phase           wall(ms)    %total   throughput");
     eprintln!(
         "│ model load    {:>9.1}  {:>6.1}%   (read+dequantize GGUF)",
@@ -710,8 +708,11 @@ fn local_load_permit() -> Result<LoadPermit> {
             true
         }
     }
-    let mut artifact =
-        ModelArtifact::new(ModelId(1), ModelVersion::new(0, 1, 0), el_core::ModelFormat::Gguf);
+    let mut artifact = ModelArtifact::new(
+        ModelId(1),
+        ModelVersion::new(0, 1, 0),
+        el_core::ModelFormat::Gguf,
+    );
     artifact.verify(&LocalFileTrust, b"local-file", b"local-file", 0);
     artifact.ensure_loadable()
 }

@@ -297,6 +297,48 @@ use el_core::{ModelId, ModelVersion};
 use el_provenance::{ModelArtifact, SignatureVerifier};
 use tokenizers::Tokenizer;
 
+// ── Opt-in benchmark instrumentation (EL_BENCH=1) ────────────────────────────
+//
+// Zero-cost when `EL_BENCH` is unset: `enabled()` short-circuits and no timing
+// is taken. When set, `QwenChatProvider::chat` prints a per-phase breakdown and
+// per-forward attribution (model compute vs. seam quantisation vs. runtime loop)
+// to stderr. Diagnostics only — not part of the SDK's public behaviour.
+mod bench {
+    use std::cell::Cell;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+
+    /// True iff the `EL_BENCH` environment variable is present (read once).
+    pub fn enabled() -> bool {
+        *ENABLED.get_or_init(|| std::env::var_os("EL_BENCH").is_some())
+    }
+
+    thread_local! {
+        static FWD_TOTAL: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        static FWD_MODEL: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        static FWD_CALLS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Accumulate one `forward_one` sample: `total` is the whole seam call,
+    /// `model` is just the candle transformer forward inside it.
+    pub fn record(total: Duration, model: Duration) {
+        FWD_TOTAL.with(|c| c.set(c.get() + total));
+        FWD_MODEL.with(|c| c.set(c.get() + model));
+        FWD_CALLS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Read and reset the forward accumulators: `(total, model, calls)`.
+    pub fn take() -> (Duration, Duration, u64) {
+        (
+            FWD_TOTAL.replace(Duration::ZERO),
+            FWD_MODEL.replace(Duration::ZERO),
+            FWD_CALLS.replace(0),
+        )
+    }
+}
+
 /// A real Qwen2 transformer `InferenceEngine`.
 ///
 /// Holds candle's stateful KV cache. Within one generation it is fed
@@ -342,12 +384,18 @@ impl QwenEngine {
     /// One forward over a single token at the current position; advances the KV
     /// cache and returns milli-logits for the next token.
     fn forward_one(&mut self, token: Token) -> Result<Vec<i32>> {
+        let t_total = bench::enabled().then(std::time::Instant::now);
+
         let input = Tensor::from_vec(vec![token], (1, 1), &self.device)
             .map_err(|_| EdgeError::Engine("candle: input tensor build failed"))?;
+
+        let t_model = bench::enabled().then(std::time::Instant::now);
         let logits = self
             .model
             .forward(&input, self.index_pos)
             .map_err(|_| EdgeError::Engine("candle: Qwen2 forward failed"))?;
+        let model_dur = t_model.map(|t| t.elapsed()).unwrap_or_default();
+
         self.index_pos += 1;
         let row = logits
             .squeeze(0)
@@ -355,7 +403,12 @@ impl QwenEngine {
         let floats = row
             .to_vec1::<f32>()
             .map_err(|_| EdgeError::Engine("candle: logits to vec failed"))?;
-        Ok(floats.iter().map(|x| (x * 1000.0).round() as i32).collect())
+        let out: Vec<i32> = floats.iter().map(|x| (x * 1000.0).round() as i32).collect();
+
+        if let Some(t) = t_total {
+            bench::record(t.elapsed(), model_dur);
+        }
+        Ok(out)
     }
 }
 
@@ -457,23 +510,54 @@ impl QwenChatProvider {
 impl LlmProvider for QwenChatProvider {
     fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
         let prompt = render_chatml(&req.messages);
+
+        let t_encode = bench::enabled().then(std::time::Instant::now);
         let prompt_tokens = self.encode(&prompt)?;
+        let d_encode = t_encode.map(|t| t.elapsed()).unwrap_or_default();
 
         // Fresh engine + session each turn (candle KV cache has no public reset);
         // the full conversation is re-prefilled. This is the standard SDK path —
         // provenance permit, session lifecycle, decode loop — not a shortcut.
+        let t_load = bench::enabled().then(std::time::Instant::now);
         let engine = QwenEngine::from_path(&self.model_path, self.eos)?;
+        let d_load = t_load.map(|t| t.elapsed()).unwrap_or_default();
+
         let mut session =
             InferenceSession::new(SessionId(1), SessionConfig::default(), engine, self.permit);
         let ports = Ports::permissive();
+
+        let _ = bench::take(); // clear forward accumulators before prefill
+        let t_prefill = bench::enabled().then(std::time::Instant::now);
         session.load_prompt(&ports, &prompt_tokens)?;
+        let d_prefill = t_prefill.map(|t| t.elapsed()).unwrap_or_default();
+        let (pf_total, pf_model, pf_calls) = bench::take();
 
         let max = req.max_tokens.unwrap_or(self.default_max_tokens);
+        let t_decode = bench::enabled().then(std::time::Instant::now);
         session.generate(&ports, max)?;
+        let d_decode = t_decode.map(|t| t.elapsed()).unwrap_or_default();
+        let (dc_total, dc_model, dc_calls) = bench::take();
 
         let out = session.output();
         let completion_tokens = out.len() as u32;
+
+        let t_detok = bench::enabled().then(std::time::Instant::now);
         let content = self.decode(out)?.trim().to_string();
+        let d_detok = t_detok.map(|t| t.elapsed()).unwrap_or_default();
+
+        if bench::enabled() {
+            report_breakdown(
+                prompt_tokens.len() as u32,
+                completion_tokens,
+                d_load,
+                d_encode,
+                d_prefill,
+                d_decode,
+                d_detok,
+                (pf_total, pf_model, pf_calls),
+                (dc_total, dc_model, dc_calls),
+            );
+        }
 
         Ok(ChatResponse {
             content,
@@ -500,6 +584,100 @@ impl LlmProvider for QwenChatProvider {
         });
         Ok(())
     }
+}
+
+/// Print an `EL_BENCH` per-phase + per-forward breakdown for one `chat()` call.
+#[allow(clippy::too_many_arguments)]
+fn report_breakdown(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    d_load: std::time::Duration,
+    d_encode: std::time::Duration,
+    d_prefill: std::time::Duration,
+    d_decode: std::time::Duration,
+    d_detok: std::time::Duration,
+    prefill_fwd: (std::time::Duration, std::time::Duration, u64),
+    decode_fwd: (std::time::Duration, std::time::Duration, u64),
+) {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let total = d_load + d_encode + d_prefill + d_decode + d_detok;
+    let pct = |d: std::time::Duration| {
+        if total.as_secs_f64() > 0.0 {
+            d.as_secs_f64() / total.as_secs_f64() * 100.0
+        } else {
+            0.0
+        }
+    };
+    let tps = |n: u32, d: std::time::Duration| {
+        if d.as_secs_f64() > 0.0 {
+            n as f64 / d.as_secs_f64()
+        } else {
+            0.0
+        }
+    };
+
+    let (pf_total, pf_model, pf_calls) = prefill_fwd;
+    let (dc_total, dc_model, dc_calls) = decode_fwd;
+    let dc_loop = d_decode.saturating_sub(dc_total);
+    let dc_seam = dc_total.saturating_sub(dc_model);
+    let per_tok = |d: std::time::Duration, n: u64| if n > 0 { ms(d) / n as f64 } else { 0.0 };
+
+    eprintln!("\n┌─ EL_BENCH chat() breakdown ───────────────────────────────");
+    eprintln!(
+        "│ prompt_tokens={prompt_tokens}  completion_tokens={completion_tokens}"
+    );
+    eprintln!("│ phase           wall(ms)    %total   throughput");
+    eprintln!(
+        "│ model load    {:>9.1}  {:>6.1}%   (read+dequantize GGUF)",
+        ms(d_load),
+        pct(d_load)
+    );
+    eprintln!(
+        "│ tokenize       {:>9.2}  {:>6.1}%",
+        ms(d_encode),
+        pct(d_encode)
+    );
+    eprintln!(
+        "│ prefill       {:>9.1}  {:>6.1}%   {:>7.1} tok/s",
+        ms(d_prefill),
+        pct(d_prefill),
+        tps(prompt_tokens, d_prefill)
+    );
+    eprintln!(
+        "│ decode        {:>9.1}  {:>6.1}%   {:>7.1} tok/s",
+        ms(d_decode),
+        pct(d_decode),
+        tps(completion_tokens, d_decode)
+    );
+    eprintln!(
+        "│ detokenize     {:>9.2}  {:>6.1}%",
+        ms(d_detok),
+        pct(d_detok)
+    );
+    eprintln!("│ TOTAL         {:>9.1}", ms(total));
+    eprintln!("│ ─ forward attribution (where prefill+decode time goes) ─");
+    eprintln!(
+        "│ prefill: {} fwd calls, model {:.1}ms, seam {:.1}ms, loop {:.1}ms",
+        pf_calls,
+        ms(pf_model),
+        ms(pf_total.saturating_sub(pf_model)),
+        ms(d_prefill.saturating_sub(pf_total)),
+    );
+    eprintln!(
+        "│ decode : {} fwd calls, model {:.1}ms, seam {:.1}ms, loop {:.1}ms",
+        dc_calls,
+        ms(dc_model),
+        ms(dc_seam),
+        ms(dc_loop),
+    );
+    eprintln!(
+        "│ per decoded token: {:.2}ms total = model {:.2} + seam {:.2} + loop {:.2}",
+        per_tok(d_decode, dc_calls),
+        per_tok(dc_model, dc_calls),
+        per_tok(dc_seam, dc_calls),
+        per_tok(dc_loop, dc_calls),
+    );
+    eprintln!("└───────────────────────────────────────────────────────────");
 }
 
 /// Render a conversation as Qwen2.5 ChatML and open an assistant turn.

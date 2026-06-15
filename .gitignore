@@ -3,6 +3,8 @@ ruvector.db
 .claude-flow/
 target/
 out/
+# Local model assets for the el-chat test client (downloaded, not committed).
+models/
 crates/adapters/el-ffi/src/frb_generated.rs
 # Claude Code local state (worktrees, settings.local.json)
 .claude/

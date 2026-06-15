@@ -13,6 +13,11 @@ el-core = { workspace = true }
 el-provenance = { workspace = true }
 el-runtime = { workspace = true }
 candle-core = "0.8"
+# Real transformer forward for local chat (Qwen2 family) + its tokenizer.
+# `tokenizers` uses the pure-Rust `fancy-regex` backend (no C/C++ onig/esaxx),
+# per ADR-008.
+candle-transformers = "0.8"
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 
 [features]
 default = []

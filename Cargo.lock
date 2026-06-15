@@ -793,7 +793,7 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "el-chat"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "el-core",
  "el-engine-candle",
@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "el-cloud"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "el-core",
  "reqwest",
@@ -812,11 +812,11 @@ dependencies = [
 
 [[package]]
 name = "el-core"
-version = "0.1.0"
+version = "0.3.1"
 
 [[package]]
 name = "el-engine-candle"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "candle-core",
  "candle-transformers",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "el-ffi"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "el-cloud",
  "el-core",
@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "el-grammar"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "el-core",
  "el-provenance",
@@ -851,21 +851,21 @@ dependencies = [
 
 [[package]]
 name = "el-memory"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "el-core",
 ]
 
 [[package]]
 name = "el-provenance"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "el-core",
 ]
 
 [[package]]
 name = "el-provenance-ed25519"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "ed25519-dalek",
  "el-core",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "el-runtime"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "el-core",
  "el-memory",
@@ -884,14 +884,14 @@ dependencies = [
 
 [[package]]
 name = "el-safety"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "el-core",
 ]
 
 [[package]]
 name = "el-telemetry"
-version = "0.1.0"
+version = "0.3.1"
 dependencies = [
  "el-core",
 ]

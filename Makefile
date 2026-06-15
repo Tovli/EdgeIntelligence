@@ -48,7 +48,7 @@ build-ios:
 build-wasm:
 	wasm-pack build crates/adapters/el-ffi \
 		--target web \
-		--out-dir ../../$(OUT)/web
+		--out-dir ../../../$(OUT)/web
 
 # ─── Binding codegen ─────────────────────────────────────────────────────────
 #
@@ -72,17 +72,31 @@ codegen-rn: build-android
 ## Generate Flutter/Dart bindings via flutter_rust_bridge v2 codegen.
 codegen-flutter:
 	@mkdir -p $(OUT)/flutter/lib
-	@if [ ! -f $(OUT)/flutter/pubspec.yaml ]; then \
-		printf '%s\n' \
-			'name: edge_intelligence' \
-			'version: 0.1.0' \
-			'description: Generated Flutter bindings for Edge Intelligence.' \
-			'environment:' \
-			'  sdk: ">=3.0.0 <4.0.0"' \
-			'dependencies:' \
-			'  flutter_rust_bridge: $(FRB_VERSION)' \
-			> $(OUT)/flutter/pubspec.yaml; \
-	fi
+	@printf '%s\n' \
+		'name: edge_intelligence' \
+		'version: 0.1.0' \
+		'description: Generated Flutter bindings for Edge Intelligence.' \
+		'repository: https://github.com/Tovli/EdgeIntelligence' \
+		'environment:' \
+		'  sdk: ">=3.3.0 <4.0.0"' \
+		'dependencies:' \
+		'  flutter_rust_bridge: ^$(FRB_VERSION)' \
+		> $(OUT)/flutter/pubspec.yaml
+	@cp LICENSE $(OUT)/flutter/LICENSE
+	@printf '%s\n' \
+		'# edge_intelligence' \
+		'' \
+		'Generated Flutter bindings for the Edge Intelligence SDK.' \
+		'' \
+		'The package contains Dart bindings generated with flutter_rust_bridge and native libraries assembled by the release pipeline.' \
+		> $(OUT)/flutter/README.md
+	@printf '%s\n' \
+		'# Changelog' \
+		'' \
+		'## 0.1.0' \
+		'' \
+		'Release notes are tracked in the Edge Intelligence repository tags and GitHub releases.' \
+		> $(OUT)/flutter/CHANGELOG.md
 	flutter_rust_bridge_codegen generate \
 		--rust-root crates/adapters/el-ffi \
 		--rust-input crate:: \

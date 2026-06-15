@@ -182,6 +182,7 @@ jobs:
         with:
           name: wasm-output
           path: out/web/
+          if-no-files-found: error
 
   build-flutter:
     name: Flutter/Dart codegen
@@ -201,6 +202,7 @@ jobs:
       - name: Stamp pub.dev version from tag
         run: |
           sed -i "s/^version: .*/version: $VERSION/" pubspec.yaml
+          printf '# Changelog\n\n## %s\n\n- Release %s.\n' "$VERSION" "$VERSION" > CHANGELOG.md
         working-directory: out/flutter
       - uses: actions/upload-artifact@v4
         with:
@@ -261,7 +263,7 @@ jobs:
 
   assemble-flutter:
     name: Assemble edge_intelligence pub.dev package
-    needs: [verify, build-android, build-ios, build-flutter]
+    needs: [verify, build-android, build-ios, build-wasm, build-flutter]
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.verify.outputs.version }}
@@ -278,6 +280,10 @@ jobs:
         with:
           name: ios-lib
           path: assembly/ios/
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm-output
+          path: assembly/pkg/
       - uses: dart-lang/setup-dart@v1
       - name: dart pub publish --dry-run (validation gate)
         run: dart pub publish --dry-run

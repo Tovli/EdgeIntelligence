@@ -12,7 +12,7 @@ The SDK produces three independently consumable artefacts:
 | Artefact | Registry | Consumer |
 |----------|----------|----------|
 | `el-*` Rust crates | crates.io | Rust projects embedding the SDK directly |
-| `@edge-intelligence/sdk` npm package | npmjs.com | React Native / web TypeScript consumers (wasm-bindgen output, ADR-001) |
+| `edge-intelligence-sdk` npm package | npmjs.com | React Native / web TypeScript consumers (wasm-bindgen output, ADR-001) |
 | `edge_intelligence` Dart package | pub.dev | Flutter consumers (FRB v2 output, ADR-009) |
 
 Each registry has its own publish toolchain, credential model, and version

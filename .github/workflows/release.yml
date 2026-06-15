@@ -214,7 +214,7 @@ jobs:
   # real native libraries alongside the generated language bindings.
 
   assemble-npm:
-    name: Assemble @edge-intelligence/sdk npm package
+    name: Assemble edge-intelligence-sdk npm package
     needs: [verify, build-android, build-ios, build-wasm]
     runs-on: ubuntu-latest
     env:
@@ -239,7 +239,7 @@ jobs:
       - name: Write package.json
         run: |
           jq -n \
-            --arg name "@edge-intelligence/sdk" \
+            --arg name "edge-intelligence-sdk" \
             --arg version "$VERSION" \
             --arg desc "Edge-native LLM inference SDK — Web (WASM) + React Native" \
             '{
@@ -328,7 +328,7 @@ jobs:
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
-      - name: Publish @edge-intelligence/sdk
+      - name: Publish edge-intelligence-sdk
         run: npm publish npm-package/ --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

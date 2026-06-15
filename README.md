@@ -237,6 +237,45 @@ covering its public API, a usage example, and the ADRs it realizes.
 
 <details>
 <summary><b>Show the full crate table</b></summary>
+## Benchmarks
+
+The SDK ships two reproducible benchmark harnesses. Both run inference through the
+public `LlmProvider` seam, so they characterize the **SDK's own behavior** and are
+**model-agnostic** — point them at whichever signed model your product loads. The
+model is pluggable and not part of this repo, so no per-model results are published
+here; run the harnesses against your own model to produce them.
+
+**1. Runtime performance / overhead** —
+[`docs/benchmarks/2026-06-14-qwen-chat-bottleneck.md`](docs/benchmarks/2026-06-14-qwen-chat-bottleneck.md)
+
+A phase-level latency breakdown of the local decode path, behind opt-in,
+zero-cost-when-unset instrumentation (`EL_BENCH=1`). The SDK-side conclusion: the
+runtime's own per-token work — decode loop, grammar mask, full-vocab argmax, KV
+commit, and content-free event emission — is **under ~1.2% of decode time**.
+Latency is dominated by model compute plus two orchestration costs the SDK can
+remove, independent of model choice:
+
+- **Batch the prefill** — feed the prompt as one `(1, prompt_len)` forward instead
+  of one forward per prompt token.
+- **Load weights once; reset only the KV cache** — and reuse KV across turns, so a
+  growing conversation is not re-prefilled from scratch each turn.
+- **Stream tokens for real** — emit from inside the decode loop so time-to-first-
+  token is `load + prefill + 1 token`, not full-generation time.
+
+**2. Clinical-quality & safety evaluation** — [`apps/el-bench`](apps/el-bench) ·
+[`benchmarks/README.md`](benchmarks/README.md)
+
+`el-bench` is an SDK-only test client (a sibling to `el-chat`) that replays
+published mental-health benchmarks — CounselBench, MindEval, and the VERA-MH
+suicide-risk safety suite — through the runtime and records transcripts for
+scoring against each benchmark's rubric. Datasets and transcripts are fetched or
+produced locally and are git-ignored (third-party data); only the harness and the
+methodology are committed. Decoding is deterministic, so a given model + task set
+yields identical transcripts — it is designed to run as a **CI safety gate**, so a
+change to the model, the system prompt, or the ADR-005 safety tier can be
+regression-tested against a fixed rubric.
+
+## Workspace Map
 
 | Crate | Role | Current state |
 |-------|------|---------------|
@@ -253,6 +292,7 @@ covering its public API, a usage example, and the ADRs it realizes.
 | [`crates/adapters/el-ffi`](crates/adapters/el-ffi) | **Device SDK facade (`EdgeLlm`):** Flutter / UniFFI / wasm-bindgen binding surfaces | Implemented and tested; host build is a workspace member, cross-target builds via `make` |
 | [`crates/adapters/el-grammar-llguidance`](crates/adapters/el-grammar-llguidance) | llguidance JSON-schema token masking | Implemented and tested; workspace-excluded (crates.io deps) |
 | [`apps/el-chat`](apps/el-chat) | Interactive chat test client; SDK-only deps, drives the runtime end-to-end | Implemented; runs real on-device chat |
+| [`apps/el-bench`](apps/el-bench) | Benchmark harness; SDK-only deps, replays quality/safety task sets through the runtime | Implemented; model-agnostic, reproducible |
 
 Of the adapters, only `el-grammar-llguidance` is excluded from the default
 workspace build (it pulls crates.io-only grammar dependencies); `el-cloud` and
@@ -324,8 +364,9 @@ to replace toy proofs with production-grade runtime pieces.
 - Binding codegen and packaging — FRB Dart codegen, uniffi-bindgen-react-native,
   wasm-pack npm publishing (the Rust binding surfaces exist in `el-ffi`).
 - Mobile toolchain validation for Android and iOS `aarch64` targets.
-- On-device benchmarks for time-to-first-token, decode throughput, memory
-  high-water marks, and thermal behavior.
+- On-device benchmarks for memory high-water marks and thermal behavior, and
+  wiring the `el-bench` VERA-MH safety suite into CI as a release gate (latency
+  and quality/safety harnesses already exist — see [Benchmarks](#benchmarks)).
 
 </details>
 

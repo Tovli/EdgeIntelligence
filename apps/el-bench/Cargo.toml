@@ -1,0 +1,29 @@
+# el-bench — clinical-quality + safety benchmark harness for the on-device model.
+#
+# Like el-chat, this is a TEST CLIENT for the SDK: it drives the real on-device
+# inference path (`el_engine_candle::QwenChatProvider` → `el_core::LlmProvider`
+# → `el_runtime::InferenceSession`) and contains no model/tokenizer/inference
+# code of its own. It replays normalized benchmark tasks (CounselBench, MindEval,
+# VERA-MH) through the model and records transcripts for offline judging.
+#
+# serde_json is the only non-SDK dependency: it parses the task files and writes
+# the transcript artifacts. It performs no inference and touches no network.
+[package]
+name = "el-bench"
+description = "Clinical-quality + safety benchmark harness — replays mental-health benchmark tasks through the SDK and records transcripts."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "el-bench"
+path = "src/main.rs"
+
+[dependencies]
+el-core = { workspace = true }
+el-engine-candle = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"

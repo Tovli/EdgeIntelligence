@@ -21,10 +21,29 @@ privacy-preserving telemetry, and host bindings for mobile and web runtimes.
 Local inference is the default path. Frontier and OpenAI-compatible providers
 exist only behind an explicit opt-in backend.
 
+> **New here?** Jump to [Architecture and entry points](#architecture-and-entry-points)
+> to see where the SDK starts and how the crates fit together, then
+> [Quick start](#quick-start) to build it.
+
+## Contents
+
+- [Why Edge Intelligence?](#why-edge-intelligence)
+- [Architecture and entry points](#architecture-and-entry-points)
+- [Quick start](#quick-start)
+- [Local chat test client](#local-chat-test-client)
+- [Workspace map](#workspace-map)
+- [Architecture decisions](#architecture-decisions)
+- [Domain model](#domain-model)
+- [Roadmap](#roadmap)
+- [Documentation](#documentation)
+
 ## Why Edge Intelligence?
 
 Most mobile LLM stacks start in the cloud and add local features later. This
-project starts at the edge:
+project starts at the edge.
+
+<details>
+<summary><b>The six principles that shape every crate</b></summary>
 
 | Principle | What it means in the SDK |
 |-----------|--------------------------|
@@ -35,7 +54,61 @@ project starts at the edge:
 | **Provable provenance** | Model signatures are verified before a session can be constructed. |
 | **Opt-in egress** | Cloud/frontier providers are a separate adapter and must be wired deliberately by the host app. |
 
-## What It Does
+</details>
+
+## Architecture and entry points
+
+Edge Intelligence is a **hexagonal (ports-and-adapters) workspace, not a single
+monolithic crate**. There is no `edge-intelligence` umbrella crate; coherence
+comes from three layers, each with a clear entry point:
+
+| Layer | Crate · symbol | Where it fits |
+|-------|----------------|---------------|
+| **Device SDK facade** | [`el-ffi`](crates/adapters/el-ffi) · `EdgeLlm` | The composition root shipped to devices. Wires the local engine and opt-in cloud behind one flat API and projects it to React Native (UniFFI/JSI), Flutter (FRB), and Web (wasm-bindgen). **Start here to build an app.** |
+| **Rust API seam** | [`el-core`](crates/el-core) · `LlmProvider` | The single trait every backend implements and every Rust consumer calls (ADR-010). **Start here to embed the SDK in Rust.** |
+| **Orchestrator** | [`el-runtime`](crates/el-runtime) · `InferenceSession` | Composes provenance, memory, safety, and grammar into the decode loop — the engine the providers drive. |
+
+```text
+  Edge device app  ·  Kotlin · Swift · Dart · TypeScript
+          │
+          ▼
+  el-ffi · EdgeLlm                      ← device SDK entry point (composition root)
+          │
+          ▼
+  el-core · LlmProvider (trait)         ← unified Rust API seam (ADR-010)
+          │
+     ┌────┴───────────────┐
+     ▼                     ▼
+  el-engine-candle      el-cloud        ← backends: local (default) · opt-in frontier
+     │
+     ▼
+  el-runtime · InferenceSession         ← orchestrator
+     │   composes
+     ▼
+  el-memory · el-provenance · el-safety · el-grammar
+```
+
+<details>
+<summary><b>Which entry point should I use?</b></summary>
+
+- **Building a mobile or web app** → use [`el-ffi`](crates/adapters/el-ffi)'s
+  `EdgeLlm`. Construct `EdgeLlm::local(model_uri)` (air-gapped) or
+  `EdgeLlm::cloud(model, api_key)` (opt-in), then call `ask(...)` /
+  `ask_stream(...)`. The crate compiles to a native library and a wasm package
+  and ships generated TypeScript/Dart bindings.
+- **Embedding the SDK in Rust** → construct a concrete provider and talk to it
+  through [`el_core::LlmProvider`](crates/el-core): `el_engine_candle::QwenChatProvider`
+  for on-device chat, or `el_cloud::CloudProvider` for a frontier backend.
+  [`apps/el-chat`](apps/el-chat) is a worked example.
+- **Extending the SDK** (new engine, grammar, safety, or compression) →
+  implement the matching port trait from [`el-runtime`](crates/el-runtime)
+  (`InferenceEngine`, `GrammarMasker`, `SafetySteerer`, `PromptCompressor`),
+  or implement `LlmProvider` directly for a whole new backend.
+
+</details>
+
+<details>
+<summary><b>The per-token decode pipeline and SDK seams</b></summary>
 
 ```text
 Host app
@@ -56,7 +129,7 @@ load gate -> memory plan -> prefill -> decode loop
                          content-free events and metrics
 ```
 
-The current workspace proves the main seams of the SDK:
+The workspace proves the main seams of the SDK:
 
 - **Runtime orchestration:** `el-runtime` owns the session state machine and
   enforces the decode order: grammar mask, safety adjustment, sampling, commit.
@@ -70,12 +143,15 @@ The current workspace proves the main seams of the SDK:
 - **Safety:** `el-safety` provides the tiered policy model and lightweight
   blacklist steering path, with SecDecoding-style model-backed safety tracked as
   follow-up work.
-- **Inference engine seam:** `el-engine-candle` runs a real Candle CPU forward
-  on a toy in-code model and drives the runtime loop end to end.
+- **Inference engine seam:** `el-engine-candle` runs a real Candle CPU forward —
+  a single-projection seam proof plus a real Qwen2 transformer — and drives the
+  runtime loop end to end.
 - **Provider seam:** `el-core::LlmProvider` gives local and frontier backends one
   host-facing API; `el-cloud` implements the opt-in OpenAI-compatible path.
 
-## Quick Start
+</details>
+
+## Quick start
 
 Prerequisite: Rust 1.96 or newer, matching the workspace `rust-version`.
 
@@ -84,13 +160,16 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Build just the dependency-light local core:
+<details>
+<summary><b>Build just the dependency-light core, or cross-compile to WASM</b></summary>
+
+Build and test only the pure-Rust local core (no Candle, no network):
 
 ```sh
 cargo test -p el-core -p el-memory -p el-telemetry -p el-provenance -p el-safety -p el-runtime -p el-grammar
 ```
 
-Cross-compile the pure Rust core for WASM:
+Cross-compile that core for WASM:
 
 ```sh
 rustup target add wasm32-wasip1 wasm32-unknown-unknown
@@ -98,16 +177,26 @@ rustup target add wasm32-wasip1 wasm32-unknown-unknown
 cargo build --target wasm32-wasip1 -p el-core -p el-memory -p el-telemetry -p el-provenance -p el-safety -p el-runtime -p el-grammar
 ```
 
-## Local Chat Test Client
+Cross-compile the device bindings (`el-ffi`) for Android / iOS / Web via the
+[`Makefile`](Makefile): `make build-android`, `make build-ios`, `make build-wasm`,
+or `make bindings` for all three codegen surfaces.
+
+</details>
+
+## Local chat test client
 
 [`apps/el-chat`](apps/el-chat) is an interactive REPL that holds a real
-multi-turn conversation with a small LLM running **entirely on-device**. Its
-purpose is to exercise the SDK end-to-end, so its only direct dependencies are
-SDK crates (`el-core`, `el-engine-candle`) — it contains no inference, model, or
-tokenizer code of its own. Every reply flows through the ADR-010
-`LlmProvider` seam:
+multi-turn conversation with a small LLM running **entirely on-device**. It
+exists to exercise the SDK end-to-end, so its only direct dependencies are SDK
+crates (`el-core`, `el-engine-candle`) — it contains no inference, model, or
+tokenizer code of its own.
 
-```
+<details>
+<summary><b>Fetch a model and run it</b></summary>
+
+Every reply flows through the ADR-010 `LlmProvider` seam:
+
+```text
 el-chat  →  el_core::LlmProvider  →  el_engine_candle::QwenChatProvider
                                        (real Qwen2 forward via candle-transformers)
                                   →  el_runtime::InferenceSession
@@ -135,17 +224,23 @@ cargo run -p el-chat -- --system "Be terse." --max-tokens 128
 ```
 
 REPL commands: `/reset`, `/system <text>`, `/help`, `/exit`. Other flags:
-`--model`, `--tokenizer`, `--system`, `--max-tokens`. The `models/`
-directory is git-ignored. Decoding is deterministic (the SDK runtime decodes
-greedily), so the same prompt yields the same reply.
+`--model`, `--tokenizer`, `--system`, `--max-tokens`. The `models/` directory is
+git-ignored. See [`apps/el-chat/README.md`](apps/el-chat/README.md) for the full
+user guide.
 
-See [`apps/el-chat/README.md`](apps/el-chat/README.md) for the full user guide.
+</details>
 
-## Workspace Map
+## Workspace map
+
+Twelve crates plus the chat app. Each crate has its own README (linked below)
+covering its public API, a usage example, and the ADRs it realizes.
+
+<details>
+<summary><b>Show the full crate table</b></summary>
 
 | Crate | Role | Current state |
 |-------|------|---------------|
-| [`crates/el-core`](crates/el-core) | Shared types, IDs, errors, events, provider trait | Implemented and tested |
+| [`crates/el-core`](crates/el-core) | Shared types, IDs, errors, events, `LlmProvider` trait | Implemented and tested |
 | [`crates/el-memory`](crates/el-memory) | Static arena planning and KV-cache descriptors | Implemented and tested |
 | [`crates/el-telemetry`](crates/el-telemetry) | Content-free event handling and privacy metrics | Implemented and tested |
 | [`crates/el-provenance`](crates/el-provenance) | Verified model load permits | Implemented and tested |
@@ -154,16 +249,26 @@ See [`apps/el-chat/README.md`](apps/el-chat/README.md) for the full user guide.
 | [`crates/el-grammar`](crates/el-grammar) | DFA grammar masking | Implemented and tested |
 | [`crates/adapters/el-provenance-ed25519`](crates/adapters/el-provenance-ed25519) | Real ED25519 signature verification | Implemented and tested |
 | [`crates/adapters/el-engine-candle`](crates/adapters/el-engine-candle) | Candle inference adapter: engine-seam proof plus a real Qwen2 transformer engine and chat provider | Implemented; real on-device chat |
-| [`crates/adapters/el-cloud`](crates/adapters/el-cloud) | Opt-in OpenAI-compatible provider backend | Implemented as an explicit egress adapter |
+| [`crates/adapters/el-cloud`](crates/adapters/el-cloud) | Opt-in OpenAI-compatible provider backend | Implemented; egress opt-in at construction |
+| [`crates/adapters/el-ffi`](crates/adapters/el-ffi) | **Device SDK facade (`EdgeLlm`):** Flutter / UniFFI / wasm-bindgen binding surfaces | Implemented and tested; host build is a workspace member, cross-target builds via `make` |
 | [`crates/adapters/el-grammar-llguidance`](crates/adapters/el-grammar-llguidance) | llguidance JSON-schema token masking | Implemented and tested; workspace-excluded (crates.io deps) |
-| [`crates/adapters/el-ffi`](crates/adapters/el-ffi) | Flutter/UniFFI/wasm-bindgen binding surfaces | Implemented and tested (native + wasm32 compile); workspace-excluded (cross toolchains) |
 | [`apps/el-chat`](apps/el-chat) | Interactive chat test client; SDK-only deps, drives the runtime end-to-end | Implemented; runs real on-device chat |
 
-## Architecture Decisions
+Of the adapters, only `el-grammar-llguidance` is excluded from the default
+workspace build (it pulls crates.io-only grammar dependencies); `el-cloud` and
+`el-ffi` are regular members whose host targets build and test with
+`cargo test --workspace`.
+
+</details>
+
+## Architecture decisions
 
 The project is intentionally decision-heavy because mobile LLM runtimes are easy
 to overfit to one device, model, or provider. The core choices are recorded as
-ADRs:
+ADRs.
+
+<details>
+<summary><b>The ten architecture decision records</b></summary>
 
 | ADR | Decision |
 |-----|----------|
@@ -180,10 +285,17 @@ ADRs:
 
 See the full index in [`docs/adr/README.md`](docs/adr/README.md).
 
-## Domain Model
+</details>
 
-The DDD model lives in [`docs/ddd`](docs/ddd/README.md). It breaks the SDK into
-nine bounded contexts:
+## Domain model
+
+The DDD model lives in [`docs/ddd`](docs/ddd/README.md). The key invariant
+across its contexts: **air-gap is the default runtime shape, not a feature flag
+sprinkled through the code** — any outbound behavior must be modeled as an
+explicit port or adapter.
+
+<details>
+<summary><b>The nine bounded contexts</b></summary>
 
 1. Inference Runtime
 2. Prompt Compression
@@ -195,14 +307,15 @@ nine bounded contexts:
 8. Model Provenance and Security
 9. Telemetry and Privacy
 
-The key invariant across those contexts: **air-gap is the default runtime shape,
-not a feature flag sprinkled through the code.** Any outbound behavior must be
-modeled as an explicit port or adapter.
+</details>
 
-## What Is Next
+## Roadmap
 
 The prototype has proven the architectural seams. The next engineering work is
-to replace toy proofs with production-grade runtime pieces:
+to replace toy proofs with production-grade runtime pieces.
+
+<details>
+<summary><b>What's next</b></summary>
 
 - Production GGUF/safetensors loading and transformer execution in
   `el-engine-candle`.
@@ -214,11 +327,14 @@ to replace toy proofs with production-grade runtime pieces:
 - On-device benchmarks for time-to-first-token, decode throughput, memory
   high-water marks, and thermal behavior.
 
+</details>
+
 ## Documentation
 
 - Product and technical rationale: [`docs/prd.md`](docs/prd.md)
 - Domain model: [`docs/ddd/README.md`](docs/ddd/README.md)
 - Architecture decisions: [`docs/adr/README.md`](docs/adr/README.md)
+- Per-crate guides: see the [Workspace map](#workspace-map) — every crate links to its own README.
 
 Edge Intelligence is still early, but the direction is deliberate: a small,
 auditable, Rust-native SDK that lets app developers choose local inference first

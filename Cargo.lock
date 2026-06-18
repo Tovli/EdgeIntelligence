@@ -793,7 +793,7 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "el-bench"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "el-core",
  "el-engine-candle",

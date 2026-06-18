@@ -162,6 +162,9 @@ mod tests {
             fn eos_token(&self) -> Token {
                 99
             }
+            fn rollback(&mut self, _keep: u32) -> el_core::Result<()> {
+                Ok(()) // stateless
+            }
         }
 
         struct OkVerifier;

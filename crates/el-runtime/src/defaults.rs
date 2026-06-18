@@ -52,4 +52,9 @@ impl InferenceEngine for NullEngine {
     fn eos_token(&self) -> Token {
         self.eos
     }
+
+    /// Stateless: `next_logits` ignores `committed`, so there is nothing to undo.
+    fn rollback(&mut self, _keep_committed: u32) -> Result<()> {
+        Ok(())
+    }
 }

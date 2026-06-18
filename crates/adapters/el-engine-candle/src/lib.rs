@@ -170,6 +170,12 @@ impl InferenceEngine for CandleEngine {
     fn eos_token(&self) -> Token {
         self.eos
     }
+
+    /// Stateless: this engine's forward is `embed[committed.last()] · w_out`, so
+    /// it holds no KV cache to restore — a rollback is a no-op.
+    fn rollback(&mut self, _keep_committed: u32) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ── LlmProvider (text-level) wrapper (ADR-010) ───────────────────────────────
@@ -343,9 +349,15 @@ mod bench {
 ///
 /// Holds candle's stateful KV cache. Within one generation it is fed
 /// incrementally (prefill, then one new token per `next_logits` call); candle
-/// exposes no public cache reset, so a fresh conversation builds a new engine.
-/// Float logits are quantised to integer milli-logits at the seam, exactly like
-/// [`CandleEngine`], so the runtime stays float-free.
+/// exposes no public cache reset, so a *fresh conversation* builds a new engine.
+///
+/// A *within-generation* safety backtrack (ADR-012) is supported via
+/// [`InferenceEngine::rollback`]: candle's attention discards its cache when a
+/// forward runs at `index_pos == 0`, so we retain the prompt and replay it from
+/// position 0 to rebuild the cache for the safe prefix (the session then
+/// re-feeds the retained committed tokens). Float logits are quantised to
+/// integer milli-logits at the seam, exactly like [`CandleEngine`], so the
+/// runtime stays float-free.
 pub struct QwenEngine {
     model: Qwen2Weights,
     device: Device,
@@ -353,6 +365,9 @@ pub struct QwenEngine {
     index_pos: usize,
     /// How many of the runtime-`committed` tokens have already been fed.
     fed: usize,
+    /// The prefill prompt, retained so a rollback can replay it from position 0
+    /// to rebuild candle's KV cache (which has no public truncation).
+    prompt: Vec<Token>,
     /// Milli-logits produced after the most recent forward.
     last_logits: Vec<i32>,
     vocab: usize,
@@ -375,6 +390,7 @@ impl QwenEngine {
             device,
             index_pos: 0,
             fed: 0,
+            prompt: Vec::new(),
             last_logits: Vec::new(),
             vocab: 0,
             eos,
@@ -416,6 +432,7 @@ impl InferenceEngine for QwenEngine {
     fn prefill(&mut self, tokens: &[Token]) -> Result<u32> {
         self.index_pos = 0;
         self.fed = 0;
+        self.prompt = tokens.to_vec(); // retained for rollback replay
         for &t in tokens {
             self.last_logits = self.forward_one(t)?;
         }
@@ -440,6 +457,24 @@ impl InferenceEngine for QwenEngine {
 
     fn eos_token(&self) -> Token {
         self.eos
+    }
+
+    fn rollback(&mut self, _keep_committed: u32) -> Result<()> {
+        // candle's KV cache is append-only with no public truncation, but its
+        // attention discards the cache on a forward at `index_pos == 0` (see
+        // quantized_qwen2). So rebuild deterministically: replay the prompt from
+        // position 0 — the first forward resets the cache, the rest re-append it —
+        // leaving the engine in its exact post-prefill state. We reset `fed` to 0
+        // so the session's next `next_logits` re-feeds the retained committed
+        // prefix (already truncated to `keep_committed`) on top. Cost is bounded
+        // by `max_rollbacks` (ADR-012).
+        self.index_pos = 0;
+        self.fed = 0;
+        for i in 0..self.prompt.len() {
+            let t = self.prompt[i];
+            self.last_logits = self.forward_one(t)?;
+        }
+        Ok(())
     }
 }
 

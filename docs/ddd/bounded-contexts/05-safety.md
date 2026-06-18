@@ -94,3 +94,26 @@ a `LogitAdjustment` applied **after** the grammar mask and **before** sampling;
 in CSD mode the orchestrator honors `Backtrack` signals at claim boundaries.
 Reads `DeviceProfile` from context 7. Independent of Grammar (4) and Speculative
 Decoding (3).
+
+## Runtime control loop (ADR-012)
+
+The decoder-time steering above runs inside a **recoverable control loop** (not a
+one-shot gate). Implemented across `el-safety` (`ChunkGuard`, `SafetyScore`,
+`RollbackPolicy`, `CheckpointManager`/`Checkpoint`) and the `el-runtime` session
+(`generate_with_policy`):
+
+- **Hard bans every step** (the `Lightweight` blacklist applies on every token).
+  *Selective soft-steering* over an early-token window, with guard-gated
+  re-escalation, is **deferred** to the `SecDecoding` follow-up: it needs the
+  base+expert model pair, so `SecDecodingSteerer` is a placeholder today and the
+  early-token window is intentionally absent (see `el-safety` `RollbackPolicy`).
+- **Safe-prefix checkpoints** captured at guard-verified boundaries — offsets
+  only; KV payload is never copied (`KvRegion::truncate`, ADR-003).
+- **Chunk guard** scores recent output every few tokens; on a hard-threshold
+  breach the loop rolls KV **and** output back to the last safe checkpoint and
+  bans the offending token so the resume diverges (`ClaimBacktracked`).
+- **Bounded, fail-closed:** rollbacks are capped (`max_rollbacks`); on exhaustion
+  — or under memory pressure with no checkpoint — the loop refuses
+  deterministically and emits `SafetyViolationDetected` / `SafetyDisabled`.
+
+See [ADR-012](../../adr/ADR-012-layered-decode-time-safety-control-loop-with-checkpointed-rollback.md).

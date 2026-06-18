@@ -63,7 +63,7 @@
 | `SafetyModeSelected` | mode, downgradedFrom? | affordable mode chosen |
 | `LogitsSteered` | stepIndex, adjustmentNorm | SecDecoding adjustment applied |
 | `SafetyViolationDetected` | stepIndex, score, threshold | content exceeded threshold |
-| `ClaimBacktracked` | claimIndex, score | CSD rewind + resample |
+| `ClaimBacktracked` | claimIndex | CSD / ADR-012 rollback to last safe checkpoint |
 | `SafetyDisabled` | reason | downgraded for memory |
 
 ### 6. Memory Management (Supporting / Shared Kernel)

@@ -17,5 +17,8 @@ pub use defaults::{AllowAllMasker, IdentityCompressor, NullEngine};
 pub use ports::{GrammarMasker, HybridRelay, InferenceEngine, Ports, PromptCompressor};
 pub use session::InferenceSession;
 
-// Re-export the safety port so callers wire one type system.
-pub use el_safety::{LogitAdjustment, SafetySteerer};
+// Re-export the safety ports so callers wire one type system.
+pub use el_safety::{
+    Checkpoint, CheckpointManager, ChunkGuard, LogitAdjustment, RollbackPolicy, SafetyScore,
+    SafetySteerer,
+};

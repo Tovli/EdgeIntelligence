@@ -52,6 +52,14 @@ impl KvRegion {
         &self.slots
     }
 
+    /// Drop tail descriptors so the region retains only the first `len` slots.
+    /// `O(dropped)`; survivors keep their `offset` (no data copy). This is the
+    /// rollback primitive for the safety control loop (ADR-012): restoring a
+    /// checkpoint rewinds committed KV without replaying prefill.
+    pub fn truncate(&mut self, len: u32) {
+        self.slots.truncate(len as usize);
+    }
+
     /// Remove pruned descriptors and re-index survivors. Returns how many were
     /// reclaimed. **Survivors keep their original `offset`** — proof that data
     /// is not moved, only descriptors are reshuffled.
@@ -86,5 +94,19 @@ mod tests {
         assert_eq!(kv.slots()[1].offset, off_token2_before);
         // ...but its logical index was shuffled down.
         assert_eq!(kv.slots()[1].token_index, 1);
+    }
+
+    #[test]
+    fn truncate_rewinds_to_len_without_touching_survivors() {
+        let mut kv = KvRegion::new();
+        kv.push(0);
+        kv.push(64);
+        kv.push(128);
+        let off1 = kv.slots()[1].offset;
+        kv.truncate(2);
+        assert_eq!(kv.len(), 2);
+        assert_eq!(kv.slots()[1].offset, off1); // survivor untouched (no data copy)
+        kv.truncate(0);
+        assert!(kv.is_empty());
     }
 }

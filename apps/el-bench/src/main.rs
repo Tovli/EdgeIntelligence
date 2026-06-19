@@ -206,8 +206,11 @@ fn main() {
     eprint!("loading model ... ");
     let _ = std::io::stderr().flush();
     let t_load = Instant::now();
+    // Measure the *raw* model: the SDK's on-device safety layer (ADR-005/012,
+    // on by default in the provider) is evaluated separately, so the baseline
+    // benchmark must disable it to score the model itself.
     let provider = match QwenChatProvider::from_paths(&args.model, &args.tokenizer) {
-        Ok(p) => p,
+        Ok(p) => p.with_safety(el_core::SafetyMode::Off),
         Err(e) => {
             eprintln!("\nerror: failed to load model: {e}");
             std::process::exit(1);

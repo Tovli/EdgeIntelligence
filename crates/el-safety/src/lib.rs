@@ -166,6 +166,64 @@ pub trait ChunkGuard {
     fn score(&self, recent: &[Token]) -> SafetyScore;
 }
 
+/// `SafetyMode::Lightweight` chunk guard — training-free **token-anchor
+/// heuristics** (no weights), the [`ChunkGuard`] counterpart of
+/// [`LightweightFilter`]. Each *pattern* is an unsafe token-id n-gram; the guard
+/// adds `per_hit` milli-units for every pattern that occurs as a contiguous
+/// subslice of the scored window, saturating at [`SafetyScore::MAX`].
+///
+/// Matching whole token sequences (not loose single ids) is deliberate: a
+/// multi-token word like "explosive" matches exactly, so a stray subword shared
+/// with benign text does not false-positive. A length-1 pattern is a plain
+/// single-token anchor.
+///
+/// Patterns are token ids, so the caller resolves them from its own tokenizer
+/// (the adapter that owns one) — this keeps `el-safety` free of any tokenizer or
+/// float dependency, and the guard fully deterministic (ADR-008) and offline
+/// (ADR-004).
+#[derive(Debug, Clone, Default)]
+pub struct AnchorGuard {
+    patterns: Vec<Vec<Token>>,
+    per_hit: u16,
+}
+
+impl AnchorGuard {
+    /// A guard adding `per_hit_milli` risk per matched pattern. Use
+    /// `per_hit_milli >= hard_threshold` so a single match breaches.
+    pub fn new(patterns: Vec<Vec<Token>>, per_hit_milli: u16) -> Self {
+        Self {
+            patterns,
+            per_hit: per_hit_milli,
+        }
+    }
+
+    /// A guard where any single pattern match saturates the score — every
+    /// flagged sequence is treated as a hard breach.
+    pub fn hard(patterns: Vec<Vec<Token>>) -> Self {
+        Self::new(patterns, SafetyScore::MAX.milli())
+    }
+
+    /// Whether the guard carries any non-empty pattern to match.
+    pub fn is_empty(&self) -> bool {
+        self.patterns.iter().all(Vec::is_empty)
+    }
+}
+
+impl ChunkGuard for AnchorGuard {
+    fn score(&self, recent: &[Token]) -> SafetyScore {
+        let mut milli: u32 = 0;
+        for pat in &self.patterns {
+            if pat.is_empty() || pat.len() > recent.len() {
+                continue;
+            }
+            if recent.windows(pat.len()).any(|w| w == pat.as_slice()) {
+                milli = milli.saturating_add(u32::from(self.per_hit));
+            }
+        }
+        SafetyScore::from_milli(milli.min(u32::from(u16::MAX)) as u16)
+    }
+}
+
 /// Cadence and bounds for the checkpointed-rollback control loop (ADR-012),
 /// chosen per device tier so cost scales with the hardware budget (ADR-003).
 ///
@@ -321,6 +379,34 @@ mod tests {
         assert_eq!(adj.delta_for(42), LightweightFilter::HARD_BAN);
         assert_eq!(adj.delta_for(7), 0);
         assert!(adj.l1_norm_milli() > 0);
+    }
+
+    #[test]
+    fn anchor_guard_matches_token_ngrams_exactly() {
+        // Two patterns: a single-token anchor (9) and a 2-token n-gram (40,41).
+        let guard = AnchorGuard::hard(vec![vec![9], vec![40, 41]]);
+
+        // No anchor present → safe.
+        assert_eq!(guard.score(&[1, 2, 3]), SafetyScore::SAFE);
+        // The single-token anchor anywhere in the window → hard breach.
+        assert_eq!(guard.score(&[1, 9, 2]), SafetyScore::MAX);
+        // The full 2-gram present (contiguous) → match.
+        assert_eq!(guard.score(&[7, 40, 41, 8]), SafetyScore::MAX);
+        // The 2-gram's tokens present but NOT contiguous → no false positive.
+        assert_eq!(guard.score(&[40, 99, 41]), SafetyScore::SAFE);
+    }
+
+    #[test]
+    fn anchor_guard_accumulates_below_max_and_is_empty_safe() {
+        // per-hit below MAX: one hit is soft, two hits saturate.
+        let guard = AnchorGuard::new(vec![vec![1], vec![2]], 600);
+        assert_eq!(guard.score(&[1, 5]).milli(), 600);
+        assert_eq!(guard.score(&[1, 2]), SafetyScore::MAX); // 1200 clamps to 1000
+
+        // No patterns (or only empty ones) → always safe, never matches.
+        assert!(AnchorGuard::hard(vec![]).is_empty());
+        assert_eq!(AnchorGuard::hard(vec![]).score(&[1, 2, 3]), SafetyScore::SAFE);
+        assert_eq!(AnchorGuard::hard(vec![vec![]]).score(&[1]), SafetyScore::SAFE);
     }
 
     #[test]

@@ -16,11 +16,14 @@
 
 use candle_core::{Device, Tensor};
 use el_core::{
-    ChatMessage, ChatRequest, ChatResponse, ChatRole, ChatToken, EdgeError, LlmProvider, Result,
-    SessionConfig, SessionId, Token,
+    ChatMessage, ChatRequest, ChatResponse, ChatRole, ChatToken, DomainEvent, EdgeError,
+    LlmProvider, Result, SafetyMode, SessionConfig, SessionId, StopReason, Token,
 };
 use el_provenance::LoadPermit;
-use el_runtime::{InferenceEngine, InferenceSession, Ports};
+use el_runtime::{
+    AnchorGuard, InferenceEngine, InferenceSession, LightweightFilter, NoSafety, Ports,
+    SafetySteerer,
+};
 
 /// Candle-backed inference engine.
 pub struct CandleEngine {
@@ -478,14 +481,128 @@ impl InferenceEngine for QwenEngine {
     }
 }
 
+// ── On-device safety wiring (ADR-005 tier + ADR-012 control loop) ────────────
+//
+// The runtime ships the *primitives* (steerer, chunk guard, checkpointed
+// rollback). They only engage when a session is given a real steerer + guard in
+// its `Ports` — `Ports::permissive()` wires neither, so a provider must opt in.
+// This adapter does: it owns the tokenizer, so it is the one place that can turn
+// a human-readable unsafe-word list into the token-id patterns the runtime's
+// float-free guard consumes. The resolved patterns/bans then drive the standard
+// `InferenceSession::generate` control loop — nothing in the SDK is bypassed.
+
+/// A small, conservative built-in `Lightweight` safety list (ADR-005). These are
+/// unambiguous weapons/mass-harm manufacture terms — content the decode-time
+/// guard should never let the model emit. It is intentionally narrow to avoid
+/// false positives in ordinary chat; production swaps in the active tier's real
+/// safety model (the LoRA adapter / classifier of ADR-012's model inventory).
+const DEFAULT_UNSAFE_WORDS: &[&str] = &[
+    "bomb",
+    "explosive",
+    "detonator",
+    "methamphetamine",
+    "ricin",
+    "anthrax",
+    "sarin",
+    "nerve agent",
+];
+
+/// Deterministic hard refusal emitted when the control loop fails closed —
+/// rollbacks exhausted or no safe checkpoint (ADR-012 §"Bounded rollback,
+/// fail-closed").
+const SAFETY_REFUSAL: &str = "I can't help with that request.";
+
+/// Encode a word to the token-id sequence(s) the model may actually emit for
+/// it. A word tokenizes differently depending on what precedes it, so both the
+/// **leading-space** form (mid-sentence, after another token) and the **bare**
+/// form (start of a line/turn or after punctuation) are returned — each as a
+/// distinct anchor n-gram. Empty/duplicate encodings are dropped, so the caller
+/// gets only matchable patterns.
+fn word_to_patterns(tokenizer: &Tokenizer, word: &str) -> Vec<Vec<Token>> {
+    let mut out: Vec<Vec<Token>> = Vec::new();
+    for variant in [format!(" {word}"), word.to_string()] {
+        if let Ok(enc) = tokenizer.encode(variant, false) {
+            let seq = enc.get_ids().to_vec();
+            if !seq.is_empty() && !out.contains(&seq) {
+                out.push(seq);
+            }
+        }
+    }
+    out
+}
+
+/// Resolved safety wiring for the provider, derived from the tokenizer once at
+/// construction. Holds only token-id data, so rebuilding a turn's `Ports` is a
+/// cheap clone with no tokenizer access on the hot path.
+#[derive(Debug, Clone)]
+struct SafetyConfig {
+    /// The ADR-005 tier. `Off` runs the plain single-pass decode (legacy path).
+    mode: SafetyMode,
+    /// Hard-banned single tokens — the always-on per-step `LightweightFilter`
+    /// layer (only words that encode to exactly one token; banning a shared
+    /// subword would be too blunt).
+    banned: Vec<Token>,
+    /// Unsafe token-id n-grams — the ADR-012 chunk-guard patterns that drive
+    /// trajectory rollback / fail-closed refusal.
+    patterns: Vec<Vec<Token>>,
+}
+
+impl SafetyConfig {
+    /// Resolve the built-in `Lightweight` list against `tokenizer`.
+    fn lightweight(tokenizer: &Tokenizer) -> Self {
+        let mut banned = Vec::new();
+        let mut patterns = Vec::new();
+        for &word in DEFAULT_UNSAFE_WORDS {
+            for seq in word_to_patterns(tokenizer, word) {
+                // A single-token form is safe to hard-ban per step; multi-token
+                // forms are caught by the guard (banning a shared subword could
+                // hurt benign text).
+                if seq.len() == 1 && !banned.contains(&seq[0]) {
+                    banned.push(seq[0]);
+                }
+                if !patterns.contains(&seq) {
+                    patterns.push(seq);
+                }
+            }
+        }
+        Self {
+            mode: SafetyMode::Lightweight,
+            banned,
+            patterns,
+        }
+    }
+
+    /// Build the per-turn safety `Ports` (steerer + chunk guard) for this tier.
+    /// `Off`, or an empty list, yields no steering/guarding.
+    fn ports(&self) -> Ports {
+        let mut ports = Ports::permissive();
+        if matches!(self.mode, SafetyMode::Off) {
+            return ports;
+        }
+        let steerer: Box<dyn SafetySteerer> = if self.banned.is_empty() {
+            Box::new(NoSafety)
+        } else {
+            Box::new(LightweightFilter::new(self.banned.clone()))
+        };
+        ports.safety = steerer;
+        if !self.patterns.is_empty() {
+            ports.guard = Some(Box::new(AnchorGuard::hard(self.patterns.clone())));
+        }
+        ports
+    }
+}
+
 /// A real local chat backend: a Qwen2 GGUF model + its tokenizer, driven
 /// through [`el_runtime::InferenceSession`].
 ///
 /// Each `chat` call renders the whole conversation to Qwen2.5 ChatML, builds a
 /// fresh [`QwenEngine`] (candle has no public KV-cache reset), then runs the
 /// SDK's standard provenance-gated session: `load_prompt` (prefill) →
-/// `generate` (grammar mask → safety steer → greedy commit). The provider holds
-/// no mutable session state, so it is `Send + Sync` without locking.
+/// `generate` (grammar mask → safety steer → guard + checkpointed rollback →
+/// greedy commit). On-device safety (ADR-005 `Lightweight` tier + the ADR-012
+/// control loop) is **on by default**; see [`with_safety`](Self::with_safety).
+/// The provider holds no mutable session state, so it is `Send + Sync` without
+/// locking.
 pub struct QwenChatProvider {
     model_path: std::path::PathBuf,
     tokenizer: Tokenizer,
@@ -493,6 +610,7 @@ pub struct QwenChatProvider {
     eos: Token,
     default_max_tokens: u32,
     model_label: String,
+    safety: SafetyConfig,
 }
 
 impl QwenChatProvider {
@@ -517,6 +635,8 @@ impl QwenChatProvider {
             .map(|s| format!("local/{s}"))
             .unwrap_or_else(|| "local/qwen2".to_string());
 
+        let safety = SafetyConfig::lightweight(&tokenizer);
+
         Ok(Self {
             model_path,
             tokenizer,
@@ -524,7 +644,39 @@ impl QwenChatProvider {
             eos,
             default_max_tokens: 512,
             model_label,
+            safety,
         })
+    }
+
+    /// Select the on-device safety tier (ADR-005). [`SafetyMode::Off`] disables
+    /// the steerer and the ADR-012 control loop (the plain single-pass decode);
+    /// [`SafetyMode::Lightweight`] (the default) runs the token-anchor guard +
+    /// hard-ban steerer + checkpointed rollback. `SecDecoding`/`Csd` need model
+    /// assets not shipped here and fall back to the `Lightweight` wiring.
+    pub fn with_safety(mut self, mode: SafetyMode) -> Self {
+        self.safety.mode = mode;
+        self
+    }
+
+    /// Add extra words to the chunk guard's unsafe patterns (resolved to token
+    /// ids via this model's tokenizer). Primarily a **test/demo hook**: e.g.
+    /// `--guard-word banana` lets you watch the ADR-012 rollback / fail-closed
+    /// refusal fire on a benign word, without needing the model to emit genuinely
+    /// harmful content. Guard-only — these are not added to the hard-ban list, so
+    /// the trajectory loop (not silent suppression) is what engages.
+    pub fn with_extra_guard_words<I, S>(mut self, words: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for word in words {
+            for seq in word_to_patterns(&self.tokenizer, word.as_ref()) {
+                if !self.safety.patterns.contains(&seq) {
+                    self.safety.patterns.push(seq);
+                }
+            }
+        }
+        self
     }
 
     fn encode(&self, text: &str) -> Result<Vec<Token>> {
@@ -557,9 +709,15 @@ impl LlmProvider for QwenChatProvider {
         let engine = QwenEngine::from_path(&self.model_path, self.eos)?;
         let d_load = t_load.map(|t| t.elapsed()).unwrap_or_default();
 
-        let mut session =
-            InferenceSession::new(SessionId(1), SessionConfig::default(), engine, self.permit);
-        let ports = Ports::permissive();
+        // Carry the active safety tier on the session config so the runtime
+        // derives the tier-aware ADR-012 `RollbackPolicy`; the matching steerer
+        // + chunk guard are wired into the ports below.
+        let cfg = SessionConfig {
+            safety: self.safety.mode,
+            ..SessionConfig::default()
+        };
+        let mut session = InferenceSession::new(SessionId(1), cfg, engine, self.permit);
+        let ports = self.safety.ports();
 
         let _ = bench::take(); // clear forward accumulators before prefill
         let t_prefill = bench::enabled().then(std::time::Instant::now);
@@ -569,16 +727,48 @@ impl LlmProvider for QwenChatProvider {
 
         let max = req.max_tokens.unwrap_or(self.default_max_tokens);
         let t_decode = bench::enabled().then(std::time::Instant::now);
-        session.generate(&ports, max)?;
+        let stop = session.generate(&ports, max)?;
         let d_decode = t_decode.map(|t| t.elapsed()).unwrap_or_default();
         let (dc_total, dc_model, dc_calls) = bench::take();
 
-        let out = session.output();
+        let out = session.output().to_vec();
         let completion_tokens = out.len() as u32;
 
         let t_detok = bench::enabled().then(std::time::Instant::now);
-        let content = self.decode(out)?.trim().to_string();
+        let decoded = self.decode(&out)?.trim().to_string();
         let d_detok = t_detok.map(|t| t.elapsed()).unwrap_or_default();
+
+        // ADR-012: surface what the decode-time control loop did. A fail-closed
+        // stop (rollbacks exhausted / no safe checkpoint) returns the
+        // deterministic refusal rather than the truncated unsafe prefix; any
+        // intervention is reported on stderr so the test client can show the
+        // guard working without corrupting the reply on stdout.
+        let safety_active = !matches!(self.safety.mode, SafetyMode::Off);
+        let content = if safety_active {
+            let events = session.drain_events();
+            let violations = events
+                .iter()
+                .filter(|e| matches!(e.event, DomainEvent::SafetyViolationDetected { .. }))
+                .count();
+            let rollbacks = events
+                .iter()
+                .filter(|e| matches!(e.event, DomainEvent::ClaimBacktracked { .. }))
+                .count();
+            let refused = stop == StopReason::Stopped && violations > 0;
+            if violations > 0 || rollbacks > 0 {
+                eprintln!(
+                    "[safety] {violations} violation(s), {rollbacks} rollback(s){}",
+                    if refused { " → refused (fail-closed)" } else { " → recovered" }
+                );
+            }
+            if refused {
+                SAFETY_REFUSAL.to_string()
+            } else {
+                decoded
+            }
+        } else {
+            decoded
+        };
 
         if bench::enabled() {
             report_breakdown(
@@ -1026,5 +1216,53 @@ mod tests {
             std::path::Path::new("/nonexistent/tokenizer.json"),
         );
         assert!(matches!(r, Err(EdgeError::Engine(_))));
+    }
+
+    // ── safety wiring (ADR-005 tier + ADR-012 control loop) ──────────────────
+
+    #[test]
+    fn safety_off_wires_no_guard_or_steering() {
+        // Off → the plain single-pass decode: `Ports::permissive()` semantics
+        // regardless of any resolved bans/patterns.
+        let cfg = SafetyConfig {
+            mode: SafetyMode::Off,
+            banned: vec![1],
+            patterns: vec![vec![2]],
+        };
+        let ports = cfg.ports();
+        assert!(ports.guard.is_none(), "Off must not wire the chunk guard");
+        assert_eq!(
+            ports.safety.mode(),
+            SafetyMode::Off,
+            "Off must keep the no-op steerer"
+        );
+    }
+
+    #[test]
+    fn lightweight_wires_guard_and_hard_ban_steerer() {
+        let cfg = SafetyConfig {
+            mode: SafetyMode::Lightweight,
+            banned: vec![1],
+            patterns: vec![vec![2, 3]],
+        };
+        let ports = cfg.ports();
+        assert!(ports.guard.is_some(), "Lightweight must wire the chunk guard");
+        assert_eq!(
+            ports.safety.mode(),
+            SafetyMode::Lightweight,
+            "a non-empty ban list selects the LightweightFilter steerer"
+        );
+    }
+
+    #[test]
+    fn lightweight_without_patterns_has_no_guard() {
+        // No resolvable unsafe patterns (e.g. all multi-token and tokenizer
+        // produced nothing) → guard stays off; the per-step ban can still apply.
+        let cfg = SafetyConfig {
+            mode: SafetyMode::Lightweight,
+            banned: vec![7],
+            patterns: vec![],
+        };
+        assert!(cfg.ports().guard.is_none());
     }
 }

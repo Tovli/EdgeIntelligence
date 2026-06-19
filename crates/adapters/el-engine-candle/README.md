@@ -49,8 +49,36 @@ println!("{}", reply.content);
 
 Each `chat` call builds a fresh `QwenEngine` (Candle exposes no public KV-cache
 reset) and runs the standard SDK path: provenance permit → `load_prompt`
-(prefill) → `generate` (grammar mask → safety steer → greedy commit). Decoding
-is deterministic greedy argmax, so replies are reproducible.
+(prefill) → `generate` (grammar mask → safety steer → chunk-guard + checkpointed
+rollback → greedy commit). Decoding is deterministic greedy argmax, so replies
+are reproducible.
+
+### On-device safety (ADR-005 + ADR-012)
+
+`QwenChatProvider` is **secure by default**: `from_paths` resolves a conservative
+built-in unsafe-word list against the model's tokenizer into the token-id data
+the runtime's float-free safety loop consumes — a `LightweightFilter` hard-ban
+steerer plus an `AnchorGuard` (weights-free token-anchor chunk guard) — and wires
+them into the session's `Ports`. The ADR-012 control loop then runs on every
+reply: guard the trajectory, roll the KV cache + output back to the last safe
+checkpoint on a hard breach, and fail closed with a deterministic refusal once
+`max_rollbacks` is exhausted. The owning app does **not** depend on `el-safety`;
+the adapter is the one layer that bridges tokenizer text ↔ token ids.
+
+```rust
+use el_core::SafetyMode;
+# use el_engine_candle::QwenChatProvider;
+# fn demo(provider: QwenChatProvider) {
+let provider = provider
+    .with_safety(SafetyMode::Off)          // opt out → plain single-pass decode
+    .with_extra_guard_words(["banana"]);   // test hook: trip the guard on a benign word
+# }
+```
+
+`SecDecoding`/`Csd` need model assets not shipped here and fall back to the
+`Lightweight` wiring. Token-anchor heuristics match whole token n-grams, so they
+are a defence-in-depth net, not a complete guard — production swaps in the active
+tier's real safety model (ADR-012 model inventory).
 
 ## Benchmark instrumentation
 
@@ -75,5 +103,9 @@ transformer path.
 
 Part of the [Edge Intelligence](../../../README.md) workspace. Realizes
 [ADR-002](../../../docs/adr/ADR-002-candle-as-rust-native-inference-engine.md)
-and [ADR-010](../../../docs/adr/ADR-010-unified-llm-provider-trait-with-opt-in-frontier-egress.md);
-see the [Inference Runtime](../../../docs/ddd/bounded-contexts/01-inference-runtime.md) context.
+and [ADR-010](../../../docs/adr/ADR-010-unified-llm-provider-trait-with-opt-in-frontier-egress.md),
+and wires the on-device safety of
+[ADR-005](../../../docs/adr/ADR-005-on-device-only-tiered-decoder-time-safety.md) /
+[ADR-012](../../../docs/adr/ADR-012-layered-decode-time-safety-control-loop-with-checkpointed-rollback.md)
+into the chat provider; see the
+[Inference Runtime](../../../docs/ddd/bounded-contexts/01-inference-runtime.md) context.

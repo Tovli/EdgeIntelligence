@@ -84,6 +84,8 @@ echo "List three primary colors." | cargo run -p el-chat -- --once
 | `-p`, `--prompt <TEXT>` | — | Send one message, print the reply, exit |
 | `--once` | — | Read one line from stdin, reply, exit |
 | `--max-tokens <N>` | `512` | Max tokens generated per reply |
+| `--safety <MODE>` | `lightweight` | On-device safety tier: `off` or `lightweight` (ADR-005/ADR-012) |
+| `--guard-word <WORD>` | — | Add a chunk-guard trip word (repeatable; demo/test hook — see §6) |
 | `-h`, `--help` | — | Show help |
 
 Example with a custom persona and shorter replies:
@@ -114,9 +116,44 @@ and runs the standard `el_runtime::InferenceSession`:
 
 1. a **provenance `LoadPermit`** is required before the model can load (ADR-006);
 2. **prefill** feeds the prompt into the engine's KV cache;
-3. the **decode loop** runs `grammar mask → safety steer → commit` per token.
+3. the **decode loop** runs `grammar mask → safety steer → chunk-guard +
+   checkpointed rollback → commit` (ADR-005 + ADR-012).
 
 Replies print through the SDK's `LlmProvider::chat_stream`.
+
+### On-device safety (ADR-005 tier + ADR-012 control loop)
+
+Safety is **on by default** (`--safety lightweight`). Every reply runs the SDK's
+recoverable decode-time control loop, with all stages on-device and air-gapped:
+
+- a **hard-ban steerer** (`LightweightFilter`) drops a small set of clearly-unsafe
+  single tokens before each greedy pick;
+- a **chunk guard** (`AnchorGuard` — weights-free token-anchor heuristics) scores
+  the generated trajectory every few tokens against a built-in conservative
+  unsafe-word list;
+- on a hard breach the loop **rolls the KV cache + output back** to the last
+  guard-verified-safe checkpoint, bans the offending token, and resumes; after
+  the bounded `max_rollbacks` (or with no safe checkpoint) it **fails closed**
+  with a deterministic refusal.
+
+When the loop intervenes you'll see a one-line `[safety]` summary on stderr, e.g.
+`[safety] 2 violation(s), 2 rollback(s) → recovered`. Pass `--safety off` to run
+the plain single-pass decode (no steerer, no guard).
+
+The built-in word list is intentionally narrow (weapons/mass-harm manufacture)
+to avoid false positives in ordinary chat; an aligned model rarely emits it, so
+to **watch the loop fire** use the test hook on a benign word:
+
+```sh
+cargo run -p el-chat -- --guard-word banana \
+  --prompt "Please say the word banana, repeating it many times." --once
+```
+
+The guard catches the trip word mid-generation, rolls back, and recovers — proof
+the ADR-012 loop runs end-to-end on the real model. (As weights-free heuristics,
+the `lightweight` tier matches whole token n-grams, so a model can still evade
+via sub-word fragments or inflections — production swaps in the active tier's
+real safety model per the ADR-012 model inventory.)
 
 ## 7. Notes and limitations
 

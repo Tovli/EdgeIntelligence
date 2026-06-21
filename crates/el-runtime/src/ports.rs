@@ -65,18 +65,24 @@ pub struct Ports {
     /// Optional chunk guard for the checkpointed-rollback control loop
     /// (ADR-012). `None` runs the plain single-pass decode.
     pub guard: Option<Box<dyn ChunkGuard>>,
+    /// Optional **ingress / prompt-risk triage** (ADR-013): scores the prompt
+    /// before generation. Reuses the [`ChunkGuard`] contract — it scores a token
+    /// window for risk — applied to the prompt rather than the output. `None`
+    /// runs no ingress check.
+    pub ingress: Option<Box<dyn ChunkGuard>>,
     pub relay: Option<Box<dyn HybridRelay>>,
 }
 
 impl Ports {
     /// Defaults: identity compression, all-tokens-allowed grammar, no safety
-    /// steering, no guard, no relay (air-gapped).
+    /// steering, no guard, no ingress, no relay (air-gapped).
     pub fn permissive() -> Self {
         Self {
             compressor: Box::new(super::defaults::IdentityCompressor),
             grammar: Box::new(super::defaults::AllowAllMasker),
             safety: Box::new(el_safety::NoSafety),
             guard: None,
+            ingress: None,
             relay: None,
         }
     }

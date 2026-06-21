@@ -9,3 +9,20 @@ crates/adapters/el-ffi/src/frb_generated.rs
 # Claude Code local state (worktrees, settings.local.json)
 .claude/
 benchmarks/data/
+
+# Codex local configuration
+.codex/
+
+# Claude Flow runtime data
+.claude-flow/data/
+.claude-flow/logs/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+.agents/
+
+# Local agent instruction files
+AGENTS.md
+CLAUDE.md

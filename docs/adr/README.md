@@ -18,6 +18,9 @@ the `adr-patterns` namespace.
 | [008](./ADR-008-implement-the-sdk-in-rust-instead-of-c-cpp.md) | Implement the SDK in Rust instead of C/C++ | accepted | language, rust, foundational |
 | [009](./ADR-009-flutter-rust-bridge-for-dart-bindings.md) | flutter_rust_bridge v2 for Dart/Flutter bindings | accepted | ffi, flutter, dart, mobile |
 | [010](./ADR-010-unified-llm-provider-trait-with-opt-in-frontier-egress.md) | Unified LlmProvider trait with opt-in frontier LLM cloud egress | accepted | llm, cloud, networking, trait |
+| [011](./ADR-011-multi-registry-release-ci-crates-io-npm-pub-dev.md) | Multi-Registry Release CI (crates.io, npm, pub.dev) | accepted | ci, release, crates.io, npm, pub.dev, packaging |
+| [012](./ADR-012-layered-decode-time-safety-control-loop-with-checkpointed-rollback.md) | Layered decode-time safety control loop with checkpointed rollback | accepted | safety, security, on-device, runtime, supporting |
+| [013](./ADR-013-model-backed-steering-layers-for-the-hybrid-safety-control-loop.md) | Model-backed steering layers for the hybrid safety control loop | proposed | safety, security, on-device, runtime, follow-up |
 
 ## Decision relationships
 
@@ -35,6 +38,10 @@ flowchart LR
     A004 --> A007[007 Content-free telemetry]
     A004 -. partially amended by .-> A010
     A003 -. budget triggers degradation .-> A005
+    A005 --> A012[012 Decode-time safety loop + rollback]
+    A012 --> A013[013 Model-backed steering layers]
+    A003 -. budget triggers degradation .-> A012
+    A006 -. signs safety weights .-> A013
 ```
 
 > **ADR-008 is foundational** (the language decision) and drives the revisions to

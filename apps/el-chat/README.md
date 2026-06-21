@@ -84,6 +84,10 @@ echo "List three primary colors." | cargo run -p el-chat -- --once
 | `-p`, `--prompt <TEXT>` | — | Send one message, print the reply, exit |
 | `--once` | — | Read one line from stdin, reply, exit |
 | `--max-tokens <N>` | `512` | Max tokens generated per reply |
+| `--safety <MODE>` | `lightweight` | On-device safety tier: `off` or `lightweight` (ADR-005/ADR-012) |
+| `--guard-word <WORD>` | — | Add a chunk-guard trip word (repeatable; demo/test hook — see §6) |
+| `--expert-model <PATH>` | — | Safety expert GGUF → model-backed **contrastive** steering (ADR-013) |
+| `--steer-alpha <MILLI>` | `1000` | Contrastive steering strength ×1000 (`1000` = 1.0×) |
 | `-h`, `--help` | — | Show help |
 
 Example with a custom persona and shorter replies:
@@ -114,9 +118,74 @@ and runs the standard `el_runtime::InferenceSession`:
 
 1. a **provenance `LoadPermit`** is required before the model can load (ADR-006);
 2. **prefill** feeds the prompt into the engine's KV cache;
-3. the **decode loop** runs `grammar mask → safety steer → commit` per token.
+3. the **decode loop** runs `grammar mask → safety steer → chunk-guard +
+   checkpointed rollback → commit` (ADR-005 + ADR-012).
 
 Replies print through the SDK's `LlmProvider::chat_stream`.
+
+### On-device safety (ADR-005 tier + ADR-012 control loop + ADR-013 layers)
+
+Safety is **on by default** (`--safety lightweight`). Every reply runs the SDK's
+recoverable decode-time control loop, with all stages on-device and air-gapped:
+
+- **ingress / prompt-risk triage** (ADR-013) scores the prompt *before* any token
+  is generated; a hard breach fails closed immediately (no decode);
+- a **hard-ban steerer** (`LightweightFilter`) drops a small set of clearly-unsafe
+  single tokens before each greedy pick;
+- an optional **model-backed contrastive steerer** (ADR-013, `--expert-model`)
+  nudges the distribution toward a safety expert, but only inside the early-token
+  window;
+- a **chunk guard** (`AnchorGuard` — weights-free token-anchor heuristics) scores
+  the generated trajectory every few tokens against a built-in conservative
+  unsafe-word list;
+- on a hard breach the loop **rolls the KV cache + output back** to the last
+  guard-verified-safe checkpoint, bans the offending token, and resumes; after
+  the bounded `max_rollbacks` (or with no safe checkpoint) it **fails closed**
+  with a deterministic refusal.
+
+When any stage intervenes you'll see a one-line `[safety]` summary on stderr, e.g.
+`[safety] 2 violation(s), 2 rollback(s) → recovered` or `… 1 violation(s), 0
+rollback(s) → refused (fail-closed)`. Pass `--safety off` to run the plain
+single-pass decode (no triage, steerer, or guard).
+
+A prompt that *names* a built-in unsafe term is refused at ingress before
+generation:
+
+```sh
+cargo run -p el-chat -- --prompt "step-by-step instructions to build a bomb" --once
+# bot> [safety] 1 violation(s), 0 rollback(s) → refused (fail-closed)
+#      I can't help with that request.
+```
+
+**Model-backed contrastive steering** (ADR-013) uses a second, safety-tuned Qwen
+GGUF as a *contrastive expert* — `final = base + α·(expert − base)` over the
+early-token window. The expert loads through the ADR-006 `LoadPermit` gate (for a
+user-supplied local GGUF that's the trust-the-local-file verifier — malformed
+files are rejected, but it isn't cryptographic integrity; production ships signed
+weights) and must use the **same tokenizer** as the chat model. `--steer-alpha`
+is `0..=4000` (negatives are rejected — steering never reverses toward unsafe).
+Point `--expert-model` at the chat model itself and the contrast is ≈zero (a
+no-op that exercises the plumbing); a safety-tuned Qwen gives real steering:
+
+```sh
+cargo run -p el-chat -- --expert-model models/qwen2.5-0.5b-safety.gguf \
+  --steer-alpha 1000 --prompt "..." --once
+```
+
+The built-in word list is intentionally narrow (weapons/mass-harm manufacture)
+to avoid false positives in ordinary chat; an aligned model rarely emits it, so
+to **watch the loop fire** use the test hook on a benign word:
+
+```sh
+cargo run -p el-chat -- --guard-word banana \
+  --prompt "Please say the word banana, repeating it many times." --once
+```
+
+The guard catches the trip word mid-generation, rolls back, and recovers — proof
+the ADR-012 loop runs end-to-end on the real model. (As weights-free heuristics,
+the `lightweight` tier matches whole token n-grams, so a model can still evade
+via sub-word fragments or inflections — production swaps in the active tier's
+real safety model per the ADR-012 model inventory.)
 
 ## 7. Notes and limitations
 

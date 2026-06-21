@@ -20,6 +20,7 @@ pub use session::InferenceSession;
 // Re-export the safety ports and the concrete on-device steerers/guards so
 // adapters wire one type system (they depend on `el-runtime`, not `el-safety`).
 pub use el_safety::{
-    AnchorGuard, Checkpoint, CheckpointManager, ChunkGuard, LightweightFilter, LogitAdjustment,
-    NoSafety, RollbackPolicy, SafetyScore, SafetySteerer,
+    contrastive_adjustment, AnchorGuard, Checkpoint, CheckpointManager, ChunkGuard,
+    ContrastiveSteerer, ExpertLogits, LightweightFilter, LogitAdjustment, NoSafety, RollbackPolicy,
+    SafetyModeSelector, SafetyScore, SafetySteerer,
 };

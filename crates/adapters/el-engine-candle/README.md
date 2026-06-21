@@ -80,6 +80,21 @@ let provider = provider
 are a defence-in-depth net, not a complete guard — production swaps in the active
 tier's real safety model (ADR-012 model inventory).
 
+**ADR-013 model-backed layers.** The **built-in** anchor patterns drive both the
+output chunk guard and **ingress triage** (the prompt is scored before
+generation; a hard breach fails closed with no decode). `--guard-word` extras are
+guard-only — they never trigger an ingress refusal. `with_expert_model(path)`
+enables **contrastive steering**: a second `QwenExpert` (any same-tokenizer Qwen
+GGUF) implements `ExpertLogits` and a `ContrastiveSteerer` applies
+`base + α·(expert − base)` over the early-token window only; supplying an expert
+promotes the session to `SecDecoding` so `SafetyModeSelector` gates it on device
+class. The expert re-primes to the prompt on a base rollback (no stale-branch
+logits). It loads through the ADR-006 `LoadPermit` gate using the local
+trust-the-file path for user GGUFs; this is not cryptographic integrity over the
+weights. Production signed weights must verify the whole artifact plus detached
+signature before issuing the permit. The chat model as its own expert is a
+≈no-op; a safety-tuned Qwen gives real steering.
+
 ## Benchmark instrumentation
 
 Setting `EL_BENCH=1` makes `QwenChatProvider::chat` print a per-phase breakdown

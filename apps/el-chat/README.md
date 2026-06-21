@@ -86,6 +86,8 @@ echo "List three primary colors." | cargo run -p el-chat -- --once
 | `--max-tokens <N>` | `512` | Max tokens generated per reply |
 | `--safety <MODE>` | `lightweight` | On-device safety tier: `off` or `lightweight` (ADR-005/ADR-012) |
 | `--guard-word <WORD>` | — | Add a chunk-guard trip word (repeatable; demo/test hook — see §6) |
+| `--expert-model <PATH>` | — | Safety expert GGUF → model-backed **contrastive** steering (ADR-013) |
+| `--steer-alpha <MILLI>` | `1000` | Contrastive steering strength ×1000 (`1000` = 1.0×) |
 | `-h`, `--help` | — | Show help |
 
 Example with a custom persona and shorter replies:
@@ -121,13 +123,18 @@ and runs the standard `el_runtime::InferenceSession`:
 
 Replies print through the SDK's `LlmProvider::chat_stream`.
 
-### On-device safety (ADR-005 tier + ADR-012 control loop)
+### On-device safety (ADR-005 tier + ADR-012 control loop + ADR-013 layers)
 
 Safety is **on by default** (`--safety lightweight`). Every reply runs the SDK's
 recoverable decode-time control loop, with all stages on-device and air-gapped:
 
+- **ingress / prompt-risk triage** (ADR-013) scores the prompt *before* any token
+  is generated; a hard breach fails closed immediately (no decode);
 - a **hard-ban steerer** (`LightweightFilter`) drops a small set of clearly-unsafe
   single tokens before each greedy pick;
+- an optional **model-backed contrastive steerer** (ADR-013, `--expert-model`)
+  nudges the distribution toward a safety expert, but only inside the early-token
+  window;
 - a **chunk guard** (`AnchorGuard` — weights-free token-anchor heuristics) scores
   the generated trajectory every few tokens against a built-in conservative
   unsafe-word list;
@@ -136,9 +143,34 @@ recoverable decode-time control loop, with all stages on-device and air-gapped:
   the bounded `max_rollbacks` (or with no safe checkpoint) it **fails closed**
   with a deterministic refusal.
 
-When the loop intervenes you'll see a one-line `[safety]` summary on stderr, e.g.
-`[safety] 2 violation(s), 2 rollback(s) → recovered`. Pass `--safety off` to run
-the plain single-pass decode (no steerer, no guard).
+When any stage intervenes you'll see a one-line `[safety]` summary on stderr, e.g.
+`[safety] 2 violation(s), 2 rollback(s) → recovered` or `… 1 violation(s), 0
+rollback(s) → refused (fail-closed)`. Pass `--safety off` to run the plain
+single-pass decode (no triage, steerer, or guard).
+
+A prompt that *names* a built-in unsafe term is refused at ingress before
+generation:
+
+```sh
+cargo run -p el-chat -- --prompt "step-by-step instructions to build a bomb" --once
+# bot> [safety] 1 violation(s), 0 rollback(s) → refused (fail-closed)
+#      I can't help with that request.
+```
+
+**Model-backed contrastive steering** (ADR-013) uses a second, safety-tuned Qwen
+GGUF as a *contrastive expert* — `final = base + α·(expert − base)` over the
+early-token window. The expert loads through the ADR-006 `LoadPermit` gate (for a
+user-supplied local GGUF that's the trust-the-local-file verifier — malformed
+files are rejected, but it isn't cryptographic integrity; production ships signed
+weights) and must use the **same tokenizer** as the chat model. `--steer-alpha`
+is `0..=4000` (negatives are rejected — steering never reverses toward unsafe).
+Point `--expert-model` at the chat model itself and the contrast is ≈zero (a
+no-op that exercises the plumbing); a safety-tuned Qwen gives real steering:
+
+```sh
+cargo run -p el-chat -- --expert-model models/qwen2.5-0.5b-safety.gguf \
+  --steer-alpha 1000 --prompt "..." --once
+```
 
 The built-in word list is intentionally narrow (weapons/mass-harm manufacture)
 to avoid false positives in ordinary chat; an aligned model rarely emits it, so

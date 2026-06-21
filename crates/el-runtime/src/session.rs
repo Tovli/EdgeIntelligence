@@ -7,7 +7,9 @@ use el_core::{
 };
 use el_memory::KvRegion;
 use el_provenance::LoadPermit;
-use el_safety::{Checkpoint, CheckpointManager, LogitAdjustment, RollbackPolicy};
+use el_safety::{
+    Checkpoint, CheckpointManager, LogitAdjustment, RollbackPolicy, SafetyModeSelector,
+};
 
 /// Below this static-memory budget there is no room to retain rollback
 /// checkpoints, so the control loop degrades to guard-only (no rollback) and
@@ -24,6 +26,9 @@ pub struct InferenceSession<E: InferenceEngine> {
     engine: E,
     kv: KvRegion,
     permit: LoadPermit,
+    /// The prompt fed at `load_prompt`, retained for ADR-013 ingress triage
+    /// (scored before generation).
+    prompt: Vec<Token>,
     output: Vec<Token>,
     step: u32,
     events: Vec<EventEnvelope>,
@@ -60,6 +65,7 @@ impl<E: InferenceEngine> InferenceSession<E> {
             engine,
             kv: KvRegion::new(),
             permit,
+            prompt: Vec::new(),
             output: Vec::new(),
             step: 0,
             events: Vec::new(),
@@ -115,6 +121,10 @@ impl<E: InferenceEngine> InferenceSession<E> {
             });
         }
 
+        // Retain the raw prompt for ADR-013 ingress triage (scored in
+        // `generate_with_policy` before any token is generated).
+        self.prompt = prompt.to_vec();
+
         let compressed = if self.config.compress {
             ports.compressor.compress(prompt)
         } else {
@@ -148,7 +158,13 @@ impl<E: InferenceEngine> InferenceSession<E> {
     /// Run the decode loop until EOS or `max_tokens`, deriving the rollback
     /// policy from the session's device tier and safety mode (ADR-005/ADR-012).
     pub fn generate(&mut self, ports: &Ports, max_tokens: u32) -> Result<StopReason> {
-        let policy = RollbackPolicy::for_device(self.config.device, self.config.safety);
+        // Resolve the *effective* tier in the decode path (ADR-013): a tier the
+        // device cannot run (e.g. `SecDecoding` on `MidRange`) is downgraded
+        // here, and the effective mode — not just the requested one — is what
+        // drives the policy and is recorded for telemetry.
+        let effective = SafetyModeSelector::resolve(self.config.safety, self.config.device);
+        self.emit(DomainEvent::SafetyModeSelected { mode: effective });
+        let policy = RollbackPolicy::for_device(self.config.device, effective);
         self.generate_with_policy(ports, max_tokens, policy)
     }
 
@@ -183,6 +199,30 @@ impl<E: InferenceEngine> InferenceSession<E> {
                 found: self.phase.as_str(),
             });
         }
+
+        // ---- ingress / prompt-risk triage (ADR-013) ----
+        // Score the prompt before generating anything. A hard breach fails
+        // closed deterministically — no unsafe trajectory is ever started. This
+        // is the heterogeneous monitor's ingress layer, distinct from the
+        // output-side chunk guard below.
+        if policy.active() {
+            if let Some(ingress) = ports.ingress.as_deref() {
+                let score = ingress.score(&self.prompt);
+                if score >= policy.hard_threshold {
+                    self.emit(DomainEvent::SafetyViolationDetected {
+                        score_milli: score.milli(),
+                        threshold_milli: policy.hard_threshold.milli(),
+                    });
+                    self.phase = Phase::Completed;
+                    self.emit(DomainEvent::GenerationCompleted {
+                        total_tokens: self.output.len() as u32,
+                        stop: StopReason::Stopped,
+                    });
+                    return Ok(StopReason::Stopped);
+                }
+            }
+        }
+
         let eos = self.engine.eos_token();
         let guarding = policy.guards() && ports.guard.is_some();
 
@@ -245,8 +285,30 @@ impl<E: InferenceEngine> InferenceSession<E> {
                 let allowed = mask.iter().filter(|b| **b).count() as u32;
                 self.emit(DomainEvent::TokenMaskApplied { allowed });
 
-                // 4. safety adjust (AFTER mask, BEFORE sampling).
-                let adj = ports.safety.adjust(&self.output);
+                // 4. safety adjust (AFTER mask, BEFORE sampling). Inside the
+                //    early-token soft-steering window (ADR-013) the steerer is
+                //    given the base logits so a model-backed (contrastive)
+                //    steerer can run; outside the window it is token-only (hard
+                //    bans every step). For token-only steerers the two paths are
+                //    identical (the default `adjust_with_logits` delegates).
+                let adj = if (self.output.len() as u32) < policy.steer_window {
+                    // Hide grammar-illegal tokens from the steerer so a top-K
+                    // model-backed steerer ranks only legal candidates — otherwise
+                    // the whole top-K could be illegal and legal tokens get no
+                    // adjustment. Skip the copy when the grammar allows everything.
+                    if mask.iter().any(|&legal| !legal) {
+                        let legal_logits: Vec<i32> = logits
+                            .iter()
+                            .zip(mask.iter())
+                            .map(|(&l, &legal)| if legal { l } else { i32::MIN })
+                            .collect();
+                        ports.safety.adjust_with_logits(&self.output, &legal_logits)
+                    } else {
+                        ports.safety.adjust_with_logits(&self.output, &logits)
+                    }
+                } else {
+                    ports.safety.adjust(&self.output)
+                };
                 if !adj.is_empty() {
                     self.emit(DomainEvent::LogitsSteered {
                         adjustment_norm_milli: adj.l1_norm_milli(),
@@ -392,6 +454,7 @@ impl<E: InferenceEngine> InferenceSession<E> {
     /// Clear KV/output for a fresh conversation (volatile memory only).
     pub fn reset(&mut self) {
         self.kv = KvRegion::new();
+        self.prompt.clear();
         self.output.clear();
         self.step = 0;
         self.phase = Phase::Initialized;
@@ -522,6 +585,7 @@ mod tests {
             grammar: Box::new(DisallowMasker(vec![0])), // grammar removes the top token
             safety: Box::new(LightweightFilter::new(vec![1])), // safety bans the next-best
             guard: None,
+            ingress: None,
             relay: None,
         };
         s.load_prompt(&ports, &[1]).unwrap();
@@ -630,6 +694,7 @@ mod tests {
     fn tiny_policy(max_rollbacks: u8) -> RollbackPolicy {
         RollbackPolicy {
             guard_every: 1,
+            steer_window: 0,
             soft_threshold: SafetyScore::from_milli(500),
             hard_threshold: SafetyScore::from_milli(800),
             max_rollbacks,
@@ -687,6 +752,7 @@ mod tests {
     fn coarse_policy(max_rollbacks: u8) -> RollbackPolicy {
         RollbackPolicy {
             guard_every: 16,
+            steer_window: 0,
             soft_threshold: SafetyScore::from_milli(500),
             hard_threshold: SafetyScore::from_milli(800),
             max_rollbacks,
@@ -852,6 +918,7 @@ mod tests {
             grammar: Box::new(crate::defaults::AllowAllMasker),
             safety: Box::new(el_safety::NoSafety),
             guard: Some(guard),
+            ingress: None,
             relay: None,
         }
     }
@@ -971,6 +1038,7 @@ mod tests {
             grammar: Box::new(DenyAllMasker),
             safety: Box::new(el_safety::NoSafety),
             guard: None,
+            ingress: None,
             relay: None,
         };
         s.load_prompt(&ports, &[]).unwrap();
@@ -1005,5 +1073,126 @@ mod tests {
         assert_eq!(stop, StopReason::Stopped);
         assert!(s.output().is_empty()); // refused back to the post-prefill prefix
         assert_eq!(s.kv_len(), 3); // prefill KV intact, not truncated to 0
+    }
+
+    // ----- ADR-013 model-backed steering: window, ingress, mode selector -----
+
+    use el_core::SafetyMode;
+    use el_safety::SafetySteerer;
+
+    /// Records, per step, whether the logit-aware path was taken and the output
+    /// length at that step — so a test can prove the early-token window gating.
+    struct RecordingSteerer {
+        log: std::rc::Rc<std::cell::RefCell<Vec<(bool, usize)>>>,
+    }
+    impl SafetySteerer for RecordingSteerer {
+        fn adjust(&self, recent: &[Token]) -> LogitAdjustment {
+            self.log.borrow_mut().push((false, recent.len()));
+            LogitAdjustment::none()
+        }
+        fn adjust_with_logits(&self, recent: &[Token], _base: &[i32]) -> LogitAdjustment {
+            self.log.borrow_mut().push((true, recent.len()));
+            LogitAdjustment::none()
+        }
+        fn mode(&self) -> SafetyMode {
+            SafetyMode::SecDecoding
+        }
+    }
+
+    #[test]
+    fn soft_steer_applies_only_inside_the_early_token_window() {
+        // AC-1: adjust_with_logits runs for output positions < steer_window, and
+        // plain token-only adjust() afterwards.
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut s = InferenceSession::new(
+            SessionId(30),
+            SessionConfig::default(),
+            descending_engine(), // never EOS (eos 9999)
+            permit(),
+        );
+        let ports = Ports {
+            compressor: Box::new(crate::defaults::IdentityCompressor),
+            grammar: Box::new(crate::defaults::AllowAllMasker),
+            safety: Box::new(RecordingSteerer { log: log.clone() }),
+            guard: None,
+            ingress: None,
+            relay: None,
+        };
+        s.load_prompt(&ports, &[]).unwrap();
+        let policy = RollbackPolicy {
+            guard_every: 0,
+            steer_window: 2,
+            soft_threshold: SafetyScore::MAX,
+            hard_threshold: SafetyScore::MAX,
+            max_rollbacks: 0,
+            max_checkpoints: 0,
+        };
+        s.generate_with_policy(&ports, 4, policy).unwrap();
+
+        let calls = log.borrow();
+        assert_eq!(calls.len(), 4);
+        for &(with_logits, len) in calls.iter() {
+            assert_eq!(
+                with_logits,
+                len < 2,
+                "window gate wrong at output len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn ingress_triage_fails_closed_before_generation() {
+        // AC-3: a prompt scored at/above the hard threshold refuses with no decode.
+        let mut s = InferenceSession::new(
+            SessionId(31),
+            SessionConfig::default(),
+            descending_engine(),
+            permit(),
+        );
+        let ports = Ports {
+            compressor: Box::new(crate::defaults::IdentityCompressor),
+            grammar: Box::new(crate::defaults::AllowAllMasker),
+            safety: Box::new(el_safety::NoSafety),
+            guard: None,
+            ingress: Some(Box::new(AlwaysHot)), // prompt scores MAX
+            relay: None,
+        };
+        s.load_prompt(&ports, &[1, 2, 3]).unwrap();
+
+        let stop = s.generate_with_policy(&ports, 8, coarse_policy(0)).unwrap();
+
+        assert_eq!(stop, StopReason::Stopped);
+        assert!(s.output().is_empty());
+        let evs = s.drain_events();
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e.event, DomainEvent::SafetyViolationDetected { .. })));
+        // Fail-closed at ingress means nothing was ever generated/committed.
+        assert!(!evs
+            .iter()
+            .any(|e| matches!(e.event, DomainEvent::TokenCommitted { .. })));
+    }
+
+    #[test]
+    fn generate_applies_safety_mode_selector_and_records_effective_mode() {
+        // AC-4: SecDecoding on MidRange downgrades to Lightweight in the decode
+        // path, and the effective mode is what gets recorded.
+        let cfg = SessionConfig {
+            device: el_core::DeviceTarget::MidRange,
+            safety: SafetyMode::SecDecoding,
+            ..SessionConfig::default()
+        };
+        let mut s = InferenceSession::new(SessionId(32), cfg, NullEngine::new(0, 4), permit());
+        let ports = Ports::permissive();
+        s.load_prompt(&ports, &[1]).unwrap();
+        s.generate(&ports, 4).unwrap();
+
+        let evs = s.drain_events();
+        assert!(evs.iter().any(|e| matches!(
+            e.event,
+            DomainEvent::SafetyModeSelected {
+                mode: SafetyMode::Lightweight
+            }
+        )));
     }
 }

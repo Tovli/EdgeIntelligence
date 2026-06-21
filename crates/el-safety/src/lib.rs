@@ -46,9 +46,19 @@ impl LogitAdjustment {
     }
 
     /// L1 norm in milli-units — what `LogitsSteered.adjustment_norm_milli`
-    /// reports to telemetry.
+    /// reports to telemetry. Saturating, so a large steered set can never
+    /// overflow the `u32` aggregate.
     pub fn l1_norm_milli(&self) -> u32 {
-        self.penalties.iter().map(|(_, d)| d.unsigned_abs()).sum()
+        self.penalties
+            .iter()
+            .fold(0u32, |acc, (_, d)| acc.saturating_add(d.unsigned_abs()))
+    }
+
+    /// The `(token, milli-delta)` pairs this adjustment applies. Lets callers
+    /// compose adjustments (e.g. hard bans + contrastive steering) without
+    /// re-deriving them.
+    pub fn penalties(&self) -> &[(Token, i32)] {
+        &self.penalties
     }
 }
 
@@ -57,6 +67,20 @@ impl LogitAdjustment {
 pub trait SafetySteerer {
     fn adjust(&self, recent_tokens: &[Token]) -> LogitAdjustment;
     fn mode(&self) -> SafetyMode;
+
+    /// Logit-aware steering (ADR-013). Given the base model's next-token logits
+    /// for this step, return the adjustment to apply (still after the grammar
+    /// mask, before sampling — the ADR-005 order is unchanged).
+    ///
+    /// The default ignores the logits and delegates to [`adjust`](Self::adjust),
+    /// so token-only steerers (hard bans, heuristics) need no change. Model-backed
+    /// steerers (e.g. [`ContrastiveSteerer`]) override this to use the base
+    /// distribution. The runtime calls this **inside** the early-token
+    /// soft-steering window and plain [`adjust`](Self::adjust) outside it, so a
+    /// model-backed adjustment costs nothing once the window closes.
+    fn adjust_with_logits(&self, recent_tokens: &[Token], _base_logits: &[i32]) -> LogitAdjustment {
+        self.adjust(recent_tokens)
+    }
 }
 
 /// Chooses the affordable mode for the device (ADR-005).
@@ -126,11 +150,138 @@ impl SecDecodingSteerer {
 impl SafetySteerer for SecDecodingSteerer {
     fn adjust(&self, _recent: &[Token]) -> LogitAdjustment {
         // TODO(adr-005): run base + safety models on Candle, derive adjustment
-        // from their divergence.
+        // from their divergence. See [`ContrastiveSteerer`] (ADR-013) for the
+        // real mechanism, wired once an expert logit source is supplied.
         LogitAdjustment::none()
     }
     fn mode(&self) -> SafetyMode {
         SafetyMode::SecDecoding
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-013 — model-backed (contrastive) steering
+// ---------------------------------------------------------------------------
+
+/// Safety-tuned next-token logits for the committed context, in integer
+/// milli-logits over the **same vocabulary and tokenizer** as the base
+/// generator (the ADR-012 shared-tokenizer invariant — the contrastive direction
+/// is only meaningful when base and expert share a token set). The expert weights
+/// are integrity-gated on load (ADR-006) by the adapter that constructs the
+/// implementor; like every safety path this is deterministic and **never touches
+/// the network** (ADR-004).
+pub trait ExpertLogits {
+    /// Expert next-token milli-logits given the committed (generated) context.
+    fn logits(&self, committed: &[Token]) -> Vec<i32>;
+}
+
+/// SafeDecoding-style **contrastive adjustment** (ADR-013): steer toward the
+/// safety expert and away from the base — `final = base + α·(expert − base)` —
+/// returned as additive milli-logit penalties consumed after the grammar mask,
+/// before sampling (the ADR-005 order is unchanged).
+///
+/// `alpha_milli` is the steering strength ×1000 (`1000` = 1.0×). Only the
+/// `top_k` highest-base-logit tokens are steered (`0` = all): SafeDecoding
+/// restricts contrast to the head of the distribution so long-tail noise is not
+/// amplified. Deterministic and integer (ADR-008).
+///
+/// Safety/robustness invariants: a **negative** `alpha_milli` is clamped to `0`
+/// — contrastive steering must never push *toward* the base/unsafe direction —
+/// and the delta math is **saturating**, so an extreme strength can neither
+/// overflow `i64` nor wrap on the `i32` cast. Plus the usual fail-safes: an
+/// **empty** result when `base`/`expert` lengths differ (or are empty), and a
+/// natural **no-op** when `expert == base` (every delta is zero).
+pub fn contrastive_adjustment(
+    base: &[i32],
+    expert: &[i32],
+    alpha_milli: i32,
+    top_k: usize,
+) -> LogitAdjustment {
+    if base.is_empty() || base.len() != expert.len() {
+        return LogitAdjustment::none();
+    }
+    // Never steer toward the base/unsafe direction (clamp negative to zero).
+    let alpha = i64::from(alpha_milli.max(0));
+    // Tokens to steer: the top_k by base logit (deterministic tie-break on
+    // index), or all of them when top_k is 0 or covers the whole vocab.
+    let mut idx: Vec<usize> = (0..base.len()).collect();
+    if top_k > 0 && top_k < base.len() {
+        idx.sort_unstable_by(|&a, &b| base[b].cmp(&base[a]).then(a.cmp(&b)));
+        idx.truncate(top_k);
+    }
+    let mut penalties: Vec<(Token, i32)> = Vec::new();
+    for i in idx {
+        let diff = i64::from(expert[i]) - i64::from(base[i]);
+        // Saturating throughout: extreme alpha saturates rather than wrapping.
+        let delta = (diff.saturating_mul(alpha) / 1000)
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        if delta != 0 {
+            penalties.push((i as Token, delta));
+        }
+    }
+    LogitAdjustment::with_penalties(penalties)
+}
+
+/// `SafetyMode::SecDecoding` (or model-backed `Lightweight`) steerer (ADR-013): a
+/// hard-ban layer applied **every step** plus **contrastive soft steering** from
+/// an [`ExpertLogits`] source applied only when the runtime supplies base logits
+/// (i.e. inside the early-token window). With no expert divergence it reduces to
+/// the hard-ban behaviour of [`LightweightFilter`]; with no bans and a flat
+/// expert it is a no-op.
+pub struct ContrastiveSteerer<E: ExpertLogits> {
+    expert: E,
+    banned: Vec<Token>,
+    alpha_milli: i32,
+    top_k: usize,
+    mode: SafetyMode,
+}
+
+impl<E: ExpertLogits> ContrastiveSteerer<E> {
+    /// `mode` is the tier label reported to telemetry (`Lightweight` for a LoRA
+    /// expert, `SecDecoding` for a contrastive base+expert pair).
+    pub fn new(
+        expert: E,
+        banned: Vec<Token>,
+        alpha_milli: i32,
+        top_k: usize,
+        mode: SafetyMode,
+    ) -> Self {
+        Self {
+            expert,
+            banned,
+            alpha_milli,
+            top_k,
+            mode,
+        }
+    }
+
+    fn bans(&self) -> Vec<(Token, i32)> {
+        self.banned
+            .iter()
+            .map(|&t| (t, LightweightFilter::HARD_BAN))
+            .collect()
+    }
+}
+
+impl<E: ExpertLogits> SafetySteerer for ContrastiveSteerer<E> {
+    /// Out-of-window / token-only path: hard bans only (no expert forward).
+    fn adjust(&self, _recent: &[Token]) -> LogitAdjustment {
+        LogitAdjustment::with_penalties(self.bans())
+    }
+
+    /// In-window path: hard bans **plus** contrastive soft steering. Bans are
+    /// listed first, so a token that is both banned and steered keeps the hard
+    /// ban (`delta_for` returns the first match).
+    fn adjust_with_logits(&self, recent: &[Token], base_logits: &[i32]) -> LogitAdjustment {
+        let mut penalties = self.bans();
+        let expert = self.expert.logits(recent);
+        let contrast = contrastive_adjustment(base_logits, &expert, self.alpha_milli, self.top_k);
+        penalties.extend_from_slice(contrast.penalties());
+        LogitAdjustment::with_penalties(penalties)
+    }
+
+    fn mode(&self) -> SafetyMode {
+        self.mode
     }
 }
 
@@ -227,16 +378,20 @@ impl ChunkGuard for AnchorGuard {
 /// Cadence and bounds for the checkpointed-rollback control loop (ADR-012),
 /// chosen per device tier so cost scales with the hardware budget (ADR-003).
 ///
-/// The early-token *soft-steering window* is intentionally absent: hard bans
-/// apply every step, and the windowed SecDecoding-style steering arrives with
-/// its model (follow-up). Checkpoint spacing is `guard_every` — checkpoints are
-/// only taken at guard-verified-safe boundaries, so there is no separate
-/// checkpoint cadence to misconfigure.
+/// `steer_window` is the ADR-012 stage-1 **early-token soft-steering window**
+/// (ADR-013): model-backed steering applies for the first `steer_window` output
+/// tokens, then decode falls back to hard-bans-only unless the guard
+/// re-escalates. Hard bans still apply every step regardless. Checkpoint spacing
+/// is `guard_every` — checkpoints are only taken at guard-verified-safe
+/// boundaries, so there is no separate checkpoint cadence to misconfigure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RollbackPolicy {
     /// Score the output every `guard_every` tokens (`0` = never); also the
     /// spacing of safe-prefix checkpoints.
     pub guard_every: u32,
+    /// Apply model-backed (soft) steering for the first `steer_window` output
+    /// tokens (`0` = never — token-only/hard-ban steering at every step).
+    pub steer_window: u32,
     /// At/above this score, escalate; do not advance the safe checkpoint.
     pub soft_threshold: SafetyScore,
     /// At/above this score, roll back (or fail closed).
@@ -256,6 +411,7 @@ impl RollbackPolicy {
         match device {
             DeviceTarget::MidRange => Self {
                 guard_every: 16,
+                steer_window: 8,
                 soft_threshold: SafetyScore(600),
                 hard_threshold: SafetyScore(800),
                 max_rollbacks: 2,
@@ -263,6 +419,7 @@ impl RollbackPolicy {
             },
             DeviceTarget::HighEnd | DeviceTarget::Auto => Self {
                 guard_every: 4,
+                steer_window: 16,
                 soft_threshold: SafetyScore(500),
                 hard_threshold: SafetyScore(750),
                 max_rollbacks: 4,
@@ -275,6 +432,7 @@ impl RollbackPolicy {
     pub fn disabled() -> Self {
         Self {
             guard_every: 0,
+            steer_window: 0,
             soft_threshold: SafetyScore::MAX,
             hard_threshold: SafetyScore::MAX,
             max_rollbacks: 0,
@@ -285,6 +443,12 @@ impl RollbackPolicy {
     /// Whether the guard/rollback machinery is active under this policy.
     pub fn guards(&self) -> bool {
         self.guard_every > 0
+    }
+
+    /// Whether any safety stage (guard/rollback or the soft-steering window) is
+    /// active — used to gate ingress triage (ADR-013).
+    pub fn active(&self) -> bool {
+        self.guard_every > 0 || self.steer_window > 0
     }
 }
 
@@ -381,6 +545,95 @@ mod tests {
         assert!(adj.l1_norm_milli() > 0);
     }
 
+    // ----- ADR-013 model-backed (contrastive) steering -----
+
+    /// Synthetic expert: returns fixed logits, ignoring context — deterministic.
+    struct FixedExpert(Vec<i32>);
+    impl ExpertLogits for FixedExpert {
+        fn logits(&self, _committed: &[Token]) -> Vec<i32> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn contrastive_pushes_toward_expert_and_is_noop_when_equal() {
+        let base = [100, 200, 300];
+        let expert = [600, 200, 100]; // prefers t0, dislikes t2
+        let adj = contrastive_adjustment(&base, &expert, 1000, 0); // alpha 1.0, all
+        assert_eq!(adj.delta_for(0), 500); // +500 toward expert
+        assert_eq!(adj.delta_for(1), 0); // unchanged → dropped
+        assert_eq!(adj.delta_for(2), -200); // away from base preference
+
+        // Half strength halves the deltas.
+        assert_eq!(
+            contrastive_adjustment(&base, &expert, 500, 0).delta_for(0),
+            250
+        );
+        // expert == base → no-op.
+        assert!(contrastive_adjustment(&base, &base, 1000, 0).is_empty());
+    }
+
+    #[test]
+    fn contrastive_top_k_restricts_to_distribution_head() {
+        let base = [10, 50, 40, 5]; // top-2 by base: t1, t2
+        let expert = [999, 999, 999, 999];
+        let adj = contrastive_adjustment(&base, &expert, 1000, 2);
+        assert_ne!(adj.delta_for(1), 0);
+        assert_ne!(adj.delta_for(2), 0);
+        assert_eq!(adj.delta_for(0), 0); // outside the head → untouched
+        assert_eq!(adj.delta_for(3), 0);
+    }
+
+    #[test]
+    fn contrastive_empty_on_length_mismatch_or_empty() {
+        assert!(contrastive_adjustment(&[1, 2, 3], &[1, 2], 1000, 0).is_empty());
+        assert!(contrastive_adjustment(&[], &[], 1000, 0).is_empty());
+    }
+
+    #[test]
+    fn contrastive_clamps_negative_and_saturates_extreme_alpha() {
+        let base = [100, 200];
+        let expert = [900, 0];
+        // Negative strength must NOT reverse the safety direction → clamped to a
+        // no-op.
+        assert!(contrastive_adjustment(&base, &expert, -5000, 0).is_empty());
+        // Extreme strength saturates instead of wrapping (no overflow/panic) and
+        // still steers toward the expert-preferred token.
+        let adj = contrastive_adjustment(&base, &expert, i32::MAX, 0);
+        assert!(adj.delta_for(0) > 0);
+        assert!(adj.delta_for(1) < 0);
+        let _ = adj.l1_norm_milli(); // saturating; must not overflow/panic
+    }
+
+    #[test]
+    fn contrastive_steerer_layers_bans_and_contrast() {
+        let base = [100, 100, 100];
+        let expert = FixedExpert(vec![100, 400, 100]); // prefers token 1
+        let steerer = ContrastiveSteerer::new(expert, vec![0], 1000, 0, SafetyMode::SecDecoding);
+
+        // Token-only path (out of window): hard ban only, no contrast.
+        let banned_only = steerer.adjust(&[]);
+        assert_eq!(banned_only.delta_for(0), LightweightFilter::HARD_BAN);
+        assert_eq!(banned_only.delta_for(1), 0);
+
+        // In-window path: ban (token 0) + contrastive steer toward token 1.
+        let full = steerer.adjust_with_logits(&[], &base);
+        assert_eq!(full.delta_for(0), LightweightFilter::HARD_BAN); // ban dominates
+        assert_eq!(full.delta_for(1), 300); // 400 - 100
+        assert_eq!(steerer.mode(), SafetyMode::SecDecoding);
+    }
+
+    #[test]
+    fn policy_has_tier_aware_steer_window() {
+        let mid = RollbackPolicy::for_device(DeviceTarget::MidRange, SafetyMode::Lightweight);
+        let high = RollbackPolicy::for_device(DeviceTarget::HighEnd, SafetyMode::SecDecoding);
+        assert!(mid.steer_window > 0 && high.steer_window > 0);
+        assert!(high.steer_window >= mid.steer_window);
+        let off = RollbackPolicy::for_device(DeviceTarget::Auto, SafetyMode::Off);
+        assert_eq!(off.steer_window, 0);
+        assert!(!off.active());
+    }
+
     #[test]
     fn anchor_guard_matches_token_ngrams_exactly() {
         // Two patterns: a single-token anchor (9) and a 2-token n-gram (40,41).
@@ -405,8 +658,14 @@ mod tests {
 
         // No patterns (or only empty ones) → always safe, never matches.
         assert!(AnchorGuard::hard(vec![]).is_empty());
-        assert_eq!(AnchorGuard::hard(vec![]).score(&[1, 2, 3]), SafetyScore::SAFE);
-        assert_eq!(AnchorGuard::hard(vec![vec![]]).score(&[1]), SafetyScore::SAFE);
+        assert_eq!(
+            AnchorGuard::hard(vec![]).score(&[1, 2, 3]),
+            SafetyScore::SAFE
+        );
+        assert_eq!(
+            AnchorGuard::hard(vec![vec![]]).score(&[1]),
+            SafetyScore::SAFE
+        );
     }
 
     #[test]

@@ -136,3 +136,21 @@ degrades to the weights-free `Lightweight` heuristics and ultimately
 - Constrained by: [ADR-004](./ADR-004-air-gapped-by-default-with-opt-in-hybrid-mode.md) (no safety stage touches the network), [ADR-006](./ADR-006-mandatory-ed25519-model-signature-verification-load-gate.md) (sign safety weights), [ADR-003](./ADR-003-static-memory-planning-with-zero-allocation-arena.md) (memory budget / degradation), [ADR-002](./ADR-002-candle-as-rust-native-inference-engine.md) (Candle engine / KV-cache rollback cost).
 - Research: [docs/research/SecDecoding alternatives research.md](../research/SecDecoding%20alternatives%20research.md)
 - Implementation seams: `crates/el-safety` (`SecDecodingSteerer`, `SafetySteerer`, `ChunkGuard`, `AnchorGuard`, `RollbackPolicy`, `SafetyModeSelector`), `crates/el-runtime` (`generate_with_policy`), `crates/adapters/el-engine-candle` (`QwenChatProvider`), `apps/el-chat` + `apps/el-bench` (the `--safety` surface).
+
+## Implementation status
+
+Landed via a SPARC pass ("full plumbing + port evolution" scope):
+
+- **Port evolution** — defaulted `SafetySteerer::adjust_with_logits(recent, base_logits)`; the decode loop calls it window-gated (`el-safety`, `el-runtime`). Additive, no control-flow change; all prior tests stay green.
+- **R1 early-token window** — `RollbackPolicy::steer_window` (tier-aware) gates soft steering in `generate_with_policy`.
+- **R2 ingress triage** — `Ports::ingress` + retained session prompt; a hard breach fails closed before any decode. Wired in the adapter via `AnchorGuard` over the prompt.
+- **R3 contrastive steering** — `el_safety::contrastive_adjustment` + `ContrastiveSteerer<E: ExpertLogits>`; `el_engine_candle::QwenExpert` (second Qwen engine) implements `ExpertLogits`. Enabled by `--expert-model` (top-K restricted; α via `--steer-alpha`).
+- **R4 effective mode** — `generate` applies `SafetyModeSelector` in the decode path and emits `SafetyModeSelected{effective}`.
+- **R5 load gate** — `QwenExpert::from_path_primed` requires a `LoadPermit` (ADR-006). For a user-supplied local GGUF there is no detached signature, so this is the same *trust-the-local-file* verifier the base model uses: it enforces the load-permit protocol and the loader rejects malformed GGUFs, but it is **not** cryptographic integrity over the weights. A signed safety artifact (production) needs a separate signed-artifact path that verifies the whole GGUF bytes plus detached signature before issuing the permit.
+- **Expert rollback alignment** — when the base engine rolls back, `QwenExpert` re-primes to the prompt and re-feeds the retained prefix, so the contrastive context stays aligned (no stale-branch logits). Cost is bounded by `max_rollbacks`, like the base engine.
+
+Still **deferred** (need real trained assets / HW): the safety LoRA / classifier weights themselves, accelerator-class true `SecDecoding`, the async (Hydra-style) guard, and **cryptographic verification of user-supplied weights** (no signature exists for local files). The `Lightweight` tier remains weights-free token-anchor heuristics.
+
+### Review fixes (post-implementation hardening)
+
+A code review surfaced six issues, all fixed: (1) the expert permit used a dummy local verifier with an overbroad integrity claim → the claim now explicitly says local GGUFs are trust-the-file only and production signed assets need whole-artifact verification; (2) the expert kept the abandoned branch after a rollback → now re-primes; (3) an expert installed a `SecDecoding` steerer while the session stayed `Lightweight` → the session is now promoted to `SecDecoding` so `SafetyModeSelector` gates it on device class and telemetry is honest; (4) top-K contrastive ranking ignored the grammar mask → grammar-illegal tokens are now hidden from the steerer; (5) `--guard-word` extras leaked into ingress and refused the rollback demo → ingress now uses built-in patterns only; (6) `--steer-alpha` was unchecked → negatives are clamped (never reverse the safety direction), the milli math saturates, and the CLI validates `0..=4000`.

@@ -38,7 +38,7 @@ exclude = [
 
 [workspace.package]
 edition = "2021"
-version = "0.3.8"
+version = "0.3.9"
 license = "Apache-2.0"
 rust-version = "1.96"
 repository = "Edge-Native LLM SDK"
@@ -48,16 +48,16 @@ repository = "Edge-Native LLM SDK"
 # This is the single source of truth for internal dep version requirements;
 # member crates reference them with `{ workspace = true }` and add no inline
 # version fields. `cargo set-version --workspace <ver>` updates every entry.
-el-core               = { path = "crates/el-core", version = "0.3.8" }
-el-memory             = { path = "crates/el-memory", version = "0.3.8" }
-el-telemetry          = { path = "crates/el-telemetry", version = "0.3.8" }
-el-provenance         = { path = "crates/el-provenance", version = "0.3.8" }
-el-safety             = { path = "crates/el-safety", version = "0.3.8" }
-el-runtime            = { path = "crates/el-runtime", version = "0.3.8" }
-el-grammar            = { path = "crates/el-grammar", version = "0.3.8" }
-el-provenance-ed25519 = { path = "crates/adapters/el-provenance-ed25519", version = "0.3.8" }
-el-engine-candle      = { path = "crates/adapters/el-engine-candle", version = "0.3.8" }
-el-cloud              = { path = "crates/adapters/el-cloud", version = "0.3.8" }
+el-core               = { path = "crates/el-core", version = "0.3.9" }
+el-memory             = { path = "crates/el-memory", version = "0.3.9" }
+el-telemetry          = { path = "crates/el-telemetry", version = "0.3.9" }
+el-provenance         = { path = "crates/el-provenance", version = "0.3.9" }
+el-safety             = { path = "crates/el-safety", version = "0.3.9" }
+el-runtime            = { path = "crates/el-runtime", version = "0.3.9" }
+el-grammar            = { path = "crates/el-grammar", version = "0.3.9" }
+el-provenance-ed25519 = { path = "crates/adapters/el-provenance-ed25519", version = "0.3.9" }
+el-engine-candle      = { path = "crates/adapters/el-engine-candle", version = "0.3.9" }
+el-cloud              = { path = "crates/adapters/el-cloud", version = "0.3.9" }
 
 [profile.release]
 opt-level = 3

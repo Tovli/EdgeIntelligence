@@ -76,6 +76,9 @@ jobs:
       - name: cargo test --locked --workspace
         run: cargo test --locked --workspace
 
+      - name: Assert crates.io packages ship README.md
+        run: bash scripts/assert-release-readmes.sh cargo
+
       - name: cargo fmt --check
         run: cargo fmt --check
 
@@ -220,6 +223,10 @@ jobs:
     env:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       - uses: actions/download-artifact@v4
         with:
           name: wasm-output
@@ -251,11 +258,27 @@ jobs:
                   browser: "./src/web/el_ffi.js",
                   "react-native": "./src/rn/el_ffi.ts"
                 }
-              },
-              types: "./src/web/el_ffi.d.ts",
-              files: ["src/", "android/", "ios/"],
-              license: "Apache-2.0"
-            }' > assembly/package.json
+               },
+               types: "./src/web/el_ffi.d.ts",
+               files: ["src/", "android/", "ios/", "README.md"],
+               license: "Apache-2.0"
+             }' > assembly/package.json
+      - name: Write README.md
+        run: |
+          cat > assembly/README.md <<'EOF'
+          # edge-intelligence-sdk
+
+          Generated Web and React Native bindings for the Edge Intelligence SDK.
+
+          This package contains the WASM/TypeScript browser surface, React Native
+          TypeScript bindings, and native Android/iOS libraries assembled by the
+          release pipeline.
+
+          Source, crate documentation, and release notes live in the Edge
+          Intelligence repository.
+          EOF
+      - name: Assert npm package ships README.md
+        run: bash scripts/assert-release-readmes.sh npm assembly
       - uses: actions/upload-artifact@v4
         with:
           name: npm-package
@@ -268,6 +291,7 @@ jobs:
     env:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: flutter-bindings
@@ -285,6 +309,8 @@ jobs:
           name: wasm-output
           path: assembly/pkg/
       - uses: dart-lang/setup-dart@v1
+      - name: Assert pub.dev package includes README.md
+        run: bash scripts/assert-release-readmes.sh pub assembly
       - name: dart pub publish --dry-run (validation gate)
         run: dart pub publish --dry-run
         working-directory: assembly/
@@ -328,6 +354,10 @@ jobs:
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
+      - name: Assert npm package artifact ships README.md
+        run: |
+          test -s npm-package/README.md
+          npm pack npm-package/ --dry-run --json | grep -Eq '"path": ?"README\.md"'
       - name: Publish edge-intelligence-sdk
         run: npm publish npm-package/ --access public
         env:
@@ -343,6 +373,8 @@ jobs:
           name: pub-package
           path: pub-package/
       - uses: dart-lang/setup-dart@v1
+      - name: Assert pub.dev package artifact includes README.md
+        run: test -s pub-package/README.md
       - name: Configure pub.dev credentials
         run: |
           mkdir -p ~/.config/dart

@@ -12,6 +12,30 @@ cat > "$TMP/bin/cargo" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [ "${1:-}" = "package" ]; then
+  crate=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -p)
+        shift
+        crate="$1"
+        ;;
+    esac
+    shift || true
+  done
+
+  case "$crate" in
+    el-core|el-ffi)
+      printf '%s\n' Cargo.toml README.md src/lib.rs
+      ;;
+    *)
+      echo "unexpected package crate: $crate" >&2
+      exit 65
+      ;;
+  esac
+  exit 0
+fi
+
 crate=""
 while [ "$#" -gt 0 ]; do
   case "$1" in

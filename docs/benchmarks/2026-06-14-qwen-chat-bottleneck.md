@@ -5,6 +5,10 @@
 `el-chat` test client (`el_core::LlmProvider` → `el_engine_candle::QwenChatProvider`
 → `el_runtime::InferenceSession`).
 **Question:** Where does the time go, and what is the dominant bottleneck?
+**Status:** ⭐ **Performance baseline** — the canonical *pre-ADR-018* reference for
+the local inference path. Later performance runs are compared against this report.
+See [2026-06-22 — after ADR-018 (full suite)](./2026-06-22-adr-018-resident-model-full-suite.md),
+which retires bottleneck #2 and re-measures #1/#3.
 
 ---
 

@@ -243,6 +243,13 @@ fn main() {
                     continue;
                 }
                 "reset" => {
+                    // Release the prior conversation's KV BEFORE reporting success.
+                    // If it can't be cleared, stop rather than fail open (the
+                    // provider drops on exit, freeing the KV via ownership).
+                    if !release_session(&provider) {
+                        eprintln!("(ending session to release conversation memory)");
+                        break;
+                    }
                     history = vec![ChatMessage::system(&args.system)];
                     eprintln!("(conversation reset)");
                     continue;
@@ -251,10 +258,14 @@ fn main() {
                     let new_sys = parts.next().unwrap_or("").trim();
                     if new_sys.is_empty() {
                         eprintln!("(usage: /system <text>)");
-                    } else {
-                        history = vec![ChatMessage::system(new_sys)];
-                        eprintln!("(system prompt updated; conversation reset)");
+                        continue;
                     }
+                    if !release_session(&provider) {
+                        eprintln!("(ending session to release conversation memory)");
+                        break;
+                    }
+                    history = vec![ChatMessage::system(new_sys)];
+                    eprintln!("(system prompt updated; conversation reset)");
                     continue;
                 }
                 other => {
@@ -271,11 +282,39 @@ fn main() {
             Ok(reply) => history.push(ChatMessage::assistant(reply)),
             Err(e) => {
                 eprintln!("\n(generation error: {e}; conversation reset)");
+                if !release_session(&provider) {
+                    eprintln!("(ending session to release conversation memory)");
+                    break;
+                }
                 history = vec![ChatMessage::system(&args.system)];
             }
         }
     }
     eprintln!("bye.");
+}
+
+/// Release the provider's resident conversation memory — KV (evicted in the
+/// engine), prompt, output, and buffered events — while keeping the model loaded
+/// (ADR-018; PRD "KV caches … cleared on session end"). Used by `/reset`,
+/// `/system`, and generation-error recovery so a discarded conversation does not
+/// linger in the engine until the next turn.
+///
+/// Retries once, then returns `false` if the conversation could **not** be
+/// cleared. Callers must then stop rather than fail open (continue and report a
+/// successful reset with user K/V possibly still resident): on `false` they break
+/// the loop so `main` returns and the provider drops, freeing the KV via ownership.
+fn release_session(provider: &QwenChatProvider) -> bool {
+    if provider.end_session().is_ok() {
+        return true;
+    }
+    // One retry for a transient failure.
+    match provider.end_session() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("(error: could not clear conversation memory: {e})");
+            false
+        }
+    }
 }
 
 /// Stream one assistant reply to stdout via the SDK's `LlmProvider::chat_stream`;

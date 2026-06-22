@@ -57,4 +57,9 @@ impl InferenceEngine for NullEngine {
     fn rollback(&mut self, _keep_committed: u32) -> Result<()> {
         Ok(())
     }
+
+    /// Stateless: no conversation cache to discard.
+    fn reset_cache(&mut self) -> Result<()> {
+        Ok(())
+    }
 }

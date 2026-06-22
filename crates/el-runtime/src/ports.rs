@@ -37,6 +37,23 @@ pub trait InferenceEngine {
     /// make the choice explicit. A stateless engine whose `next_logits`
     /// recomputes purely from `committed` implements it as `Ok(())`.
     fn rollback(&mut self, keep_committed: u32) -> Result<()>;
+
+    /// Return the engine to its **pristine, pre-prefill** state so the same
+    /// loaded weights can serve a *new conversation* without being reloaded
+    /// (ADR-018). After `Ok(())`, the next [`prefill`](Self::prefill) must build a
+    /// KV cache from scratch as if the engine had just been constructed.
+    ///
+    /// This is distinct from [`rollback`](Self::rollback): `rollback(keep)` rewinds
+    /// *within* a generation to a safe prefix of length `keep` (ADR-012);
+    /// `reset_cache` discards the whole conversation. It is what lets a provider
+    /// hold one resident model and reuse it across turns instead of re-reading the
+    /// weights from disk every call.
+    ///
+    /// Like `rollback`, it is **required with no default**: a stateful adapter that
+    /// forgot to override would otherwise carry a stale cache into the next
+    /// conversation. A stateless engine whose `next_logits` recomputes purely from
+    /// `committed` implements it as `Ok(())`.
+    fn reset_cache(&mut self) -> Result<()>;
 }
 
 /// Prompt Compression port (LLMLingua-2 — context 2).

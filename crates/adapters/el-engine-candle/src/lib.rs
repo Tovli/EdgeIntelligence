@@ -179,6 +179,11 @@ impl InferenceEngine for CandleEngine {
     fn rollback(&mut self, _keep_committed: u32) -> Result<()> {
         Ok(())
     }
+
+    /// Stateless: no conversation cache to discard between turns (ADR-018).
+    fn reset_cache(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ── LlmProvider (text-level) wrapper (ADR-010) ───────────────────────────────
@@ -261,7 +266,8 @@ impl LlmProvider for LocalLlmProvider {
         let max = req.max_tokens.unwrap_or(64);
 
         let mut session = self.session.lock().unwrap();
-        session.reset();
+        session.reset()?;
+        let _ = session.drain_events(); // bound buffered events across reused turns
         let ports = Ports::permissive();
         session.load_prompt(&ports, &prompt_tokens)?;
         session.generate(&ports, max)?;
@@ -351,8 +357,12 @@ mod bench {
 /// A real Qwen2 transformer `InferenceEngine`.
 ///
 /// Holds candle's stateful KV cache. Within one generation it is fed
-/// incrementally (prefill, then one new token per `next_logits` call); candle
-/// exposes no public cache reset, so a *fresh conversation* builds a new engine.
+/// incrementally (prefill, then one new token per `next_logits` call). The engine
+/// is **loaded once and reused across conversations** (ADR-018): candle exposes no
+/// public cache-clear, but its attention *replaces* the cache on a forward at
+/// `index_pos == 0`, so [`reset_cache`](InferenceEngine::reset_cache) evicts the
+/// previous conversation's KV with a single benign position-0 forward — no engine
+/// reconstruction and no reload from disk between turns.
 ///
 /// A *within-generation* safety backtrack (ADR-012) is supported via
 /// [`InferenceEngine::rollback`]: candle's attention discards its cache when a
@@ -375,6 +385,12 @@ pub struct QwenEngine {
     last_logits: Vec<i32>,
     vocab: usize,
     eos: Token,
+    /// Whether candle's per-layer KV cache may hold conversation-derived K/V that
+    /// still needs clearing (ADR-018). Set by every `forward_one` (before the
+    /// fallible model forward) and cleared **only** after a fully successful
+    /// eviction forward in `reset_cache`, so a partially-failed eviction is retried
+    /// rather than skipped — `index_pos` alone can't carry that signal.
+    cache_dirty: bool,
 }
 
 impl QwenEngine {
@@ -397,12 +413,17 @@ impl QwenEngine {
             last_logits: Vec::new(),
             vocab: 0,
             eos,
+            cache_dirty: false,
         })
     }
 
     /// One forward over a single token at the current position; advances the KV
     /// cache and returns milli-logits for the next token.
     fn forward_one(&mut self, token: Token) -> Result<Vec<i32>> {
+        // Any forward may write conversation K/V into candle's cache; mark dirty
+        // before the fallible call so a forward that fails part-way still leaves
+        // the cache flagged for clearing (ADR-018).
+        self.cache_dirty = true;
         let t_total = bench::enabled().then(std::time::Instant::now);
 
         let input = Tensor::from_vec(vec![token], (1, 1), &self.device)
@@ -477,6 +498,43 @@ impl InferenceEngine for QwenEngine {
             let t = self.prompt[i];
             self.last_logits = self.forward_one(t)?;
         }
+        Ok(())
+    }
+
+    /// Release the current conversation's KV **while keeping the resident weights
+    /// loaded** (ADR-018) — the separation of conversation lifecycle from model
+    /// lifecycle, and the engine half of [`InferenceSession::close`] / `reset`.
+    ///
+    /// candle's `quantized_qwen2` owns its per-layer KV with no public clear API,
+    /// but its attention *ignores and replaces* the cache on a forward at
+    /// `index_pos == 0`. So one forward over a benign token (id 0) drops the prior
+    /// (user) K/V tensors — freeing that memory and clearing the user's data from
+    /// the cache (PRD line 131) — without touching the weights. What remains is a
+    /// single non-user token's KV, itself overwritten by the next prefill or freed
+    /// when the engine is dropped. Skipped when nothing has been cached yet
+    /// (`index_pos == 0`), so a pristine or already-cleared engine does no work.
+    ///
+    /// Distinct from `rollback`, which *replays* a retained prefix to rewind
+    /// within a single generation. Fallible (it runs a forward); on error the
+    /// caller (`reset`/`close`) leaves session state untouched and surfaces it.
+    fn reset_cache(&mut self) -> Result<()> {
+        if self.cache_dirty {
+            // Overwrite (and thereby drop) the user K/V by forwarding a benign
+            // token at position 0; the resulting logits are discarded. `cache_dirty`
+            // is cleared **only after** a fully successful forward — if candle
+            // fails after replacing some layers, it stays set so the next call
+            // re-clears (a partially-cleared cache is never reported as clean).
+            self.index_pos = 0;
+            self.forward_one(0)?;
+            self.cache_dirty = false;
+        }
+        self.index_pos = 0;
+        self.fed = 0;
+        // Release (not just `clear`) the conversation-derived buffers so their
+        // bytes aren't retained in an owned allocation (P2): `Vec::new()` drops
+        // the old allocation; `clear()` would keep capacity and the stale ids.
+        self.prompt = Vec::new();
+        self.last_logits = Vec::new();
         Ok(())
     }
 }
@@ -680,19 +738,36 @@ impl ExpertLogits for QwenExpert {
     }
 }
 
+/// The resident model behind a [`QwenChatProvider`] (ADR-018).
+///
+/// The weights are loaded **once** (in [`QwenChatProvider::from_paths`]) into
+/// `Loaded`. The first `chat` promotes them into a reusable [`InferenceSession`]
+/// (`Active`) — done lazily so the builder-configured safety tier / expert is
+/// finalized first — and every later turn reuses that one session via
+/// `reset()` + `load_prompt()`. The model is never re-read from disk per turn.
+enum ChatSession {
+    /// Weights resident, no conversation session yet.
+    Loaded(QwenEngine),
+    /// Reusable session wrapping the resident engine.
+    Active(InferenceSession<QwenEngine>),
+    /// Transient placeholder held only during the `Loaded` → `Active` swap.
+    Swapping,
+}
+
 /// A real local chat backend: a Qwen2 GGUF model + its tokenizer, driven
 /// through [`el_runtime::InferenceSession`].
 ///
-/// Each `chat` call renders the whole conversation to Qwen2.5 ChatML, builds a
-/// fresh [`QwenEngine`] (candle has no public KV-cache reset), then runs the
-/// SDK's standard provenance-gated session: `load_prompt` (prefill) →
-/// `generate` (grammar mask → safety steer → guard + checkpointed rollback →
-/// greedy commit). On-device safety (ADR-005 `Lightweight` tier + the ADR-012
-/// control loop) is **on by default**; see [`with_safety`](Self::with_safety).
-/// The provider holds no mutable session state, so it is `Send + Sync` without
-/// locking.
+/// The model weights are loaded **once** at construction and kept resident
+/// (ADR-018): each `chat` renders the whole conversation to Qwen2.5 ChatML and
+/// reuses one persistent provenance-gated session — `reset` (discard the prior
+/// conversation + engine KV cache) → `load_prompt` (prefill) → `generate`
+/// (grammar mask → safety steer → guard + checkpointed rollback → greedy commit)
+/// — instead of rebuilding the engine and re-reading the GGUF every turn.
+/// On-device safety (ADR-005 `Lightweight` tier + the ADR-012 control loop) is
+/// **on by default**; see [`with_safety`](Self::with_safety). The resident model
+/// lives behind a `Mutex`, so the provider stays `Send + Sync` and concurrent
+/// `chat` calls serialize on the one conversation.
 pub struct QwenChatProvider {
-    model_path: std::path::PathBuf,
     tokenizer: Tokenizer,
     permit: LoadPermit,
     eos: Token,
@@ -700,10 +775,14 @@ pub struct QwenChatProvider {
     model_label: String,
     safety: SafetyConfig,
     /// Optional safety **expert** GGUF for ADR-013 contrastive steering. `None`
-    /// runs the token-only `Lightweight` steerer.
+    /// runs the token-only `Lightweight` steerer. NOTE (ADR-018 follow-up): the
+    /// expert is still loaded per turn; persisting it like the base model is the
+    /// next increment. The default (no-expert) path is fully resident.
     expert_model: Option<std::path::PathBuf>,
     /// Contrastive steering strength ×1000 (1000 = 1.0×).
     steer_alpha_milli: i32,
+    /// Resident model + reusable session (ADR-018).
+    session: std::sync::Mutex<ChatSession>,
 }
 
 impl QwenChatProvider {
@@ -731,8 +810,13 @@ impl QwenChatProvider {
         let safety = SafetyConfig::lightweight(&tokenizer);
 
         let permit = local_load_permit(&model_path)?;
+
+        // ADR-018: load the weights ONCE here and keep them resident, instead of
+        // re-reading the GGUF on every `chat`. The first `chat` promotes this into
+        // a reusable session (see `ChatSession`).
+        let engine = QwenEngine::from_path(&model_path, eos)?;
+
         Ok(Self {
-            model_path,
             tokenizer,
             permit,
             eos,
@@ -741,6 +825,7 @@ impl QwenChatProvider {
             safety,
             expert_model: None,
             steer_alpha_milli: 1000,
+            session: std::sync::Mutex::new(ChatSession::Loaded(engine)),
         })
     }
 
@@ -792,6 +877,24 @@ impl QwenChatProvider {
         self
     }
 
+    /// End the current conversation, releasing its KV / output / prompt / buffered
+    /// events **while keeping the model resident** (ADR-018 separation of
+    /// conversation and model lifecycles; the AC-4 explicit release / PRD line 131
+    /// "KV caches … cleared on session end"). The next `chat` starts a fresh
+    /// conversation on the same loaded weights — no reload. A no-op if no
+    /// conversation has started yet. To free the weights too, drop the provider
+    /// (Rust ownership).
+    pub fn end_session(&self) -> Result<()> {
+        let mut cell = self
+            .session
+            .lock()
+            .map_err(|_| EdgeError::Engine("chat session mutex poisoned"))?;
+        if let ChatSession::Active(session) = &mut *cell {
+            session.close()?;
+        }
+        Ok(())
+    }
+
     fn encode(&self, text: &str) -> Result<Vec<Token>> {
         let enc = self
             .tokenizer
@@ -815,18 +918,12 @@ impl LlmProvider for QwenChatProvider {
         let prompt_tokens = self.encode(&prompt)?;
         let d_encode = t_encode.map(|t| t.elapsed()).unwrap_or_default();
 
-        // Fresh engine + session each turn (candle KV cache has no public reset);
-        // the full conversation is re-prefilled. This is the standard SDK path —
-        // provenance permit, session lifecycle, decode loop — not a shortcut.
-        let t_load = bench::enabled().then(std::time::Instant::now);
-        let engine = QwenEngine::from_path(&self.model_path, self.eos)?;
-        let d_load = t_load.map(|t| t.elapsed()).unwrap_or_default();
-
         // Carry the active safety tier on the session config so the runtime
         // derives the tier-aware ADR-012 `RollbackPolicy` and records the true
         // mode. A supplied expert promotes the tier to `SecDecoding`, so the
         // runtime's `SafetyModeSelector` can gate it on device class instead of
-        // it masquerading as `Lightweight`.
+        // it masquerading as `Lightweight`. Both are deterministic from the
+        // builder-set config, so they are identical on every turn.
         let requested = requested_session_safety(self.safety.mode, self.expert_model.is_some());
         let cfg = SessionConfig {
             safety: requested,
@@ -837,7 +934,44 @@ impl LlmProvider for QwenChatProvider {
         // downgrades to `Lightweight` on non-accelerator devices, where the
         // expert is dropped — honest tier-aware behaviour).
         let effective = SafetyModeSelector::resolve(requested, cfg.device);
-        let mut session = InferenceSession::new(SessionId(1), cfg, engine, self.permit);
+
+        // ADR-018: reuse the resident model. Lock the session cell; on first use
+        // promote the loaded weights into a reusable session (created with the now
+        // final builder config); every later turn reuses it — no disk reload.
+        let mut cell = self
+            .session
+            .lock()
+            .map_err(|_| EdgeError::Engine("chat session mutex poisoned"))?;
+        let t_load = bench::enabled().then(std::time::Instant::now);
+        if matches!(&*cell, ChatSession::Loaded(_)) {
+            let engine = match std::mem::replace(&mut *cell, ChatSession::Swapping) {
+                ChatSession::Loaded(e) => e,
+                _ => unreachable!("guarded by the matches! above"),
+            };
+            *cell = ChatSession::Active(InferenceSession::new(
+                SessionId(1),
+                cfg,
+                engine,
+                self.permit,
+            ));
+        }
+        let d_load = t_load.map(|t| t.elapsed()).unwrap_or_default();
+        let session = match &mut *cell {
+            ChatSession::Active(s) => s,
+            // `Swapping` only persists if a prior promotion panicked — in which
+            // case `lock()` above would already have failed on the poisoned mutex.
+            _ => return Err(EdgeError::Engine("chat session not initialized")),
+        };
+
+        // Discard the previous conversation and the engine's KV cache, then run
+        // this turn over the SAME resident weights (ADR-018) — no disk reload.
+        session.reset()?;
+        // Provider-owned turn isolation: drop any events buffered by a prior turn
+        // (e.g. one that errored before its end-of-turn drain) so this turn's
+        // safety count below cannot include another turn's stale violations.
+        // `reset()` deliberately preserves events (generic semantics); bounding
+        // them per turn is the reusing provider's job.
+        let _ = session.drain_events();
         let mut ports = self.safety.ports();
 
         if matches!(effective, SafetyMode::SecDecoding) {
@@ -877,14 +1011,15 @@ impl LlmProvider for QwenChatProvider {
         let decoded = self.decode(&out)?.trim().to_string();
         let d_detok = t_detok.map(|t| t.elapsed()).unwrap_or_default();
 
-        // ADR-012: surface what the decode-time control loop did. A fail-closed
-        // stop (rollbacks exhausted / no safe checkpoint) returns the
-        // deterministic refusal rather than the truncated unsafe prefix; any
-        // intervention is reported on stderr so the test client can show the
-        // guard working without corrupting the reply on stdout.
+        // ADR-018: always drain — a persistent session would otherwise accumulate
+        // events across turns. ADR-012: surface what the decode-time control loop
+        // did. A fail-closed stop (rollbacks exhausted / no safe checkpoint)
+        // returns the deterministic refusal rather than the truncated unsafe
+        // prefix; any intervention is reported on stderr so the test client can
+        // show the guard working without corrupting the reply on stdout.
+        let events = session.drain_events();
         let safety_active = !matches!(self.safety.mode, SafetyMode::Off);
         let content = if safety_active {
-            let events = session.drain_events();
             let violations = events
                 .iter()
                 .filter(|e| matches!(e.event, DomainEvent::SafetyViolationDetected { .. }))
@@ -994,7 +1129,7 @@ fn report_breakdown(
     eprintln!("│ prompt_tokens={prompt_tokens}  completion_tokens={completion_tokens}");
     eprintln!("│ phase           wall(ms)    %total   throughput");
     eprintln!(
-        "│ model load    {:>9.1}  {:>6.1}%   (read+dequantize GGUF)",
+        "│ session setup {:>9.1}  {:>6.1}%   (weights loaded once at startup — ADR-018)",
         ms(d_load),
         pct(d_load)
     );

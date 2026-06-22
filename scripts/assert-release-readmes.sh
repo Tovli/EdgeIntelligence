@@ -18,29 +18,50 @@ assert_file_readme() {
 
 assert_cargo_readmes() {
   local crates="${PUBLISH_CRATES:-$DEFAULT_PUBLISH_CRATES}"
-  local tmp
-  tmp="$(mktemp)"
-  trap 'rm -f "$tmp"' RETURN
+  local package_list
+  local metadata
+  package_list="$(mktemp)"
+  metadata="$(mktemp)"
+  trap 'rm -f "$package_list" "$metadata"' RETURN
 
   cd "$ROOT"
+  cargo metadata --no-deps --format-version 1 > "$metadata"
   for crate in $crates; do
-    cargo package --list --allow-dirty -p "$crate" > "$tmp"
-    grep -Fxq "README.md" "$tmp" || fail "crates.io package ${crate} does not include README.md"
+    if ! CRATE="$crate" METADATA="$metadata" python3 <<'PYEOF'
+import json
+import os
+from pathlib import Path
+
+crate = os.environ["CRATE"]
+metadata = Path(os.environ["METADATA"])
+packages = json.loads(metadata.read_text(encoding="utf-8"))["packages"]
+
+for package in packages:
+    if package["name"] == crate:
+        readme = Path(package["manifest_path"]).parent / "README.md"
+        raise SystemExit(0 if readme.is_file() and readme.stat().st_size > 0 else 1)
+
+raise SystemExit(1)
+PYEOF
+    then
+      fail "crates.io package ${crate} source README.md is missing or empty"
+    fi
+
+    cargo package --list --allow-dirty -p "$crate" > "$package_list"
+    grep -Fxq "README.md" "$package_list" || fail "crates.io package ${crate} does not include README.md"
     echo "OK: crates.io package ${crate} includes README.md"
   done
 }
 
 assert_npm_readme() {
   local dir="${1:?npm package directory is required}"
-  local tmp
+  local pack_json
   assert_file_readme "$dir" "npm package at $dir"
-  tmp="$(mktemp)"
 
   cd "$dir"
-  npm pack --dry-run --json > "$tmp"
-  grep -Eq '"path": ?"README\.md"' "$tmp" \
+  pack_json="$(npm pack --dry-run --json)"
+  grep -Eq '"path": ?"README\.md"' <<<"$pack_json" \
     || fail "npm package at $dir would not ship README.md"
-  rm -f "$tmp"
   echo "OK: npm package at $dir ships README.md"
 }
 

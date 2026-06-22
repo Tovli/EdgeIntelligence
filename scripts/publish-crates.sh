@@ -11,7 +11,7 @@ RATE_LIMIT_SLEEP_SECONDS="${RATE_LIMIT_SLEEP_SECONDS:-600}"
 INDEX_POLL_ATTEMPTS="${INDEX_POLL_ATTEMPTS:-24}"
 INDEX_POLL_SECONDS="${INDEX_POLL_SECONDS:-15}"
 
-PUBLISH_CRATES="$PUBLISH_CRATES" "$SCRIPT_DIR/assert-release-readmes.sh" cargo
+PUBLISH_CRATES="$PUBLISH_CRATES" bash "$SCRIPT_DIR/assert-release-readmes.sh" cargo
 
 crate_url() {
   printf 'https://crates.io/api/v1/crates/%s/%s' "$1" "$VERSION"

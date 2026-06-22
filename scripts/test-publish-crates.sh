@@ -7,10 +7,42 @@ trap 'rm -rf "$TMP"' EXIT
 
 FAKE_STATE="$TMP/state"
 mkdir -p "$TMP/bin" "$FAKE_STATE"
+mkdir -p "$TMP/el-core" "$TMP/el-ffi"
+printf '%s\n' '# el-core' > "$TMP/el-core/README.md"
+printf '%s\n' '# el-ffi' > "$TMP/el-ffi/README.md"
 
 cat > "$TMP/bin/cargo" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+
+if [ "${1:-}" = "metadata" ]; then
+  cat "${FAKE_METADATA:?}"
+  exit 0
+fi
+
+if [ "${1:-}" = "package" ]; then
+  crate=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -p)
+        shift
+        crate="$1"
+        ;;
+    esac
+    shift || true
+  done
+
+  case "$crate" in
+    el-core|el-ffi)
+      printf '%s\n' Cargo.toml README.md src/lib.rs
+      ;;
+    *)
+      echo "unexpected package crate: $crate" >&2
+      exit 65
+      ;;
+  esac
+  exit 0
+fi
 
 crate=""
 while [ "$#" -gt 0 ]; do
@@ -49,6 +81,15 @@ esac
 SH
 chmod +x "$TMP/bin/cargo"
 
+cat > "$TMP/metadata.json" <<JSON
+{
+  "packages": [
+    { "name": "el-core", "manifest_path": "$TMP/el-core/Cargo.toml" },
+    { "name": "el-ffi", "manifest_path": "$TMP/el-ffi/Cargo.toml" }
+  ]
+}
+JSON
+
 cat > "$TMP/bin/curl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -80,9 +121,12 @@ exit 0
 SH
 chmod +x "$TMP/bin/jq"
 
+grep -q 'bash "$SCRIPT_DIR/assert-release-readmes.sh" cargo' "$ROOT/scripts/publish-crates.sh"
+
 OUTPUT="$TMP/output"
 PATH="$TMP/bin:$PATH" \
 FAKE_STATE="$FAKE_STATE" \
+FAKE_METADATA="$TMP/metadata.json" \
 VERSION="0.3.5" \
 PUBLISH_CRATES="el-core el-ffi" \
 PUBLISH_MAX_ATTEMPTS="2" \

@@ -3,12 +3,15 @@ set -euo pipefail
 
 : "${VERSION:?VERSION is required}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UA="${CRATES_IO_USER_AGENT:-edge-intelligence-release/ci}"
 PUBLISH_CRATES="${PUBLISH_CRATES:-el-core el-memory el-telemetry el-provenance el-safety el-runtime el-grammar el-provenance-ed25519 el-engine-candle el-cloud el-ffi}"
 PUBLISH_MAX_ATTEMPTS="${PUBLISH_MAX_ATTEMPTS:-3}"
 RATE_LIMIT_SLEEP_SECONDS="${RATE_LIMIT_SLEEP_SECONDS:-600}"
 INDEX_POLL_ATTEMPTS="${INDEX_POLL_ATTEMPTS:-24}"
 INDEX_POLL_SECONDS="${INDEX_POLL_SECONDS:-15}"
+
+PUBLISH_CRATES="$PUBLISH_CRATES" bash "$SCRIPT_DIR/assert-release-readmes.sh" cargo
 
 crate_url() {
   printf 'https://crates.io/api/v1/crates/%s/%s' "$1" "$VERSION"

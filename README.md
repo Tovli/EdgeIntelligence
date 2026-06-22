@@ -32,6 +32,7 @@ exist only behind an explicit opt-in backend.
 - [Quick start](#quick-start)
 - [Local chat test client](#local-chat-test-client)
 - [Workspace map](#workspace-map)
+- [Benchmarks](#benchmarks)
 - [Architecture decisions](#architecture-decisions)
 - [Domain model](#domain-model)
 - [Roadmap](#roadmap)
@@ -232,11 +233,37 @@ user guide.
 
 ## Workspace map
 
-Twelve crates plus the chat app. Each crate has its own README (linked below)
-covering its public API, a usage example, and the ADRs it realizes.
+Twelve crates plus two apps. Each crate has its own README (linked below)
+covering its public API, a usage example, and the ADRs it realizes; app rows
+identify the runnable clients.
 
 <details>
-<summary><b>Show the full crate table</b></summary>
+<summary><b>Show the full workspace table</b></summary>
+
+| Crate | Role | Current state |
+|-------|------|---------------|
+| [`crates/el-core`](crates/el-core) | Shared types, IDs, errors, events, `LlmProvider` trait | Implemented and tested |
+| [`crates/el-memory`](crates/el-memory) | Static arena planning and KV-cache descriptors | Implemented and tested |
+| [`crates/el-telemetry`](crates/el-telemetry) | Content-free event handling and privacy metrics | Implemented and tested |
+| [`crates/el-provenance`](crates/el-provenance) | Verified model load permits | Implemented and tested |
+| [`crates/el-safety`](crates/el-safety) | Tiered decoder-time safety policy | Partial, lightweight path implemented |
+| [`crates/el-runtime`](crates/el-runtime) | Session lifecycle and decode-loop orchestration | Implemented and tested |
+| [`crates/el-grammar`](crates/el-grammar) | DFA grammar masking | Implemented and tested |
+| [`crates/adapters/el-provenance-ed25519`](crates/adapters/el-provenance-ed25519) | Real ED25519 signature verification | Implemented and tested |
+| [`crates/adapters/el-engine-candle`](crates/adapters/el-engine-candle) | Candle inference adapter: engine-seam proof plus a real Qwen2 transformer engine and chat provider | Implemented; real on-device chat |
+| [`crates/adapters/el-cloud`](crates/adapters/el-cloud) | Opt-in OpenAI-compatible provider backend | Implemented; egress opt-in at construction |
+| [`crates/adapters/el-ffi`](crates/adapters/el-ffi) | **Device SDK facade (`EdgeLlm`):** Flutter / UniFFI / wasm-bindgen binding surfaces | Implemented and tested; host build is a workspace member, cross-target builds via `make` |
+| [`crates/adapters/el-grammar-llguidance`](crates/adapters/el-grammar-llguidance) | llguidance JSON-schema token masking | Implemented and tested; workspace-excluded (crates.io deps) |
+| [`apps/el-chat`](apps/el-chat) | Interactive chat test client; SDK-only deps, drives the runtime end-to-end | Implemented; runs real on-device chat |
+| [`apps/el-bench`](apps/el-bench) | Benchmark harness; SDK-only deps, replays quality/safety task sets through the runtime | Implemented; model-agnostic, reproducible |
+
+Of the adapters, only `el-grammar-llguidance` is excluded from the default
+workspace build (it pulls crates.io-only grammar dependencies); `el-cloud` and
+`el-ffi` are regular members whose host targets build and test with
+`cargo test --workspace`.
+
+</details>
+
 ## Benchmarks
 
 The SDK ships two reproducible benchmark harnesses. Both run inference through the
@@ -274,32 +301,6 @@ methodology are committed. Decoding is deterministic, so a given model + task se
 yields identical transcripts — it is designed to run as a **CI safety gate**, so a
 change to the model, the system prompt, or the ADR-005 safety tier can be
 regression-tested against a fixed rubric.
-
-## Workspace Map
-
-| Crate | Role | Current state |
-|-------|------|---------------|
-| [`crates/el-core`](crates/el-core) | Shared types, IDs, errors, events, `LlmProvider` trait | Implemented and tested |
-| [`crates/el-memory`](crates/el-memory) | Static arena planning and KV-cache descriptors | Implemented and tested |
-| [`crates/el-telemetry`](crates/el-telemetry) | Content-free event handling and privacy metrics | Implemented and tested |
-| [`crates/el-provenance`](crates/el-provenance) | Verified model load permits | Implemented and tested |
-| [`crates/el-safety`](crates/el-safety) | Tiered decoder-time safety policy | Partial, lightweight path implemented |
-| [`crates/el-runtime`](crates/el-runtime) | Session lifecycle and decode-loop orchestration | Implemented and tested |
-| [`crates/el-grammar`](crates/el-grammar) | DFA grammar masking | Implemented and tested |
-| [`crates/adapters/el-provenance-ed25519`](crates/adapters/el-provenance-ed25519) | Real ED25519 signature verification | Implemented and tested |
-| [`crates/adapters/el-engine-candle`](crates/adapters/el-engine-candle) | Candle inference adapter: engine-seam proof plus a real Qwen2 transformer engine and chat provider | Implemented; real on-device chat |
-| [`crates/adapters/el-cloud`](crates/adapters/el-cloud) | Opt-in OpenAI-compatible provider backend | Implemented; egress opt-in at construction |
-| [`crates/adapters/el-ffi`](crates/adapters/el-ffi) | **Device SDK facade (`EdgeLlm`):** Flutter / UniFFI / wasm-bindgen binding surfaces | Implemented and tested; host build is a workspace member, cross-target builds via `make` |
-| [`crates/adapters/el-grammar-llguidance`](crates/adapters/el-grammar-llguidance) | llguidance JSON-schema token masking | Implemented and tested; workspace-excluded (crates.io deps) |
-| [`apps/el-chat`](apps/el-chat) | Interactive chat test client; SDK-only deps, drives the runtime end-to-end | Implemented; runs real on-device chat |
-| [`apps/el-bench`](apps/el-bench) | Benchmark harness; SDK-only deps, replays quality/safety task sets through the runtime | Implemented; model-agnostic, reproducible |
-
-Of the adapters, only `el-grammar-llguidance` is excluded from the default
-workspace build (it pulls crates.io-only grammar dependencies); `el-cloud` and
-`el-ffi` are regular members whose host targets build and test with
-`cargo test --workspace`.
-
-</details>
 
 ## Architecture decisions
 

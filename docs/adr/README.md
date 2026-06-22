@@ -21,6 +21,12 @@ the `adr-patterns` namespace.
 | [011](./ADR-011-multi-registry-release-ci-crates-io-npm-pub-dev.md) | Multi-Registry Release CI (crates.io, npm, pub.dev) | accepted | ci, release, crates.io, npm, pub.dev, packaging |
 | [012](./ADR-012-layered-decode-time-safety-control-loop-with-checkpointed-rollback.md) | Layered decode-time safety control loop with checkpointed rollback | accepted | safety, security, on-device, runtime, supporting |
 | [013](./ADR-013-model-backed-steering-layers-for-the-hybrid-safety-control-loop.md) | Model-backed steering layers for the hybrid safety control loop | proposed | safety, security, on-device, runtime, follow-up |
+| [018](./ADR-018-persistent-model-instances-and-stateful-sessions.md) | Persistent model instances and stateful inference sessions | proposed | runtime, performance, on-device, follow-up, P0 |
+| [019](./ADR-019-in-loop-incremental-decoding-and-token-streaming.md) | In-loop incremental decoding and real token streaming | proposed | runtime, performance, bindings, follow-up, P0 |
+| [020](./ADR-020-batched-single-pass-prefill.md) | Batched (single-pass) prefill | proposed | runtime, performance, on-device, follow-up, P0 |
+| [021](./ADR-021-memory-mapped-verified-gguf-loading.md) | Memory-mapped verified GGUF loading | proposed | runtime, performance, provenance, on-device, follow-up, P0 |
+| [022](./ADR-022-two-tier-quantized-kv-cache-with-attention-aware-eviction.md) | Two-tier quantized KV cache with attention-aware eviction | proposed | memory, runtime, performance, on-device, follow-up, P0 |
+| [023](./ADR-023-baseline-performance-instrumentation.md) | Baseline performance instrumentation | proposed | telemetry, performance, testing, follow-up, P0 |
 
 ## Decision relationships
 
@@ -42,6 +48,22 @@ flowchart LR
     A012 --> A013[013 Model-backed steering layers]
     A003 -. budget triggers degradation .-> A012
     A006 -. signs safety weights .-> A013
+
+    %% P0 performance milestone (docs/research/improvements-plan.md, EPIC 1-4)
+    A010 --> A018[018 Persistent model + stateful sessions]
+    A018 --> A019[019 In-loop streaming]
+    A012 -. emit only guard-verified tokens .-> A019
+    A018 --> A020[020 Batched prefill]
+    A018 --> A021[021 Mmap'd verified load]
+    A006 -. verify before map .-> A021
+    A018 --> A022[022 Two-tier quantized KV + eviction]
+    A003 -. KV budget / degradation .-> A022
+    A007 --> A023[023 Baseline instrumentation]
+    A023 -. measures .-> A018
+    A023 -. measures .-> A019
+    A023 -. measures .-> A020
+    A023 -. measures .-> A021
+    A023 -. measures .-> A022
 ```
 
 > **ADR-008 is foundational** (the language decision) and drives the revisions to

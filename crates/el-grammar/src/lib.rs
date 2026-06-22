@@ -165,6 +165,9 @@ mod tests {
             fn rollback(&mut self, _keep: u32) -> el_core::Result<()> {
                 Ok(()) // stateless
             }
+            fn reset_cache(&mut self) -> el_core::Result<()> {
+                Ok(()) // stateless
+            }
         }
 
         struct OkVerifier;

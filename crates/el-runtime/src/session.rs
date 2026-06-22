@@ -451,14 +451,62 @@ impl<E: InferenceEngine> InferenceSession<E> {
         }
     }
 
-    /// Clear KV/output for a fresh conversation (volatile memory only).
-    pub fn reset(&mut self) {
+    /// Reset for a fresh conversation on the **same resident weights** — the seam
+    /// that turns a provider from "rebuild the engine every turn" into "load once,
+    /// reuse" (ADR-018). Clears the session's KV descriptors / output / prompt and
+    /// resets the engine's *logical* cache; distinct from a safety
+    /// [`rollback`](InferenceEngine::rollback) (which rewinds *within* a
+    /// generation).
+    ///
+    /// Returns the engine's `reset_cache` error rather than swallowing it: an
+    /// engine that fails to discard its cache must not be reported as a clean
+    /// fresh session. On error the session state is left **untouched** (so an empty
+    /// session can never desync from a stale engine cache) and the caller is
+    /// notified — it should drop/rebuild rather than reuse.
+    ///
+    /// Buffered events are **preserved** (generic semantics): a telemetry consumer
+    /// may still [`drain_events`](Self::drain_events) after a reset. Turn-level
+    /// event isolation is the caller's concern — a provider that reuses one session
+    /// across turns should drain between turns (see the adapter providers).
+    ///
+    /// `reset_cache` releases the *previous conversation's* KV while keeping the
+    /// resident weights loaded — that separation of conversation lifecycle from
+    /// model lifecycle is the point of ADR-018.
+    pub fn reset(&mut self) -> Result<()> {
+        self.engine.reset_cache()?;
         self.kv = KvRegion::new();
         self.prompt.clear();
         self.output.clear();
         self.step = 0;
         self.phase = Phase::Initialized;
         self.emit(DomainEvent::SessionReset);
+        Ok(())
+    }
+
+    /// End the current conversation: release its volatile memory — engine KV
+    /// (via [`reset_cache`](InferenceEngine::reset_cache)), KV descriptors,
+    /// committed output, retained prompt, and buffered events — while keeping the
+    /// **resident model loaded** so the session can serve a new conversation
+    /// without reloading weights (ADR-018; PRD line 131 "KV caches … cleared on
+    /// session end"; the AC-4 explicit release).
+    ///
+    /// Takes `&mut self`, not `self`: dropping the session would also drop the
+    /// (expensive) weights, which is the opposite of "load once, reuse." Instead
+    /// the engine releases the conversation's KV in place — for candle's
+    /// `quantized_qwen2`, a position-0 forward overwrites and frees the prior K/V
+    /// tensors (see its `reset_cache`). Unlike [`reset`](Self::reset), `close` also
+    /// frees the buffers' *capacity* and discards buffered events, minimizing the
+    /// idle footprint. Propagates a `reset_cache` failure (state untouched on
+    /// error). To free the weights too, drop the session/provider (ownership).
+    pub fn close(&mut self) -> Result<()> {
+        self.engine.reset_cache()?;
+        self.kv = KvRegion::new();
+        self.prompt = Vec::new();
+        self.output = Vec::new();
+        self.events = Vec::new();
+        self.step = 0;
+        self.phase = Phase::Initialized;
+        Ok(())
     }
 
     /// Consult the opt-in LAN relay. Hard-fails with [`EdgeError::AirGapViolation`]
@@ -538,6 +586,9 @@ mod tests {
         fn rollback(&mut self, _keep: u32) -> Result<()> {
             Ok(()) // stateless
         }
+        fn reset_cache(&mut self) -> Result<()> {
+            Ok(()) // stateless
+        }
     }
 
     // Grammar masker that disallows specific token ids.
@@ -567,7 +618,7 @@ mod tests {
         assert_eq!(s.output(), &[3]);
         assert_eq!(s.phase(), Phase::Completed);
 
-        s.reset();
+        s.reset().unwrap();
         assert_eq!(s.phase(), Phase::Initialized);
         assert!(s.output().is_empty());
     }
@@ -745,6 +796,9 @@ mod tests {
         fn rollback(&mut self, _keep: u32) -> Result<()> {
             Ok(()) // stateless: logits depend only on the passed ctx
         }
+        fn reset_cache(&mut self) -> Result<()> {
+            Ok(()) // stateless
+        }
     }
 
     /// `guard_every` larger than any completion here, so the *cadence* check
@@ -870,6 +924,10 @@ mod tests {
             self.fed = keep_committed as usize; // re-sync to the retained prefix
             self.rollbacks.set(self.rollbacks.get() + 1);
             self.last_keep.set(keep_committed);
+            Ok(())
+        }
+        fn reset_cache(&mut self) -> Result<()> {
+            self.fed = 0; // pristine: a fresh conversation re-feeds from scratch
             Ok(())
         }
     }
@@ -1194,5 +1252,347 @@ mod tests {
                 mode: SafetyMode::Lightweight
             }
         )));
+    }
+
+    // ----- ADR-018 persistent model / stateful session reuse -----
+
+    /// Counts how often it is prefilled and cache-reset, and emits EOS on the
+    /// first decode step so generation terminates immediately. Mirrors a *resident*
+    /// engine: one instance reused across conversations, never reconstructed.
+    struct CountingEngine {
+        eos: Token,
+        vocab: usize,
+        prefills: std::rc::Rc<std::cell::Cell<u32>>,
+        resets: std::rc::Rc<std::cell::Cell<u32>>,
+    }
+    impl InferenceEngine for CountingEngine {
+        fn prefill(&mut self, t: &[Token]) -> Result<u32> {
+            self.prefills.set(self.prefills.get() + 1);
+            Ok(t.len() as u32)
+        }
+        fn next_logits(&mut self, _committed: &[Token]) -> Vec<i32> {
+            let mut v = vec![0i32; self.vocab];
+            if let Some(s) = v.get_mut(self.eos as usize) {
+                *s = 1;
+            }
+            v
+        }
+        fn eos_token(&self) -> Token {
+            self.eos
+        }
+        fn rollback(&mut self, _keep: u32) -> Result<()> {
+            Ok(())
+        }
+        fn reset_cache(&mut self) -> Result<()> {
+            self.resets.set(self.resets.get() + 1);
+            Ok(())
+        }
+    }
+
+    fn counting_engine() -> (
+        CountingEngine,
+        std::rc::Rc<std::cell::Cell<u32>>,
+        std::rc::Rc<std::cell::Cell<u32>>,
+    ) {
+        let prefills = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let resets = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let engine = CountingEngine {
+            eos: 1,
+            vocab: 4,
+            prefills: prefills.clone(),
+            resets: resets.clone(),
+        };
+        (engine, prefills, resets)
+    }
+
+    #[test]
+    fn reset_resets_the_engine_cache() {
+        // AC: reset() must discard the engine's conversation cache, not just the
+        // session's descriptors — otherwise a reused resident engine would carry a
+        // stale KV cache into the next conversation.
+        let (engine, _prefills, resets) = counting_engine();
+        let mut s =
+            InferenceSession::new(SessionId(40), SessionConfig::default(), engine, permit());
+        assert_eq!(resets.get(), 0);
+        s.reset().unwrap();
+        assert_eq!(
+            resets.get(),
+            1,
+            "reset() must reset the engine cache (ADR-018)"
+        );
+    }
+
+    #[test]
+    fn one_engine_serves_multiple_conversations_via_reset() {
+        // AC-1/AC-2: the same resident engine is reused across conversations — it
+        // is prefilled again per turn but never reconstructed, and its cache is
+        // reset between turns.
+        let (engine, prefills, resets) = counting_engine();
+        let mut s =
+            InferenceSession::new(SessionId(41), SessionConfig::default(), engine, permit());
+        let ports = Ports::permissive();
+
+        s.load_prompt(&ports, &[1, 2]).unwrap();
+        s.generate(&ports, 8).unwrap();
+        assert_eq!(prefills.get(), 1);
+
+        // Reuse for a second conversation — no new engine, no reload.
+        s.reset().unwrap();
+        s.load_prompt(&ports, &[3, 4, 5]).unwrap();
+        s.generate(&ports, 8).unwrap();
+
+        assert_eq!(
+            prefills.get(),
+            2,
+            "the one resident engine was prefilled again, not rebuilt"
+        );
+        assert!(
+            resets.get() >= 1,
+            "the engine cache was reset between conversations"
+        );
+    }
+
+    /// Counts both cache resets and drops, so a test can prove `close()` releases
+    /// the conversation's KV (reset_cache) **without** dropping the resident engine.
+    struct ResidentEngine {
+        eos: Token,
+        vocab: usize,
+        resets: std::rc::Rc<std::cell::Cell<u32>>,
+        dropped: std::rc::Rc<std::cell::Cell<u32>>,
+    }
+    impl Drop for ResidentEngine {
+        fn drop(&mut self) {
+            self.dropped.set(self.dropped.get() + 1);
+        }
+    }
+    impl InferenceEngine for ResidentEngine {
+        fn prefill(&mut self, t: &[Token]) -> Result<u32> {
+            Ok(t.len() as u32)
+        }
+        fn next_logits(&mut self, _committed: &[Token]) -> Vec<i32> {
+            let mut v = vec![0i32; self.vocab];
+            if let Some(s) = v.get_mut(self.eos as usize) {
+                *s = 1;
+            }
+            v
+        }
+        fn eos_token(&self) -> Token {
+            self.eos
+        }
+        fn rollback(&mut self, _keep: u32) -> Result<()> {
+            Ok(())
+        }
+        fn reset_cache(&mut self) -> Result<()> {
+            self.resets.set(self.resets.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn close_releases_conversation_but_keeps_engine_resident() {
+        // AC-4 / ADR-018: `close` must release the conversation's memory (KV via
+        // the engine's `reset_cache`) while keeping the resident weights loaded —
+        // and the session must remain reusable for the next conversation. Dropping
+        // the engine (and its weights) is NOT close's job; that is provider drop.
+        let resets = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let engine = ResidentEngine {
+            eos: 1,
+            vocab: 4,
+            resets: resets.clone(),
+            dropped: dropped.clone(),
+        };
+        let mut s =
+            InferenceSession::new(SessionId(42), SessionConfig::default(), engine, permit());
+        let ports = Ports::permissive();
+        s.load_prompt(&ports, &[1, 2, 3]).unwrap();
+        s.generate(&ports, 8).unwrap();
+        assert!(s.kv_len() > 0, "conversation memory is measurable (AC-4)");
+
+        s.close().unwrap();
+
+        assert_eq!(s.kv_len(), 0, "close frees the session's KV descriptors");
+        assert!(s.output().is_empty(), "close frees committed output");
+        assert!(
+            resets.get() >= 1,
+            "close releases the engine's conversation KV (keeps weights)"
+        );
+        assert_eq!(
+            dropped.get(),
+            0,
+            "the resident engine/weights are NOT dropped by close"
+        );
+
+        // Model still resident → the session serves a new conversation, no reload.
+        s.load_prompt(&ports, &[4, 5]).unwrap();
+        s.generate(&ports, 8).unwrap();
+        assert!(
+            s.kv_len() > 0,
+            "same engine serves a new conversation after close"
+        );
+        assert_eq!(dropped.get(), 0);
+    }
+
+    #[test]
+    fn reset_preserves_undrained_events() {
+        // Generic semantics: reset() must NOT silently drop a consumer's undrained
+        // telemetry. Turn-level isolation is the provider's job (drain between
+        // turns), not reset()'s.
+        let (engine, _prefills, _resets) = counting_engine();
+        let mut s =
+            InferenceSession::new(SessionId(44), SessionConfig::default(), engine, permit());
+        let ports = Ports::permissive();
+        s.load_prompt(&ports, &[1, 2]).unwrap();
+        s.generate(&ports, 8).unwrap(); // emits events the caller has not drained
+
+        s.reset().unwrap();
+
+        let evs = s.drain_events();
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e.event, DomainEvent::TokenCommitted { .. })),
+            "pre-reset events are preserved for the consumer"
+        );
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e.event, DomainEvent::SessionReset)),
+            "and the reset itself is recorded"
+        );
+    }
+
+    /// Reset is fallible: this engine refuses to discard its cache.
+    struct FailResetEngine {
+        eos: Token,
+        vocab: usize,
+    }
+    impl InferenceEngine for FailResetEngine {
+        fn prefill(&mut self, t: &[Token]) -> Result<u32> {
+            Ok(t.len() as u32)
+        }
+        fn next_logits(&mut self, _committed: &[Token]) -> Vec<i32> {
+            let mut v = vec![0i32; self.vocab];
+            if let Some(s) = v.get_mut(self.eos as usize) {
+                *s = 1;
+            }
+            v
+        }
+        fn eos_token(&self) -> Token {
+            self.eos
+        }
+        fn rollback(&mut self, _keep: u32) -> Result<()> {
+            Ok(())
+        }
+        fn reset_cache(&mut self) -> Result<()> {
+            Err(EdgeError::Engine("reset_cache refused"))
+        }
+    }
+
+    #[test]
+    fn reset_propagates_engine_cache_failure_and_leaves_state() {
+        // A fallible engine that cannot discard its cache must NOT be reported as a
+        // clean fresh session: the error surfaces and the session descriptors stay
+        // untouched, so an empty session can never desync from a stale engine cache.
+        let mut s = InferenceSession::new(
+            SessionId(45),
+            SessionConfig::default(),
+            FailResetEngine { eos: 1, vocab: 4 },
+            permit(),
+        );
+        let ports = Ports::permissive();
+        s.load_prompt(&ports, &[1, 2, 3]).unwrap();
+        s.generate(&ports, 8).unwrap();
+        let kv_before = s.kv_len();
+        assert!(kv_before > 0);
+
+        let err = s.reset().unwrap_err();
+        assert!(matches!(err, EdgeError::Engine(_)));
+        assert_eq!(
+            s.kv_len(),
+            kv_before,
+            "descriptors must be left intact when the engine reset fails"
+        );
+        assert_eq!(
+            s.phase(),
+            Phase::Completed,
+            "phase is unchanged on a failed reset"
+        );
+    }
+
+    /// Marks itself dirty when it caches, fails its first `reset_cache` (a
+    /// simulated partial eviction), then succeeds — recording `cleared` only after
+    /// a *fully successful* attempt. Mirrors the `QwenEngine` dirty-flag contract.
+    struct RetryClearEngine {
+        eos: Token,
+        vocab: usize,
+        dirty: bool,
+        fails_left: std::rc::Rc<std::cell::Cell<u32>>,
+        cleared: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+    impl InferenceEngine for RetryClearEngine {
+        fn prefill(&mut self, t: &[Token]) -> Result<u32> {
+            self.dirty = true;
+            Ok(t.len() as u32)
+        }
+        fn next_logits(&mut self, _committed: &[Token]) -> Vec<i32> {
+            self.dirty = true;
+            let mut v = vec![0i32; self.vocab];
+            if let Some(s) = v.get_mut(self.eos as usize) {
+                *s = 1;
+            }
+            v
+        }
+        fn eos_token(&self) -> Token {
+            self.eos
+        }
+        fn rollback(&mut self, _keep: u32) -> Result<()> {
+            Ok(())
+        }
+        fn reset_cache(&mut self) -> Result<()> {
+            if self.dirty {
+                if self.fails_left.get() > 0 {
+                    self.fails_left.set(self.fails_left.get() - 1);
+                    return Err(EdgeError::Engine("partial eviction")); // stays dirty
+                }
+                self.dirty = false;
+                self.cleared.set(true);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reset_retries_clearing_after_a_failed_attempt() {
+        // Regression (P1): a `reset_cache` that fails after partially clearing must
+        // NOT be skipped on the next attempt. Dirtiness is tracked independently of
+        // any position cursor, so the retry re-clears rather than falsely reporting
+        // a clean cache while user K/V is still resident.
+        let fails_left = std::rc::Rc::new(std::cell::Cell::new(1u32));
+        let cleared = std::rc::Rc::new(std::cell::Cell::new(false));
+        let engine = RetryClearEngine {
+            eos: 1,
+            vocab: 4,
+            dirty: false,
+            fails_left: fails_left.clone(),
+            cleared: cleared.clone(),
+        };
+        let mut s =
+            InferenceSession::new(SessionId(47), SessionConfig::default(), engine, permit());
+        let ports = Ports::permissive();
+        s.load_prompt(&ports, &[1, 2]).unwrap();
+        s.generate(&ports, 8).unwrap();
+
+        // First reset fails (simulated partial eviction) and is surfaced.
+        assert!(s.reset().is_err());
+        assert!(
+            !cleared.get(),
+            "a failed reset must not report the cache cleared"
+        );
+
+        // The retry actually re-clears — it is not skipped.
+        s.reset().unwrap();
+        assert!(
+            cleared.get(),
+            "the next reset re-clears after a failed attempt"
+        );
     }
 }

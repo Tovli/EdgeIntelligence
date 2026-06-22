@@ -47,11 +47,14 @@ println!("{}", reply.content);
 # Ok::<(), el_core::EdgeError>(())
 ```
 
-Each `chat` call builds a fresh `QwenEngine` (Candle exposes no public KV-cache
-reset) and runs the standard SDK path: provenance permit → `load_prompt`
-(prefill) → `generate` (grammar mask → safety steer → chunk-guard + checkpointed
-rollback → greedy commit). Decoding is deterministic greedy argmax, so replies
-are reproducible.
+The model weights load **once** in `from_paths` and stay resident; each `chat`
+reuses one persistent provenance-gated session (ADR-018) — reset (which evicts the
+previous conversation's KV from Candle's cache via a position-0 forward, keeping
+the weights loaded) → `load_prompt` (prefill) → `generate` (grammar mask → safety
+steer → chunk-guard + checkpointed rollback → greedy commit). No per-turn reload
+from disk. Decoding is deterministic greedy argmax, so replies are reproducible.
+`end_session()` releases a conversation's memory while keeping the model resident;
+dropping the provider frees the weights too.
 
 ### On-device safety (ADR-005 + ADR-012)
 
@@ -98,9 +101,11 @@ signature before issuing the permit. The chat model as its own expert is a
 ## Benchmark instrumentation
 
 Setting `EL_BENCH=1` makes `QwenChatProvider::chat` print a per-phase breakdown
-(model load / tokenize / prefill / decode / detokenize) plus per-forward
-attribution (model compute vs. seam quantisation vs. runtime loop) to stderr.
-It is zero-cost when unset and is a diagnostic only — not part of public behaviour.
+(session setup / tokenize / prefill / decode / detokenize) plus per-forward
+attribution (model compute vs. seam quantisation vs. runtime loop) to stderr. The
+weights load once at startup (ADR-018), so per-turn "session setup" is near-zero —
+not a per-chat model load. Zero-cost when unset; a diagnostic only, not part of
+public behaviour.
 
 ## Features & dependencies
 

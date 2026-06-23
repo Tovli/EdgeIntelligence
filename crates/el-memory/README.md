@@ -29,8 +29,15 @@ Depends only on `el-core`. No `unsafe` (`#![forbid(unsafe_code)]`).
 
 ## Usage
 
+In a Qwen2.5 0.5B local chat run, `el-engine-candle` loads the GGUF/tokenizer
+and the runtime uses memory planning and KV descriptors like these during
+prefill and decode.
+
 ```rust
 use el_memory::{Arena, BufferLifetime, KvRegion, MemoryTier, StaticMemoryPlanner, TensorSpec};
+
+let _qwen_model = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
+let _qwen_tokenizer = "models/qwen2.5-0.5b-instruct.tokenizer.json";
 
 // Two same-tier tensors with disjoint lifetimes share one offset, so the tier
 // needs max(size), not the sum.

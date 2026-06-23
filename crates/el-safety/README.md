@@ -39,6 +39,10 @@ Depends only on `el-core`. No `unsafe` (`#![forbid(unsafe_code)]`).
 
 ## Usage
 
+`QwenChatProvider` resolves guard words through the Qwen2.5 0.5B
+`tokenizer.json`; this crate receives the resulting token ids and applies the
+same deterministic steering regardless of the model backend.
+
 ```rust
 use el_core::{DeviceTarget, SafetyMode};
 use el_safety::{LightweightFilter, SafetyModeSelector, SafetySteerer};
@@ -47,8 +51,9 @@ use el_safety::{LightweightFilter, SafetyModeSelector, SafetySteerer};
 let mode = SafetyModeSelector::resolve(SafetyMode::SecDecoding, DeviceTarget::MidRange);
 assert_eq!(mode, SafetyMode::Lightweight);
 
-// Lightweight bans specific token ids outright.
-let filter = LightweightFilter::new(vec![42, 99]);
+// Lightweight bans specific Qwen tokenizer ids outright.
+let qwen_guard_token_ids = vec![42, 99];
+let filter = LightweightFilter::new(qwen_guard_token_ids);
 let adj = filter.adjust(&[]);
 assert_eq!(adj.delta_for(42), LightweightFilter::HARD_BAN);
 assert_eq!(adj.delta_for(7), 0);

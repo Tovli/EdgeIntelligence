@@ -21,16 +21,24 @@ do about it (issue a `LoadPermit`, or hard-stop). Pure-Rust dependency tree, no
 
 ## Usage
 
+Use this adapter when a shipped Qwen2.5 0.5B GGUF is accompanied by a detached
+ED25519 signature and a trusted provider public key.
+
 ```rust
 use el_core::{ModelFormat, ModelId, ModelVersion};
 use el_provenance::ModelArtifact;
 use el_provenance_ed25519::Ed25519Verifier;
+use std::path::Path;
 
 let mut verifier = Ed25519Verifier::new();
 verifier.register(/* public_key_id */ 1, trusted_public_key_bytes)?;
 
+let qwen_path = Path::new("models/qwen2.5-0.5b-instruct-q4_k_m.gguf");
+let model_bytes = std::fs::read(qwen_path)?;
+let signature_bytes = std::fs::read(qwen_path.with_extension("gguf.sig"))?;
+
 let mut artifact = ModelArtifact::new(ModelId(1), ModelVersion::new(0, 1, 0), ModelFormat::Gguf);
-artifact.verify(&verifier, model_bytes, signature_bytes, 1);
+artifact.verify(&verifier, &model_bytes, &signature_bytes, 1);
 
 // Verified → a LoadPermit; tampered bytes, a forged signature, or an unknown
 // key id → a hard error with no fallback.

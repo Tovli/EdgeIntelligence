@@ -34,17 +34,72 @@ No `unsafe` (`#![forbid(unsafe_code)]`). The crate is `cdylib` + `staticlib` +
 
 ## Usage (Rust side)
 
+Use the Qwen2.5 0.5B GGUF as the local model URI when constructing the facade.
+Native package bindings use the same model path after copying the file into app
+storage. For full Rust ChatML/tokenizer control, use
+`el_engine_candle::QwenChatProvider` directly.
+
 ```rust
 use el_ffi::EdgeLlm;
 
-// Empty path → deterministic toy model; exercises the full binding layer.
-let sdk = EdgeLlm::local(String::new())?;
-let reply = sdk.ask("hello".into())?;
+const QWEN_0_5B_GGUF: &str = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
+
+let sdk = EdgeLlm::local(QWEN_0_5B_GGUF.into())?;
+let reply = sdk.ask("Summarize edge inference in one sentence.".into())?;
 assert!(!reply.is_empty());
 
 // Streaming (Flutter / closure form):
-sdk.ask_stream("hi".into(), |fragment| print!("{fragment}"))?;
+sdk.ask_stream("Give me two deployment tips.".into(), |fragment| print!("{fragment}"))?;
 # Ok::<(), el_ffi::SdkError>(())
+```
+
+## Usage (npm / web)
+
+The npm package exposes the wasm-bindgen browser surface. The local web path
+currently exercises the generated API shape while Candle-on-wasm is being wired;
+native React Native builds load the GGUF through the same package.
+
+```ts
+import init, { EdgeLlm } from "edge-intelligence-sdk";
+
+await init();
+
+const qwen05b = "/models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
+const sdk = new EdgeLlm(qwen05b);
+const reply = sdk.ask_wasm("Summarize edge inference in one sentence.");
+
+console.log(reply);
+```
+
+## Usage (React Native)
+
+```ts
+import { EdgeLlm } from "edge-intelligence-sdk";
+
+const qwen05b = "/data/user/0/com.example.app/files/models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
+const sdk = EdgeLlm.local(qwen05b);
+
+const reply = sdk.ask("Summarize edge inference in one sentence.");
+let streamed = "";
+sdk.ask_stream_cb("Give me two deployment tips.", {
+  on_token(token) {
+    streamed += token;
+  },
+});
+```
+
+## Usage (pub.dev / Flutter)
+
+```dart
+import "package:edge_intelligence/edge_intelligence.dart";
+
+final qwen05b = "/path/to/app/models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
+final sdk = await EdgeLlm.local(qwen05b);
+
+final reply = await sdk.ask("Summarize edge inference in one sentence.");
+await for (final token in sdk.askStream("Give me two deployment tips.")) {
+  stdout.write(token);
+}
 ```
 
 ## Building the bindings

@@ -30,17 +30,22 @@ Mismatched shapes are rejected at load time, not silently at inference.
 
 ## Usage
 
+This is the direct Rust SDK path for a local Qwen2.5 0.5B instruct model.
+
 ```rust
 use el_core::{ChatMessage, ChatRequest, LlmProvider};
 use el_engine_candle::QwenChatProvider;
 
-// Real on-device chat: a local Qwen2 GGUF + its tokenizer (no network egress).
-let provider = QwenChatProvider::from_paths(
-    "models/qwen2.5-0.5b-instruct-q4_k_m.gguf",
-    "models/qwen2.5-0.5b-instruct.tokenizer.json",
-)?;
+const QWEN_0_5B_GGUF: &str = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
+const QWEN_0_5B_TOKENIZER: &str = "models/qwen2.5-0.5b-instruct.tokenizer.json";
 
-let req = ChatRequest::new("local", vec![ChatMessage::user("What is the capital of France?")])
+// Real on-device chat: a local Qwen2 GGUF + its tokenizer (no network egress).
+let provider = QwenChatProvider::from_paths(QWEN_0_5B_GGUF, QWEN_0_5B_TOKENIZER)?;
+
+let req = ChatRequest::new(
+    "local/qwen2.5-0.5b-instruct-q4_k_m",
+    vec![ChatMessage::user("Summarize edge inference in one sentence.")],
+)
     .with_max_tokens(128);
 let reply = provider.chat(&req)?;
 println!("{}", reply.content);

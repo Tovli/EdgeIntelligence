@@ -27,9 +27,13 @@ Depends only on `el-core`. No `unsafe` (`#![forbid(unsafe_code)]`).
 
 ## Usage
 
+For a packaged Qwen2.5 0.5B model, verify the local GGUF bytes and detached
+signature before the runtime can construct a session.
+
 ```rust
 use el_core::{ModelFormat, ModelId, ModelVersion};
 use el_provenance::{ModelArtifact, SignatureVerifier};
+use std::path::Path;
 
 // Plug in a real verifier (el-provenance-ed25519) or a test double.
 struct AlwaysOk;
@@ -37,12 +41,16 @@ impl SignatureVerifier for AlwaysOk {
     fn verify(&self, _bytes: &[u8], _sig: &[u8], _key_id: u32) -> bool { true }
 }
 
+let qwen_path = Path::new("models/qwen2.5-0.5b-instruct-q4_k_m.gguf");
+let qwen_bytes = std::fs::read(qwen_path)?;
+let qwen_signature = std::fs::read(qwen_path.with_extension("gguf.sig"))?;
+
 let mut artifact = ModelArtifact::new(ModelId(1), ModelVersion::new(0, 1, 0), ModelFormat::Gguf);
-artifact.verify(&AlwaysOk, b"<model-bytes>", b"<signature>", /* public_key_id */ 7);
+artifact.verify(&AlwaysOk, &qwen_bytes, &qwen_signature, /* public_key_id */ 7);
 
 // No verified signature → no permit → no session.
 let permit = artifact.ensure_loadable()?; // Err(UnverifiedModel | SignatureRejected) otherwise
-# Ok::<(), el_core::EdgeError>(())
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ## Place in the workspace

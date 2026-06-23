@@ -276,20 +276,8 @@ jobs:
                files: ["src/", "android/", "ios/", "README.md"],
                license: "Apache-2.0"
              }' > assembly/package.json
-      - name: Write README.md
-        run: |
-          cat > assembly/README.md <<'EOF'
-          # edge-intelligence-sdk
-
-          Generated Web and React Native bindings for the Edge Intelligence SDK.
-
-          This package contains the WASM/TypeScript browser surface, React Native
-          TypeScript bindings, and native Android/iOS libraries assembled by the
-          release pipeline.
-
-          Source, crate documentation, and release notes live in the Edge
-          Intelligence repository.
-          EOF
+      - name: Copy README.md
+        run: cp packaging/npm/README.md assembly/README.md
       - name: Assert npm package ships README.md
         run: bash scripts/assert-release-readmes.sh npm assembly
       - uses: actions/upload-artifact@v4

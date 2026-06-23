@@ -54,6 +54,36 @@ pub trait InferenceEngine {
     /// conversation. A stateless engine whose `next_logits` recomputes purely from
     /// `committed` implements it as `Ok(())`.
     fn reset_cache(&mut self) -> Result<()>;
+
+    /// Prefill `full_context`, **reusing the KV already cached for its longest
+    /// matching prefix** and feeding only the divergent suffix — cross-turn
+    /// incremental prefill (ADR-018 AC-3). Returns the resulting KV length.
+    ///
+    /// This is the engine half of [`InferenceSession::continue_prompt`]: on a
+    /// follow-up turn the whole conversation is re-rendered and re-tokenized, but a
+    /// stateful engine that still holds the prior turn's KV can skip re-encoding the
+    /// unchanged prefix. The token-level prefix match against the live cache **is**
+    /// the tokenizer-round-trip guard — if the re-tokenized context diverges from
+    /// what was cached (decode→encode is not always identity), reuse stops at the
+    /// divergence and the suffix is fed fresh.
+    ///
+    /// **Soundness contract.** After `Ok`, the engine MUST be in the exact state a
+    /// `reset_cache()` + `prefill(full_context)` would have left it — identical
+    /// logits for any subsequent [`next_logits`](Self::next_logits). Reuse is purely
+    /// a compute optimisation; it must never change *what* the cache represents, so
+    /// the runtime's safety checks (which re-run over `full_context` every turn) see
+    /// identical data.
+    ///
+    /// Unlike [`rollback`](Self::rollback)/[`reset_cache`](Self::reset_cache), a wrong
+    /// implementation here is a correctness/perf regression, not a safety
+    /// fail-*open* — so this has a **safe default**: discard the cache and re-prefill
+    /// the whole context (no reuse). Stateful engines override it for the fast path;
+    /// stateless engines (whose `next_logits` recomputes from `committed`) inherit
+    /// the default unchanged.
+    fn prefill_reuse(&mut self, full_context: &[Token]) -> Result<u32> {
+        self.reset_cache()?;
+        self.prefill(full_context)
+    }
 }
 
 /// Prompt Compression port (LLMLingua-2 — context 2).

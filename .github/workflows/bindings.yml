@@ -95,6 +95,7 @@ jobs:
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
         run: bash scripts/retry-command.sh make codegen-rn
       - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
         with:
           name: rn-bindings
           path: out/rn/
@@ -140,6 +141,7 @@ jobs:
       - name: Build WASM ESM package
         run: make build-wasm
       - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
         with:
           name: web-bindings
           path: out/web/
@@ -163,6 +165,7 @@ jobs:
       - name: Codegen — Flutter/Dart
         run: make codegen-flutter
       - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
         with:
           name: flutter-bindings
           path: out/flutter/

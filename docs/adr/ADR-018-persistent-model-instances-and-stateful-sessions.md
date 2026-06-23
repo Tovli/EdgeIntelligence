@@ -137,20 +137,16 @@ Landed via a SPARC pass (scope: AC-1/AC-2/AC-4 + the engine seam; AC-3 deferred)
   `reset_cache` is propagated, not swallowed. Full workspace suite green;
   `cargo fmt --all -- --check` and `clippy -D warnings` clean.
 
-Still **deferred** (own increment, per the spec's scope decision):
+**AC-3 (cross-turn prefix reuse) and expert persistence landed in a follow-up
+increment — see below.**
 
-- **AC-3 — cross-turn prefix reuse / incremental prefill.** Each turn still
-  re-prefills the whole conversation (no weight reload). Reusing the unchanged
-  prefix's KV needs an engine "extend-without-reset" contract, a session "continue"
-  transition, and care around the ADR-012 safe-prefix invariant and tokenizer
-  round-trip stability. The persistent-session architecture here is its foundation.
-- **Expert persistence.** With `--expert-model`, the safety expert GGUF is still
-  loaded per turn; persisting it like the base model is a follow-up. The default
-  (no-expert) path is fully resident.
+Still **deferred**:
+
 - **Concurrent multi-session weight sharing.** candle couples weights + KV cache,
   so this realizes *serial* conversation reuse; true N-sessions-over-one-model
   needs an engine that separates weights from cache (same root constraint as
-  ADR-022).
+  ADR-022). Not attempted: it requires a forked/custom attention cache, not a
+  runtime change.
 
 ### Review fixes (post-implementation hardening)
 
@@ -214,6 +210,78 @@ doc still described the old "fresh engine per `chat` (Candle can't reset its
 cache)" behavior; both now describe the ADR-018 resident model + in-place
 `reset_cache` eviction, and the `EL_BENCH` section reflects the once-at-startup
 load ("session setup", not a per-chat "model load").
+
+### Follow-up increment — AC-3 cross-turn prefix reuse + expert persistence
+
+Landed via a second SPARC pass (scope: AC-3 + expert persistence; concurrent
+multi-session left deferred above):
+
+- **Engine seam — `InferenceEngine::prefill_reuse(full_context)`.** Prefills a
+  context while reusing the KV already cached for its longest matching prefix and
+  feeding only the divergent suffix. Unlike `rollback`/`reset_cache` (whose wrong
+  default fails *open* on safety) a wrong reuse is only a correctness/perf
+  regression, so this has a **safe default**: discard the cache and re-prefill the
+  whole context (no reuse). Only `QwenEngine` overrides it; the other ten engine
+  impls inherit the default unchanged — no churn.
+- **Tokenizer round-trip guard via longest-common-prefix.** `QwenEngine` now tracks
+  `cached`, the exact token sequence behind its KV (length == `index_pos`). A
+  follow-up turn re-renders + re-tokenizes the whole conversation; `prefill_reuse`
+  takes the token-level LCP of `cached` and the new context and reuses up to it.
+  When the context exactly extends the cache, only the new tail is forwarded (the
+  fast path); on any divergence — decode→encode is not always identity — or a
+  shorter context, it rebuilds from position 0 (candle has no cache truncation),
+  never worse than the pre-AC-3 full re-prefill. Either branch leaves the engine in
+  the **same** state a `reset_cache()` + `prefill(full_context)` would (the suffix
+  is fed by identical `forward_one` calls at identical positions), so subsequent
+  logits are bit-identical — the soundness contract, proven by a stateful mock.
+- **Session — `InferenceSession::continue_prompt(full_context)`.** A new transition
+  valid only from `Completed` (a finished prior turn): retains `full_context` as the
+  prompt for ADR-013 ingress triage, calls `prefill_reuse`, rebuilds the KV
+  descriptors to the reported length, and clears this turn's `output` (the prior
+  reply is now baked into the prefilled context). The **ADR-012 safe-prefix
+  invariant is preserved**: the reuse base for a within-turn rollback is
+  `full_context`, ingress re-scores the whole prompt every turn, and the chunk guard
+  scores this turn's output as before — KV reuse changes *how* logits are computed,
+  never *what* the safety loop checks.
+- **Provider — `QwenChatProvider::chat`.** The unconditional per-turn `reset()` is
+  gone; the turn branches on `session.phase()`: `Completed` → `continue_prompt`
+  (reuse the prior KV prefix), otherwise → `load_prompt` (fresh). `/reset`,
+  `/system`, and error recovery still go through `end_session` (→ `Initialized`), so
+  the next turn re-prefills cleanly; a refused or tokenizer-drifted prior turn falls
+  back automatically via the engine's LCP check.
+- **Expert persistence.** `QwenExpert` is now `Send + Sync` (a `Mutex<{engine,fed}>`
+  instead of `RefCell`/`Cell`) and the provider holds it resident in
+  `Mutex<Option<Arc<QwenExpert>>>`. The expert GGUF is loaded **once** on the first
+  `SecDecoding` turn and `reprime`d (`reset_cache` + prefill, no disk reload) every
+  later turn; a per-turn `SharedExpert(Arc<QwenExpert>)` newtype clones into the
+  turn's `ContrastiveSteerer` (sidestepping the orphan rule on `Arc<QwenExpert>`).
+  `end_session` releases the expert's KV too, keeping its weights resident.
+- **Tests.** Runtime: cross-turn reuse feeds only the suffix; `prefill_reuse` leaves
+  the same state as a fresh prefill (fast-path *and* rebuild-on-divergence); the
+  default reuse does a full recompute; `continue_prompt` rejects a non-`Completed`
+  phase; a continued turn still runs the full guard + rollback loop. Adapter: an LCP
+  helper unit test, and a compile-time `Send + Sync` assertion over `QwenExpert` /
+  `QwenChatProvider` (the resident expert must not cost the provider its
+  thread-safety). A model-backed `QwenEngine`/expert integration test needs a Qwen
+  GGUF fixture (none in-tree, as for the increment-1 engine), so the reuse contract
+  is proven at the trait level + the shared `forward_one` equivalence argument. Full
+  workspace suite green; `cargo fmt --all -- --check` and `clippy -D warnings` clean.
+
+**Review fixes (increment-2 hardening).** (1) **Dirty-phase wedge (P1).** Removing
+the unconditional per-turn `reset()` meant a `prefill`/`prefill_reuse` that failed
+mid-transition left the session in `Prefilling`; the provider's `_ => load_prompt`
+branch then hit `InvalidPhase` on every later turn and wedged. The provider now
+dispatches explicitly — `Completed`→`continue_prompt`, `Initialized`→`load_prompt`,
+otherwise `reset()` + `load_prompt` (discard the half-fed cache, start fresh).
+Regression: `failed_continue_prompt_leaves_a_recoverable_session`. (2) **Stale logits
+on empty rebuild (P2).** `QwenEngine::prefill_reuse`'s rebuild branch didn't clear
+`last_logits`, so `continue_prompt(&[])` reported `kv_len == 0` while `next_logits`
+still returned the prior turn's distribution — breaking the `reset_cache`+`prefill`
+equivalence. It now clears `last_logits` before the rebuild loop; the trait mock
+gained stored-logits semantics to guard it
+(`prefill_reuse_into_empty_context_drops_stale_logits`). (3) **Root artifacts (P3).**
+Six empty shell-redirect artifacts in the repo root were removed (the same mishap
+class as increment-1's rounds 1–4).
 
 ## Links
 - Source: [docs/research/improvements-plan.md](../research/improvements-plan.md) §P0.1, EPIC-1.

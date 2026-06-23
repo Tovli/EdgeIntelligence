@@ -364,6 +364,11 @@ mod bench {
 /// previous conversation's KV with a single benign position-0 forward — no engine
 /// reconstruction and no reload from disk between turns.
 ///
+/// Across turns of the *same* conversation it also reuses the unchanged prefix's
+/// KV: [`prefill_reuse`](InferenceEngine::prefill_reuse) feeds only the suffix the
+/// re-rendered conversation adds beyond `cached`, the live token sequence behind
+/// the cache (ADR-018 AC-3 cross-turn incremental prefill).
+///
 /// A *within-generation* safety backtrack (ADR-012) is supported via
 /// [`InferenceEngine::rollback`]: candle's attention discards its cache when a
 /// forward runs at `index_pos == 0`, so we retain the prompt and replay it from
@@ -381,6 +386,12 @@ pub struct QwenEngine {
     /// The prefill prompt, retained so a rollback can replay it from position 0
     /// to rebuild candle's KV cache (which has no public truncation).
     prompt: Vec<Token>,
+    /// The exact token sequence currently represented by the KV cache —
+    /// `prompt` plus the committed tokens fed so far. Its length equals
+    /// `index_pos` (every `forward_one` advances both in lock-step). It is the
+    /// basis for the cross-turn longest-common-prefix reuse check (ADR-018 AC-3,
+    /// [`prefill_reuse`](InferenceEngine::prefill_reuse)).
+    cached: Vec<Token>,
     /// Milli-logits produced after the most recent forward.
     last_logits: Vec<i32>,
     vocab: usize,
@@ -410,6 +421,7 @@ impl QwenEngine {
             index_pos: 0,
             fed: 0,
             prompt: Vec::new(),
+            cached: Vec::new(),
             last_logits: Vec::new(),
             vocab: 0,
             eos,
@@ -457,8 +469,10 @@ impl InferenceEngine for QwenEngine {
         self.index_pos = 0;
         self.fed = 0;
         self.prompt = tokens.to_vec(); // retained for rollback replay
+        self.cached = Vec::with_capacity(tokens.len());
         for &t in tokens {
             self.last_logits = self.forward_one(t)?;
+            self.cached.push(t);
         }
         self.vocab = self.last_logits.len();
         Ok(tokens.len() as u32)
@@ -474,6 +488,7 @@ impl InferenceEngine for QwenEngine {
                 Ok(l) => self.last_logits = l,
                 Err(_) => return vec![0; self.vocab.max(1)],
             }
+            self.cached.push(t); // keep `cached` == the KV's token sequence
             self.fed += 1;
         }
         self.last_logits.clone()
@@ -498,6 +513,10 @@ impl InferenceEngine for QwenEngine {
             let t = self.prompt[i];
             self.last_logits = self.forward_one(t)?;
         }
+        // The cache now represents exactly the replayed prompt; the session
+        // re-feeds the retained committed prefix via `next_logits`, extending
+        // `cached` back in lock-step.
+        self.cached = self.prompt.clone();
         Ok(())
     }
 
@@ -534,9 +553,70 @@ impl InferenceEngine for QwenEngine {
         // bytes aren't retained in an owned allocation (P2): `Vec::new()` drops
         // the old allocation; `clear()` would keep capacity and the stale ids.
         self.prompt = Vec::new();
+        self.cached = Vec::new();
         self.last_logits = Vec::new();
         Ok(())
     }
+
+    /// Cross-turn incremental prefill (ADR-018 AC-3): reuse the KV already cached
+    /// for the longest prefix `full_context` shares with the live cache, and feed
+    /// only the divergent suffix at the live position — no reload, no whole-history
+    /// re-prefill.
+    ///
+    /// `cached` is the exact token sequence behind the current KV (length ==
+    /// `index_pos`). The token-level longest-common-prefix against it is the
+    /// tokenizer-round-trip guard: a re-rendered+re-tokenized conversation that
+    /// drifts from what was generated simply matches a shorter prefix and the rest
+    /// is fed fresh. When `full_context` exactly extends the cache, only the new
+    /// tail is forwarded (the fast path); otherwise — divergence, or a context
+    /// shorter than the cache — candle cannot truncate its append-only cache, so we
+    /// rebuild from position 0 (a forward at `index_pos == 0` drops the old cache),
+    /// which is never worse than the pre-ADR-018 full re-prefill.
+    ///
+    /// Either branch leaves the engine in the **same** state a `reset_cache()` +
+    /// `prefill(full_context)` would: the suffix is fed by the identical
+    /// `forward_one` calls at the identical positions, so subsequent logits are
+    /// bit-identical to a from-scratch prefill (the soundness contract).
+    fn prefill_reuse(&mut self, full_context: &[Token]) -> Result<u32> {
+        let reuse = longest_common_prefix(&self.cached, full_context);
+        if reuse == self.cached.len() && reuse == self.index_pos {
+            // Fast path: the cache is an exact prefix of `full_context`. Feed only
+            // the new suffix at the live position; the existing KV is reused as-is.
+            for &t in &full_context[reuse..] {
+                self.last_logits = self.forward_one(t)?;
+                self.cached.push(t);
+            }
+        } else {
+            // Divergence (or a shorter context): rebuild from scratch. Setting
+            // `index_pos = 0` makes the first `forward_one` discard candle's old
+            // cache, exactly as a fresh `prefill` would. Clear `last_logits` first
+            // so an *empty* `full_context` leaves no stale distribution behind —
+            // matching `reset_cache()` + `prefill(&[])`; a non-empty context
+            // overwrites it in the loop.
+            self.index_pos = 0;
+            self.cached = Vec::with_capacity(full_context.len());
+            self.last_logits = Vec::new();
+            for &t in full_context {
+                self.last_logits = self.forward_one(t)?;
+                self.cached.push(t);
+            }
+        }
+        self.fed = 0;
+        // Replay base for this turn's rollback.
+        self.prompt = full_context.to_vec();
+        // Set `vocab` unconditionally — exactly as `prefill` does — so an empty
+        // rebuild leaves `vocab == 0`, matching `reset_cache()` + `prefill(&[])`;
+        // a non-empty context sets it to the real vocab via the fed logits.
+        self.vocab = self.last_logits.len();
+        Ok(self.index_pos as u32)
+    }
+}
+
+/// Length of the longest common prefix of two token slices. The cross-turn KV
+/// reuse cutoff (ADR-018 AC-3): how many leading tokens of a re-tokenized
+/// conversation still match what the engine already cached.
+fn longest_common_prefix(a: &[Token], b: &[Token]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
 // ── On-device safety wiring (ADR-005 tier + ADR-012 control loop) ────────────
@@ -674,12 +754,26 @@ impl SafetyConfig {
     }
 }
 
+/// Interior state of a [`QwenExpert`], guarded by one mutex so the
+/// rollback-detect-then-feed step is atomic.
+struct ExpertState {
+    engine: QwenEngine,
+    /// How many committed tokens the expert has fed since its last prime — used
+    /// to detect a base rollback (committed shrinks below this) and re-sync.
+    fed: usize,
+}
+
 /// A safety **expert** logit source for contrastive steering (ADR-013): a second
 /// Qwen engine — in production base + a safety LoRA; here any same-tokenizer Qwen
 /// GGUF — loaded through the ADR-006 provenance gate and **primed with the turn's
 /// prompt** so its logits align with the base engine's. The session feeds it the
-/// committed tokens via [`ExpertLogits::logits`]; interior mutability is required
-/// because each forward advances candle's KV cache.
+/// committed tokens via [`ExpertLogits::logits`].
+///
+/// The weights are **loaded once and kept resident** like the base model
+/// (ADR-018 expert persistence): the provider holds it across turns and calls
+/// [`reprime`](Self::reprime) per turn (`reset_cache` + prefill, no disk reload).
+/// State lives behind a `Mutex` (not `RefCell`/`Cell`) so the resident expert is
+/// `Send + Sync` and can sit in the `Send + Sync` provider.
 ///
 /// Steering is bounded to the early-token window (ADR-013), so the expert runs
 /// only for the first `steer_window` tokens. When the base engine rolls back
@@ -689,10 +783,7 @@ impl SafetyConfig {
 /// at the chat model itself yields ~zero contrast (a no-op); a safety-tuned Qwen
 /// GGUF gives real steering.
 pub struct QwenExpert {
-    engine: std::cell::RefCell<QwenEngine>,
-    /// How many committed tokens the expert has fed since its last prime — used
-    /// to detect a base rollback (committed shrinks below this) and re-sync.
-    fed: std::cell::Cell<usize>,
+    state: std::sync::Mutex<ExpertState>,
     /// Evidence the expert weights passed the ADR-006 load gate (R5). Held for
     /// the engine's lifetime; never used after construction.
     _permit: LoadPermit,
@@ -711,30 +802,74 @@ impl QwenExpert {
         let mut engine = QwenEngine::from_path(path, eos)?;
         engine.prefill(prompt)?;
         Ok(Self {
-            engine: std::cell::RefCell::new(engine),
-            fed: std::cell::Cell::new(0),
+            state: std::sync::Mutex::new(ExpertState { engine, fed: 0 }),
             _permit: permit,
         })
+    }
+
+    /// Re-prime the **resident** expert to a new turn's prompt without reloading
+    /// the GGUF (ADR-018 expert persistence): discard the prior turn's KV and
+    /// prefill the new prompt on the same loaded weights. The expensive part —
+    /// reading + parsing the GGUF — happens once in `from_path_primed`; this only
+    /// re-runs the (cheap, bounded) prompt prefill.
+    pub fn reprime(&self, prompt: &[Token]) -> Result<()> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| EdgeError::Engine("expert mutex poisoned"))?;
+        st.engine.reset_cache()?;
+        st.engine.prefill(prompt)?;
+        st.fed = 0;
+        Ok(())
+    }
+
+    /// Release the expert's conversation KV while keeping its weights resident
+    /// (ADR-018) — the expert half of [`QwenChatProvider::end_session`].
+    fn release(&self) -> Result<()> {
+        let mut st = self
+            .state
+            .lock()
+            .map_err(|_| EdgeError::Engine("expert mutex poisoned"))?;
+        st.engine.reset_cache()?;
+        st.fed = 0;
+        Ok(())
     }
 }
 
 impl ExpertLogits for QwenExpert {
     fn logits(&self, committed: &[Token]) -> Vec<i32> {
-        let mut engine = self.engine.borrow_mut();
+        let mut st = match self.state.lock() {
+            Ok(st) => st,
+            Err(_) => return Vec::new(),
+        };
         // Base rolled back? `committed` shrank below what we've fed. Re-prime the
         // expert to the prompt (QwenEngine::rollback replays the prompt and
         // resets its feed cursor) so it re-feeds the retained prefix from a clean
         // state — keeping the contrastive context aligned with the base. Cost is
         // bounded by `max_rollbacks` (ADR-012), same as the base engine.
-        if committed.len() < self.fed.get() {
-            if engine.rollback(0).is_err() {
+        if committed.len() < st.fed {
+            if st.engine.rollback(0).is_err() {
                 return Vec::new();
             }
-            self.fed.set(0);
+            st.fed = 0;
         }
-        let out = engine.next_logits(committed);
-        self.fed.set(committed.len());
+        let out = st.engine.next_logits(committed);
+        st.fed = committed.len();
         out
+    }
+}
+
+/// A resident expert shared into a turn's steerer (ADR-018 expert persistence):
+/// the weights are loaded once and held by the provider; each turn clones this
+/// `Arc` into the turn's [`ContrastiveSteerer`]. After the turn the steerer (and
+/// this clone) drops, but the provider's `Arc` keeps the weights resident. The
+/// newtype sidesteps the orphan rule (`ExpertLogits` cannot be implemented for a
+/// bare `Arc<QwenExpert>` outside `el-safety`).
+struct SharedExpert(std::sync::Arc<QwenExpert>);
+
+impl ExpertLogits for SharedExpert {
+    fn logits(&self, committed: &[Token]) -> Vec<i32> {
+        self.0.logits(committed)
     }
 }
 
@@ -743,8 +878,10 @@ impl ExpertLogits for QwenExpert {
 /// The weights are loaded **once** (in [`QwenChatProvider::from_paths`]) into
 /// `Loaded`. The first `chat` promotes them into a reusable [`InferenceSession`]
 /// (`Active`) — done lazily so the builder-configured safety tier / expert is
-/// finalized first — and every later turn reuses that one session via
-/// `reset()` + `load_prompt()`. The model is never re-read from disk per turn.
+/// finalized first — and every later turn reuses that one session: a follow-up
+/// turn via `continue_prompt` (reuse the cached KV prefix, AC-3), a fresh turn via
+/// `load_prompt`, and a turn after a mid-flight failure via `reset()` +
+/// `load_prompt`. The model is never re-read from disk per turn.
 enum ChatSession {
     /// Weights resident, no conversation session yet.
     Loaded(QwenEngine),
@@ -759,10 +896,12 @@ enum ChatSession {
 ///
 /// The model weights are loaded **once** at construction and kept resident
 /// (ADR-018): each `chat` renders the whole conversation to Qwen2.5 ChatML and
-/// reuses one persistent provenance-gated session — `reset` (discard the prior
-/// conversation + engine KV cache) → `load_prompt` (prefill) → `generate`
-/// (grammar mask → safety steer → guard + checkpointed rollback → greedy commit)
-/// — instead of rebuilding the engine and re-reading the GGUF every turn.
+/// reuses one persistent provenance-gated session — a follow-up turn reuses the
+/// cached KV prefix and prefills only the new suffix (`continue_prompt`, AC-3
+/// cross-turn incremental prefill), while a fresh turn uses `load_prompt` —
+/// then `generate` (grammar mask → safety steer → guard + checkpointed rollback
+/// → greedy commit), instead of rebuilding the engine and re-reading the GGUF
+/// every turn.
 /// On-device safety (ADR-005 `Lightweight` tier + the ADR-012 control loop) is
 /// **on by default**; see [`with_safety`](Self::with_safety). The resident model
 /// lives behind a `Mutex`, so the provider stays `Send + Sync` and concurrent
@@ -775,14 +914,18 @@ pub struct QwenChatProvider {
     model_label: String,
     safety: SafetyConfig,
     /// Optional safety **expert** GGUF for ADR-013 contrastive steering. `None`
-    /// runs the token-only `Lightweight` steerer. NOTE (ADR-018 follow-up): the
-    /// expert is still loaded per turn; persisting it like the base model is the
-    /// next increment. The default (no-expert) path is fully resident.
+    /// runs the token-only `Lightweight` steerer. The weights are loaded once and
+    /// kept resident in `expert` (ADR-018 expert persistence).
     expert_model: Option<std::path::PathBuf>,
     /// Contrastive steering strength ×1000 (1000 = 1.0×).
     steer_alpha_milli: i32,
     /// Resident model + reusable session (ADR-018).
     session: std::sync::Mutex<ChatSession>,
+    /// The resident safety expert (ADR-018 expert persistence): loaded lazily on
+    /// the first `SecDecoding` turn and reused across turns via `reprime`, instead
+    /// of re-reading the expert GGUF from disk every turn. `None` until first use,
+    /// or always-`None` when no `--expert-model` is configured.
+    expert: std::sync::Mutex<Option<std::sync::Arc<QwenExpert>>>,
 }
 
 impl QwenChatProvider {
@@ -826,6 +969,7 @@ impl QwenChatProvider {
             expert_model: None,
             steer_alpha_milli: 1000,
             session: std::sync::Mutex::new(ChatSession::Loaded(engine)),
+            expert: std::sync::Mutex::new(None),
         })
     }
 
@@ -891,6 +1035,16 @@ impl QwenChatProvider {
             .map_err(|_| EdgeError::Engine("chat session mutex poisoned"))?;
         if let ChatSession::Active(session) = &mut *cell {
             session.close()?;
+        }
+        // Release the resident safety expert's conversation KV too (keeps its
+        // weights). Locked after the session — the same order `chat` uses — so
+        // the two mutexes never deadlock.
+        let slot = self
+            .expert
+            .lock()
+            .map_err(|_| EdgeError::Engine("expert mutex poisoned"))?;
+        if let Some(expert) = slot.as_ref() {
+            expert.release()?;
         }
         Ok(())
     }
@@ -963,27 +1117,44 @@ impl LlmProvider for QwenChatProvider {
             _ => return Err(EdgeError::Engine("chat session not initialized")),
         };
 
-        // Discard the previous conversation and the engine's KV cache, then run
-        // this turn over the SAME resident weights (ADR-018) — no disk reload.
-        session.reset()?;
         // Provider-owned turn isolation: drop any events buffered by a prior turn
         // (e.g. one that errored before its end-of-turn drain) so this turn's
         // safety count below cannot include another turn's stale violations.
-        // `reset()` deliberately preserves events (generic semantics); bounding
-        // them per turn is the reusing provider's job.
+        // `continue_prompt`/`reset` deliberately preserve events (generic
+        // semantics); bounding them per turn is the reusing provider's job.
         let _ = session.drain_events();
         let mut ports = self.safety.ports();
 
         if matches!(effective, SafetyMode::SecDecoding) {
             if let Some(expert_path) = &self.expert_model {
-                let expert = QwenExpert::from_path_primed(
-                    expert_path,
-                    self.eos,
-                    &prompt_tokens,
-                    local_load_permit(expert_path)?,
-                )?;
+                // ADR-018 expert persistence: load the expert weights ONCE and keep
+                // them resident; every later turn re-primes (no disk reload). The
+                // expert lock is always taken while holding the session lock — a
+                // fixed order, so no deadlock with `end_session`.
+                let expert = {
+                    let mut slot = self
+                        .expert
+                        .lock()
+                        .map_err(|_| EdgeError::Engine("expert mutex poisoned"))?;
+                    match slot.as_ref() {
+                        Some(e) => {
+                            e.reprime(&prompt_tokens)?;
+                            std::sync::Arc::clone(e)
+                        }
+                        None => {
+                            let e = std::sync::Arc::new(QwenExpert::from_path_primed(
+                                expert_path,
+                                self.eos,
+                                &prompt_tokens,
+                                local_load_permit(expert_path)?,
+                            )?);
+                            *slot = Some(std::sync::Arc::clone(&e));
+                            e
+                        }
+                    }
+                };
                 ports.safety = Box::new(ContrastiveSteerer::new(
-                    expert,
+                    SharedExpert(expert),
                     self.safety.banned.clone(),
                     self.steer_alpha_milli,
                     CONTRASTIVE_TOP_K,
@@ -994,7 +1165,26 @@ impl LlmProvider for QwenChatProvider {
 
         let _ = bench::take(); // clear forward accumulators before prefill
         let t_prefill = bench::enabled().then(std::time::Instant::now);
-        session.load_prompt(&ports, &prompt_tokens)?;
+        // ADR-018 AC-3: on a follow-up turn (a finished prior turn left the
+        // session `Completed`), reuse the cached KV prefix and prefill only the
+        // new suffix; a fresh turn does a full prefill. The engine's
+        // longest-common-prefix check is the backstop, so a tokenizer round-trip
+        // drift in the reused branch falls back to a correct full re-prefill.
+        match session.phase() {
+            el_core::Phase::Completed => session.continue_prompt(&ports, &prompt_tokens)?,
+            // First use, or a fresh start after `end_session` / error recovery.
+            el_core::Phase::Initialized => session.load_prompt(&ports, &prompt_tokens)?,
+            // Dirty: a prior turn's prefill failed mid-transition and left the
+            // session in `Prefilling`/`Decoding`. Now that the unconditional
+            // per-turn `reset()` is gone, a bare `load_prompt` here would hit
+            // `InvalidPhase` and wedge the provider — so discard the partial
+            // conversation (clearing the engine's possibly half-fed cache) and
+            // start fresh instead.
+            _ => {
+                session.reset()?;
+                session.load_prompt(&ports, &prompt_tokens)?;
+            }
+        }
         let d_prefill = t_prefill.map(|t| t.elapsed()).unwrap_or_default();
         let (pf_total, pf_model, pf_calls) = bench::take();
 
@@ -1501,6 +1691,17 @@ mod tests {
     }
 
     #[test]
+    fn longest_common_prefix_cutoff() {
+        // The cross-turn KV reuse boundary (ADR-018 AC-3).
+        assert_eq!(longest_common_prefix(&[], &[1, 2]), 0);
+        assert_eq!(longest_common_prefix(&[1, 2, 3], &[1, 2, 3, 4, 5]), 3); // extends
+        assert_eq!(longest_common_prefix(&[1, 2, 3], &[1, 2, 3]), 3); // equal
+        assert_eq!(longest_common_prefix(&[1, 9, 3], &[1, 2, 3]), 1); // diverges at idx 1
+        assert_eq!(longest_common_prefix(&[1, 2, 3], &[1, 2]), 2); // shorter context
+        assert_eq!(longest_common_prefix(&[5, 6], &[1, 2]), 0); // immediate divergence
+    }
+
+    #[test]
     fn local_load_permit_passes_the_provenance_gate() {
         // The runtime requires a LoadPermit; the local-trust path must yield one
         // for a GGUF artifact (ADR-006 gate exercised, not bypassed).
@@ -1636,5 +1837,16 @@ mod tests {
             ok_permit(),
         );
         assert!(matches!(r, Err(EdgeError::Engine(_))));
+    }
+
+    #[test]
+    fn provider_and_expert_stay_send_and_sync() {
+        // ADR-018 expert persistence: making the expert resident must NOT cost the
+        // provider its thread-safety. The resident expert (`Mutex<…Arc<QwenExpert>>`)
+        // keeps `QwenChatProvider: Send + Sync`, which is why `QwenExpert` uses a
+        // `Mutex` rather than `RefCell`/`Cell`. Compile-time guard.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<QwenExpert>();
+        assert_send_sync::<QwenChatProvider>();
     }
 }

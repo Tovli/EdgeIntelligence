@@ -155,6 +155,68 @@ impl<E: InferenceEngine> InferenceSession<E> {
         Ok(())
     }
 
+    /// Begin a **follow-up turn on the same conversation**, reusing the KV cache
+    /// for the unchanged prefix instead of re-prefilling the whole transcript
+    /// (ADR-018 AC-3 cross-turn incremental prefill). `full_context` is the entire
+    /// re-rendered conversation, tokenized (rendering is the provider's concern).
+    ///
+    /// Valid only from [`Phase::Completed`] — i.e. a prior turn on this resident
+    /// session finished. The engine ([`prefill_reuse`](InferenceEngine::prefill_reuse))
+    /// reuses the longest cached prefix that still matches `full_context` and feeds
+    /// only the divergent suffix; the prior turn's generated reply, now baked into
+    /// the re-rendered context, becomes part of the reused prefix. This turn's
+    /// generated `output` starts empty; the KV descriptors are rebuilt to the
+    /// engine's reported length.
+    ///
+    /// Safety is unchanged (ADR-012/ADR-013): [`generate`](Self::generate) re-scores
+    /// the full prompt at ingress and guards this turn's output as usual, and a
+    /// within-turn rollback rebuilds from `full_context` (the reuse base). KV reuse
+    /// is purely a compute optimisation — it never alters what the safety loop sees.
+    ///
+    /// Distinct from [`reset`](Self::reset) (discard the conversation, start fresh):
+    /// `continue_prompt` *keeps* the conversation and extends it. A provider that
+    /// cannot guarantee a clean prior turn (after a reset, error, or full discard)
+    /// should use [`load_prompt`](Self::load_prompt) from `Initialized` instead;
+    /// the engine's prefix check is a backstop that falls back to a full prefill on
+    /// any divergence.
+    ///
+    /// Unlike `load_prompt`, this deliberately does **not** apply prompt
+    /// compression: cross-turn reuse needs a byte-stable token prefix, and
+    /// compressing the (growing) re-rendered conversation each turn would yield a
+    /// different prefix and defeat reuse — the two are mutually exclusive. `ports`
+    /// is accepted for call-site symmetry with `load_prompt`; the grammar/safety/
+    /// ingress ports are consumed by [`generate`](Self::generate), not here.
+    pub fn continue_prompt(&mut self, _ports: &Ports, full_context: &[Token]) -> Result<()> {
+        if self.phase != Phase::Completed {
+            return Err(EdgeError::InvalidPhase {
+                expected: "Completed",
+                found: self.phase.as_str(),
+            });
+        }
+        // The whole re-rendered conversation is this turn's prompt for ADR-013
+        // ingress triage (re-scored in `generate_with_policy`).
+        self.prompt = full_context.to_vec();
+
+        self.phase = Phase::Prefilling;
+        let kv_len = self.engine.prefill_reuse(full_context)?;
+        // Rebuild the KV descriptors to match the reused-plus-extended cache.
+        self.kv = KvRegion::new();
+        for _ in 0..kv_len {
+            let off = self.kv.len() as u64;
+            self.kv.push(off);
+        }
+        // Fresh generated output for this turn; the prior reply is now in the
+        // prefilled context.
+        self.output.clear();
+        self.emit(DomainEvent::PrefillCompleted {
+            prompt_tokens: full_context.len() as u32,
+            kv_len,
+            prefill_tps: 0,
+        });
+        self.phase = Phase::Decoding;
+        Ok(())
+    }
+
     /// Run the decode loop until EOS or `max_tokens`, deriving the rollback
     /// policy from the session's device tier and safety mode (ADR-005/ADR-012).
     pub fn generate(&mut self, ports: &Ports, max_tokens: u32) -> Result<StopReason> {
@@ -1594,5 +1656,344 @@ mod tests {
             cleared.get(),
             "the next reset re-clears after a failed attempt"
         );
+    }
+
+    // ----- ADR-018 AC-3 cross-turn prefix reuse / incremental prefill -----
+
+    /// A stateful mock mirroring `QwenEngine`'s cache bookkeeping: it tracks the
+    /// exact cached token sequence, counts every forward (one per fed token), and
+    /// implements `prefill_reuse` with the same longest-common-prefix reuse — so
+    /// the cross-turn reuse contract can be proven without a real model. Its
+    /// logits are a deterministic hash of the cached sequence, so two engines with
+    /// identical caches return identical logits (and divergent caches almost never
+    /// do): the soundness probe for reuse-equals-fresh-prefill.
+    struct ReuseEngine {
+        eos: Token,
+        vocab: usize,
+        index_pos: usize,
+        fed: usize,
+        cached: Vec<Token>,
+        prompt: Vec<Token>,
+        /// Logits after the most recent forward — **stored**, like `QwenEngine`'s
+        /// `last_logits`, so the empty/rebuild path can be checked for stale state.
+        last_logits: Vec<i32>,
+        forwards: std::rc::Rc<std::cell::Cell<u32>>,
+        /// When set, the favoured token is always EOS so `generate` terminates on
+        /// the first decode step (keeps the reuse-savings test deterministic).
+        eos_immediately: bool,
+    }
+    impl ReuseEngine {
+        fn new(eos: Token, vocab: usize, eos_immediately: bool) -> Self {
+            Self {
+                eos,
+                vocab,
+                index_pos: 0,
+                fed: 0,
+                cached: Vec::new(),
+                prompt: Vec::new(),
+                last_logits: Vec::new(),
+                forwards: std::rc::Rc::new(std::cell::Cell::new(0)),
+                eos_immediately,
+            }
+        }
+        fn forward(&mut self, t: Token) {
+            self.forwards.set(self.forwards.get() + 1);
+            self.cached.push(t);
+            self.index_pos += 1;
+            self.last_logits = self.logits_for_cache();
+        }
+        fn logits_for_cache(&self) -> Vec<i32> {
+            let mut v = vec![0i32; self.vocab];
+            if self.eos_immediately {
+                if let Some(s) = v.get_mut(self.eos as usize) {
+                    *s = 1_000_000;
+                }
+                return v;
+            }
+            // Content hash of the cached sequence so identical caches ⇒ identical
+            // logits — the probe for reuse soundness.
+            let h = self
+                .cached
+                .iter()
+                .fold(0i32, |a, &t| a.wrapping_mul(31).wrapping_add(t as i32 + 1));
+            for (i, slot) in v.iter_mut().enumerate() {
+                *slot = h.wrapping_add(i as i32);
+            }
+            v
+        }
+    }
+    impl InferenceEngine for ReuseEngine {
+        fn prefill(&mut self, tokens: &[Token]) -> Result<u32> {
+            self.index_pos = 0;
+            self.fed = 0;
+            self.cached = Vec::new();
+            self.last_logits = Vec::new();
+            self.prompt = tokens.to_vec();
+            for &t in tokens {
+                self.forward(t);
+            }
+            Ok(tokens.len() as u32)
+        }
+        fn next_logits(&mut self, committed: &[Token]) -> Vec<i32> {
+            while self.fed < committed.len() {
+                self.forward(committed[self.fed]);
+                self.fed += 1;
+            }
+            self.last_logits.clone()
+        }
+        fn eos_token(&self) -> Token {
+            self.eos
+        }
+        fn rollback(&mut self, _keep: u32) -> Result<()> {
+            self.index_pos = 0;
+            self.fed = 0;
+            self.cached = Vec::new();
+            self.last_logits = Vec::new();
+            let prompt = self.prompt.clone();
+            for &t in &prompt {
+                self.forward(t);
+            }
+            Ok(())
+        }
+        fn reset_cache(&mut self) -> Result<()> {
+            self.index_pos = 0;
+            self.fed = 0;
+            self.cached = Vec::new();
+            self.last_logits = Vec::new();
+            self.prompt = Vec::new();
+            Ok(())
+        }
+        fn prefill_reuse(&mut self, full_context: &[Token]) -> Result<u32> {
+            let reuse = self
+                .cached
+                .iter()
+                .zip(full_context)
+                .take_while(|(a, b)| a == b)
+                .count();
+            if reuse == self.cached.len() && reuse == self.index_pos {
+                for &t in &full_context[reuse..] {
+                    self.forward(t);
+                }
+            } else {
+                self.index_pos = 0;
+                self.cached = Vec::new();
+                self.last_logits = Vec::new(); // mirror QwenEngine: no stale logits on rebuild
+                for &t in full_context {
+                    self.forward(t);
+                }
+            }
+            self.fed = 0;
+            self.prompt = full_context.to_vec();
+            Ok(self.index_pos as u32)
+        }
+    }
+
+    /// Fails every `prefill_reuse` (a transient reuse error) but resets and
+    /// prefills fine — the dirty-phase recovery probe.
+    struct FailReuseEngine {
+        eos: Token,
+        vocab: usize,
+    }
+    impl InferenceEngine for FailReuseEngine {
+        fn prefill(&mut self, t: &[Token]) -> Result<u32> {
+            Ok(t.len() as u32)
+        }
+        fn next_logits(&mut self, _c: &[Token]) -> Vec<i32> {
+            let mut v = vec![0i32; self.vocab];
+            if let Some(s) = v.get_mut(self.eos as usize) {
+                *s = 1;
+            }
+            v
+        }
+        fn eos_token(&self) -> Token {
+            self.eos
+        }
+        fn rollback(&mut self, _keep: u32) -> Result<()> {
+            Ok(())
+        }
+        fn reset_cache(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn prefill_reuse(&mut self, _full_context: &[Token]) -> Result<u32> {
+            Err(EdgeError::Engine("prefill_reuse failed"))
+        }
+    }
+
+    #[test]
+    fn continue_prompt_reuses_cached_prefix_and_feeds_only_suffix() {
+        // AC-3a: a follow-up turn forwards ONLY the new suffix; the unchanged
+        // prefix's KV is reused — no whole-context re-prefill, no reload.
+        let engine = ReuseEngine::new(1, 4, true);
+        let forwards = engine.forwards.clone();
+        let mut s =
+            InferenceSession::new(SessionId(50), SessionConfig::default(), engine, permit());
+        let ports = Ports::permissive();
+
+        s.load_prompt(&ports, &[10, 11]).unwrap();
+        s.generate(&ports, 8).unwrap(); // EOS immediately → output = [1]
+        assert_eq!(forwards.get(), 2, "turn 1 prefilled the 2 prompt tokens");
+
+        // Turn 2: same [10,11] prefix + a 3-token suffix.
+        s.continue_prompt(&ports, &[10, 11, 20, 21, 22]).unwrap();
+        assert_eq!(
+            forwards.get() - 2,
+            3,
+            "only the 3-token suffix was prefilled, not the whole 5-token context"
+        );
+        assert_eq!(s.phase(), Phase::Decoding);
+        // KV descriptors reflect the full reused-plus-extended context.
+        assert_eq!(s.kv_len(), 5);
+
+        s.generate(&ports, 8).unwrap();
+        assert_eq!(s.output(), &[1]);
+        assert_eq!(s.phase(), Phase::Completed);
+    }
+
+    #[test]
+    fn continue_prompt_requires_a_completed_prior_turn() {
+        // AC-3d: continue is valid only after a finished turn; an unprefilled
+        // (Initialized) session must use load_prompt instead.
+        let engine = ReuseEngine::new(1, 4, true);
+        let mut s =
+            InferenceSession::new(SessionId(51), SessionConfig::default(), engine, permit());
+        let ports = Ports::permissive();
+        let err = s.continue_prompt(&ports, &[1, 2]).unwrap_err();
+        assert!(matches!(err, EdgeError::InvalidPhase { .. }));
+    }
+
+    #[test]
+    fn prefill_reuse_leaves_same_state_as_a_fresh_prefill() {
+        // AC-3b soundness: prefill_reuse(ctx) must leave the engine producing the
+        // SAME logits as reset_cache()+prefill(ctx) — both for the fast (extend)
+        // path and the divergence (rebuild) path. Reuse is only a compute
+        // optimisation; it must never change what the cache represents.
+        let mut fresh = ReuseEngine::new(99, 6, false);
+        fresh.prefill(&[1, 2, 3, 4]).unwrap();
+        let want = fresh.next_logits(&[]);
+
+        // Fast path: cache [1,2] then extend to [1,2,3,4].
+        let mut extend = ReuseEngine::new(99, 6, false);
+        extend.prefill(&[1, 2]).unwrap();
+        extend.prefill_reuse(&[1, 2, 3, 4]).unwrap();
+        assert_eq!(
+            extend.next_logits(&[]),
+            want,
+            "extend-reuse == fresh prefill"
+        );
+
+        // Divergence: cache [1,9,3] diverges from [1,2,3,4] at index 1 → rebuild.
+        let mut rebuild = ReuseEngine::new(99, 6, false);
+        rebuild.prefill(&[1, 9, 3]).unwrap();
+        rebuild.prefill_reuse(&[1, 2, 3, 4]).unwrap();
+        assert_eq!(
+            rebuild.next_logits(&[]),
+            want,
+            "rebuild-on-divergence == fresh prefill"
+        );
+    }
+
+    #[test]
+    fn default_prefill_reuse_does_a_full_recompute() {
+        // The safe default (used by every engine that doesn't override): discard
+        // the cache and re-prefill the whole context. NullEngine is stateless, so
+        // this is a no-op reset + a full prefill of the given length.
+        let mut e = NullEngine::new(1, 4);
+        assert_eq!(e.prefill(&[1, 2]).unwrap(), 2);
+        assert_eq!(
+            e.prefill_reuse(&[1, 2, 3, 4, 5]).unwrap(),
+            5,
+            "default reuse re-prefills the full context length"
+        );
+    }
+
+    #[test]
+    fn continued_turn_still_runs_the_safety_control_loop() {
+        // AC-3c: a continued turn is guarded exactly like a fresh one — the
+        // chunk-guard + checkpointed rollback still bans the unsafe token. Uses a
+        // stateless engine (default prefill_reuse) to isolate the safety wiring.
+        let mut s = InferenceSession::new(
+            SessionId(52),
+            SessionConfig::default(),
+            descending_engine(), // always prefers the unsafe token 0
+            permit(),
+        );
+        let ports = guarded_ports(Box::new(BanToken(0)));
+
+        s.load_prompt(&ports, &[7]).unwrap();
+        s.generate_with_policy(&ports, 2, tiny_policy(3)).unwrap();
+        assert_eq!(s.phase(), Phase::Completed);
+
+        // Follow-up turn over the re-rendered conversation.
+        s.continue_prompt(&ports, &[7, 1, 1, 8]).unwrap();
+        let stop = s.generate_with_policy(&ports, 3, tiny_policy(3)).unwrap();
+
+        assert_eq!(stop, StopReason::MaxTokens);
+        assert!(
+            !s.output().contains(&0),
+            "the guard still bans the unsafe token on a continued turn"
+        );
+        assert_eq!(s.output(), &[1, 1, 1]);
+        let evs = s.drain_events();
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e.event, DomainEvent::ClaimBacktracked { .. })));
+    }
+
+    #[test]
+    fn prefill_reuse_into_empty_context_drops_stale_logits() {
+        // Regression (P2): rebuilding into an EMPTY context must leave no stale
+        // distribution — same state as reset_cache()+prefill(&[]). Otherwise
+        // continue_prompt(&[]) would report kv_len 0 yet decode from the prior
+        // turn's logits.
+        let mut reused = ReuseEngine::new(9, 4, false);
+        reused.prefill(&[1, 2, 3]).unwrap();
+        assert!(!reused.next_logits(&[]).is_empty());
+        reused.prefill_reuse(&[]).unwrap();
+
+        let mut fresh = ReuseEngine::new(9, 4, false);
+        fresh.reset_cache().unwrap();
+        fresh.prefill(&[]).unwrap();
+
+        assert_eq!(
+            reused.next_logits(&[]),
+            fresh.next_logits(&[]),
+            "rebuild into an empty context == a fresh empty prefill"
+        );
+        assert!(
+            reused.next_logits(&[]).is_empty(),
+            "no stale distribution may survive the rebuild"
+        );
+    }
+
+    #[test]
+    fn failed_continue_prompt_leaves_a_recoverable_session() {
+        // Regression (P1): a failed prefill_reuse sets Prefilling but never reaches
+        // Decoding. The session must NOT wedge — the provider's dirty-phase
+        // recovery (reset() then load_prompt()) must work afterwards, instead of
+        // the next turn hitting InvalidPhase forever.
+        let mut s = InferenceSession::new(
+            SessionId(54),
+            SessionConfig::default(),
+            FailReuseEngine { eos: 1, vocab: 4 },
+            permit(),
+        );
+        let ports = Ports::permissive();
+        s.load_prompt(&ports, &[10, 11]).unwrap();
+        s.generate(&ports, 8).unwrap();
+        assert_eq!(s.phase(), Phase::Completed);
+
+        let err = s.continue_prompt(&ports, &[10, 11, 12]).unwrap_err();
+        assert!(matches!(err, EdgeError::Engine(_)));
+        assert_ne!(
+            s.phase(),
+            Phase::Completed,
+            "a failed reuse must not masquerade as a finished turn"
+        );
+
+        // The provider's recovery path must succeed regardless of the dirty phase.
+        s.reset().unwrap();
+        s.load_prompt(&ports, &[20, 21]).unwrap();
+        assert_eq!(s.phase(), Phase::Decoding);
+        assert_eq!(s.generate(&ports, 8).unwrap(), StopReason::Eos);
     }
 }

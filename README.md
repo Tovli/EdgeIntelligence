@@ -2,6 +2,9 @@
 
 # Edge Intelligence
 
+[![npm package](https://img.shields.io/npm/v/edge-intelligence-sdk?style=for-the-badge&logo=npm&logoColor=white&label=npm)](https://www.npmjs.com/package/edge-intelligence-sdk)
+[![pub.dev package](https://img.shields.io/pub/v/edge_intelligence?style=for-the-badge&logo=dart&logoColor=white&label=pub.dev)](https://pub.dev/packages/edge_intelligence)
+[![crates.io package](https://img.shields.io/crates/v/el-core?style=for-the-badge&logo=rust&logoColor=white&label=crates.io%20el-core)](https://crates.io/crates/el-core)
 ![Rust](https://img.shields.io/badge/Rust-2021-f46623?style=for-the-badge&logo=rust&logoColor=white)
 ![Status](https://img.shields.io/badge/status-active%20prototype-2563eb?style=for-the-badge)
 ![Privacy](https://img.shields.io/badge/default-air--gapped-10b981?style=for-the-badge)
@@ -269,38 +272,57 @@ workspace build (it pulls crates.io-only grammar dependencies); `el-cloud` and
 The SDK ships two reproducible benchmark harnesses. Both run inference through the
 public `LlmProvider` seam, so they characterize the **SDK's own behavior** and are
 **model-agnostic** — point them at whichever signed model your product loads. The
-model is pluggable and not part of this repo, so no per-model results are published
-here; run the harnesses against your own model to produce them.
+harnesses are model-pluggable; the dated reports under
+[`docs/benchmarks/`](docs/benchmarks) publish **reference results on the prototype's
+reference model** (Qwen2.5-0.5B-Instruct q4_k_m, Intel i5-14500, release build) so
+the trend is visible. Re-run either harness against your own model to reproduce.
 
-**1. Runtime performance / overhead** —
-[`docs/benchmarks/2026-06-14-qwen-chat-bottleneck.md`](docs/benchmarks/2026-06-14-qwen-chat-bottleneck.md)
+### 1. Runtime performance — measured progression
 
-A phase-level latency breakdown of the local decode path, behind opt-in,
-zero-cost-when-unset instrumentation (`EL_BENCH=1`). The SDK-side conclusion: the
-runtime's own per-token work — decode loop, grammar mask, full-vocab argmax, KV
-commit, and content-free event emission — is **under ~1.2% of decode time**.
-Latency is dominated by model compute plus two orchestration costs the SDK can
-remove, independent of model choice:
+A phase-level breakdown of the local decode path, behind opt-in,
+zero-cost-when-unset instrumentation (`EL_BENCH=1`). The SDK-side conclusion is
+stable across every run: the runtime's own per-token glue — decode loop, grammar
+mask, full-vocab argmax, KV commit, content-free event emission — is **under ~1.2%
+of decode time (~99% is raw model forward)**. The wins have therefore come from
+removing *orchestration* costs, tracked across three reports:
 
-- **Batch the prefill** — feed the prompt as one `(1, prompt_len)` forward instead
-  of one forward per prompt token.
-- **Load weights once; reset only the KV cache** — and reuse KV across turns, so a
-  growing conversation is not re-prefilled from scratch each turn.
-- **Stream tokens for real** — emit from inside the decode loop so time-to-first-
-  token is `load + prefill + 1 token`, not full-generation time.
+| Milestone | Report | Per-turn weight reload | Prefill (full suite) | Multi-turn re-prefill | Full-suite wall¹ |
+|-----------|--------|------------------------|----------------------|-----------------------|------------------|
+| Baseline (pre-ADR-018) | [2026-06-14](docs/benchmarks/2026-06-14-qwen-chat-bottleneck.md) | **~1.2 s every turn** | un-batched, ~15 tok/s, the #1–2 cost | whole conversation re-prefilled each turn | — (micro-bench) |
+| Resident model + stateful sessions ([ADR-018](docs/adr/ADR-018-persistent-model-instances-and-stateful-sessions.md)) | [2026-06-22](docs/benchmarks/2026-06-22-adr-018-resident-model-full-suite.md) | **0 ms** (loaded once) | 56.8% of compute (now the #1 cost) | still re-prefilled | **53.7 min** |
+| + Cross-turn prefix reuse (ADR-018 AC-3) | [2026-06-23](docs/benchmarks/2026-06-23-adr-018-ac3-prefix-reuse-full-suite.md) | 0 ms | **29.5%** of compute (−65% wall) | **only the new suffix is prefilled** | **35.7 min (−33.5%)** |
 
-**2. Clinical-quality & safety evaluation** — [`apps/el-bench`](apps/el-bench) ·
-[`benchmarks/README.md`](benchmarks/README.md)
+¹ Same `el-bench` suite (66 tasks → 97 replies, 256 max-tokens, safety off), same
+host — the 06-22 and 06-23 rows are directly comparable. The 06-14 baseline is an
+`el-chat` micro-benchmark that *isolated* the bottlenecks, so its wall time is not
+run-for-run comparable; the per-phase rates and bottleneck status are.
 
-`el-bench` is an SDK-only test client (a sibling to `el-chat`) that replays
-published mental-health benchmarks — CounselBench, MindEval, and the VERA-MH
-suicide-risk safety suite — through the runtime and records transcripts for
-scoring against each benchmark's rubric. Datasets and transcripts are fetched or
-produced locally and are git-ignored (third-party data); only the harness and the
-methodology are committed. Decoding is deterministic, so a given model + task set
-yields identical transcripts — it is designed to run as a **CI safety gate**, so a
-change to the model, the system prompt, or the ADR-005 safety tier can be
-regression-tested against a fixed rubric.
+**Net effect so far:** the per-turn 491 MB weight-reload tax is gone, and multi-turn
+prefill no longer re-processes the whole conversation — cutting the full-suite run by
+a third and making multi-turn (`mindeval`) **~3× faster** (52.2 → 17.5 s/reply). The
+remaining levers are kernel-level: **batching the prefill of a cold/first turn**
+([ADR-020](docs/adr/ADR-020-batched-single-pass-prefill.md) — the per-forward prefill
+rate is still ~15 tok/s) and the **~14 tok/s quantized decode floor**, which is now
+the dominant cost.
+
+### 2. Clinical-quality & safety evaluation
+
+[`apps/el-bench`](apps/el-bench) · [`benchmarks/README.md`](benchmarks/README.md) ·
+[2026-06-15 report](docs/benchmarks/2026-06-15-clinical-quality-safety.md)
+
+`el-bench` replays published mental-health benchmarks — CounselBench, MindEval, and
+the VERA-MH suicide-risk safety suite (66 tasks → 97 replies) — through the runtime
+and records transcripts for scoring against each benchmark's rubric. Datasets and
+transcripts are fetched or produced locally and are git-ignored (third-party data);
+only the harness and the methodology are committed. Decoding is deterministic, so a
+given model + task set yields identical transcripts — it is designed to run as a
+**CI safety gate** whenever the model, system prompt, or ADR-005 safety tier changes.
+
+> **Headline (reference model):** used as an *unsupervised* responder, the raw 0.5B
+> model is **categorically unsafe for crisis scenarios** — 0/15 risk personas got a
+> specific crisis resource and 0/17 got a direct safety question. This is the hard
+> requirement behind ADR-005 decoder-time safety and a dedicated crisis-routing
+> layer; see the report for the full rubric-by-rubric findings.
 
 ## Architecture decisions
 

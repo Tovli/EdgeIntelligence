@@ -31,6 +31,10 @@ is wired.
 
 ## Usage
 
+For Qwen2.5 0.5B, build the DFA over token ids from
+`models/qwen2.5-0.5b-instruct.tokenizer.json`, then wire the masker into the
+same runtime ports used by `QwenChatProvider`.
+
 ```rust
 use el_grammar::{Dfa, DfaMasker};
 use el_runtime::GrammarMasker;

@@ -22,12 +22,17 @@ events it observes.
 
 ## Usage
 
+The collector sees only numeric events from a session, whether that session is
+the local Qwen2.5 0.5B path or another `LlmProvider`; prompts and responses
+never enter telemetry.
+
 ```rust
 use el_core::{DomainEvent, EventEnvelope, SessionId};
 use el_telemetry::MetricsCollector;
 
 let mut collector = MetricsCollector::new();
 
+// Example events from a local Qwen2.5 0.5B prefill/decode pass.
 collector.observe(&EventEnvelope::new(
     SessionId(1),
     0,

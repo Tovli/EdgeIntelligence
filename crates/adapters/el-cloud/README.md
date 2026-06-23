@@ -46,11 +46,15 @@ a clean completion), and errors carry only parse category/position/size —
 
 ## Usage
 
+Use `CloudProvider` only as an explicit fallback or comparison path; the local
+Qwen2.5 0.5B GGUF remains on device and is not sent to the provider.
+
 ```rust
 use el_core::{ChatMessage, ChatRequest, CredentialRef, LlmProvider};
 use el_cloud::CloudProvider;
 
 let provider = CloudProvider::new();
+let _local_qwen_model = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
 
 // The credential is resolved at runtime from the platform keystore — never embedded.
 let req = ChatRequest::new("openai/gpt-4o", vec![ChatMessage::user("Hello!")])

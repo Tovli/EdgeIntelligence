@@ -44,6 +44,11 @@ and covered by tests.
 
 ## Usage
 
+The snippet uses `NullEngine` so the crate stays self-contained. In the real
+Qwen2.5 0.5B path, replace it with the Candle `QwenEngine`/`QwenChatProvider`
+loaded from `models/qwen2.5-0.5b-instruct-q4_k_m.gguf` plus the matching
+tokenizer.
+
 ```rust
 use el_core::{SessionConfig, SessionId, StopReason};
 use el_provenance::{ModelArtifact, SignatureVerifier};

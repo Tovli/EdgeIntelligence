@@ -66,8 +66,11 @@ Run `make codegen-rn` (Android + RN), `make build-ios`, `make build-wasm`,
 index propagation before the next dependent is submitted.
 
 The `bindings.yml` CI (ADR-011, triggered on every PR/push to affected paths)
-provides the pre-release confidence gate. `release.yml` only runs on explicit
-version tags.
+provides the pre-release confidence gate. Pull requests validate that binding
+codegen still succeeds without depending on nonessential artifact upload
+finalization; pushes to `master` retain the generated binding artifacts for
+inspection. `release.yml` only runs on explicit version tags and still uploads
+artifacts because later assembly jobs consume them.
 
 ## Consequences
 

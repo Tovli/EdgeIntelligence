@@ -12,6 +12,7 @@ WORKFLOWS = [
 
 RN_RETRY_COMMAND = "bash scripts/retry-command.sh make codegen-rn"
 WASM_RETRY_COMMAND = "bash scripts/retry-command.sh curl -fsSL"
+BINDINGS_UPLOAD_IF = "if: github.event_name != 'pull_request'"
 
 REQUIRED_INSTALLS = [
     (
@@ -46,6 +47,15 @@ def check_workflow(path: Path) -> list[str]:
 
     if "Install wasm-pack" in text and WASM_RETRY_COMMAND not in text:
         errors.append(f"{path}: wasm-pack download must run through retry wrapper")
+
+    if path.name == "bindings.yml":
+        step_blocks = text.split("\n      - ")
+        for block in step_blocks:
+            if "uses: actions/upload-artifact@v4" in block and BINDINGS_UPLOAD_IF not in block:
+                errors.append(
+                    f"{path}: PR validation artifact uploads must be gated with "
+                    f"{BINDINGS_UPLOAD_IF!r}"
+                )
 
     return errors
 

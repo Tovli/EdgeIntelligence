@@ -83,13 +83,7 @@ codegen-flutter:
 		'  flutter_rust_bridge: ^$(FRB_VERSION)' \
 		> $(OUT)/flutter/pubspec.yaml
 	@cp LICENSE $(OUT)/flutter/LICENSE
-	@printf '%s\n' \
-		'# edge_intelligence' \
-		'' \
-		'Generated Flutter bindings for the Edge Intelligence SDK.' \
-		'' \
-		'The package contains Dart bindings generated with flutter_rust_bridge and native libraries assembled by the release pipeline.' \
-		> $(OUT)/flutter/README.md
+	@cp packaging/flutter/README.md $(OUT)/flutter/README.md
 	@printf '%s\n' \
 		'# Changelog' \
 		'' \

@@ -40,6 +40,12 @@ These are enforced by the type system, not by convention:
 
 ## Usage
 
+This is the crate-local part of a real local SDK call. In an app, the request
+can be served by `el_engine_candle::QwenChatProvider::from_paths(...)` with
+`models/qwen2.5-0.5b-instruct-q4_k_m.gguf` and
+`models/qwen2.5-0.5b-instruct.tokenizer.json`; `el-core` only defines the
+backend-agnostic contract.
+
 ```rust
 use el_core::{ChatMessage, ChatRequest, LlmProvider, SessionConfig};
 
@@ -49,7 +55,10 @@ assert!(!cfg.hybrid_mode);
 
 // A backend-agnostic request. `model` is a routing hint:
 //   "local"/"" → local engine, "openai/…", "anthropic/…", "ollama/…", "gemini/…"
-let req = ChatRequest::new("local", vec![ChatMessage::user("Hello!")])
+let req = ChatRequest::new(
+    "local/qwen2.5-0.5b-instruct-q4_k_m",
+    vec![ChatMessage::user("Summarize edge inference in one sentence.")],
+)
     .with_max_tokens(256)
     .with_temperature(700); // 700 = 0.7 (milli to keep the type Eq-able)
 

@@ -25,11 +25,16 @@ The HuggingFace `tokenizers::Tokenizer` is bridged to llguidance's `TokEnv` via
 
 ## Usage
 
+Use the same Qwen2.5 0.5B tokenizer that the chat provider uses, so schema
+masking and model decoding agree on token ids.
+
 ```rust
 use el_grammar_llguidance::LlguidanceMasker;
 use el_runtime::GrammarMasker;
 
-let tokenizer = tokenizers::Tokenizer::from_file("tokenizer.json").unwrap();
+let tokenizer = tokenizers::Tokenizer::from_file(
+    "models/qwen2.5-0.5b-instruct.tokenizer.json",
+).unwrap();
 let masker = LlguidanceMasker::from_tokenizer(&tokenizer, r#"{"type":"integer"}"#)?;
 
 // In the decode loop, wired into the session's Ports:

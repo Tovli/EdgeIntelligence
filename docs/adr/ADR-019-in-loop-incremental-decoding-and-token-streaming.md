@@ -94,7 +94,7 @@ from it, with emission gated by the safety control loop.
 
 ## Links
 - Source: [docs/research/improvements-plan.md](../research/improvements-plan.md) §P0.2, EPIC-2.
-- Builds on: [ADR-010](./ADR-010-unified-llm-provider-trait-with-opt-in-frontier-egress.md) (`chat_stream`/`ChatToken` seam), [ADR-018](./ADR-018-persistent-model-instances-and-stateful-sessions.md) (persistent session to stream over), [ADR-009](./ADR-009-flutter-rust-bridge-for-dart-bindings.md) (Dart stream binding).
+- Builds on: [ADR-010](./ADR-010-unified-llm-provider-trait-with-opt-in-frontier-egress.md) (`chat_stream`/`ChatToken` seam), [ADR-018](./ADR-018-persistent-model-instances-and-stateful-sessions.md) (persistent session to stream over), [ADR-024](./ADR-024-dart-only-platform-agnostic-pub-dev-sdk.md) (Dart stream binding).
 - Constrained by: [ADR-012](./ADR-012-layered-decode-time-safety-control-loop-with-checkpointed-rollback.md) (emit only guard-verified tokens — no streaming a rolled-back span), [ADR-005](./ADR-005-on-device-only-tiered-decoder-time-safety.md) (decode order invariant).
 - Implementation seams: `crates/el-runtime` (`generate_with_policy` emit hook), `crates/adapters/el-engine-candle` (`chat_stream` incremental detokenize), `crates/adapters/el-ffi` (per-binding stream wrappers).
 - Measured by: [ADR-023](./ADR-023-baseline-performance-instrumentation.md) (real `ttft_ms`).

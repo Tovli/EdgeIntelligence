@@ -1,7 +1,7 @@
 # ADR-001 / ADR-009 / ADR-010 host bindings.
 [package]
 name = "el-ffi"
-description = "Host bindings: uniffi-bindgen-react-native (RN), flutter_rust_bridge v2 (Flutter), wasm-bindgen (web) — ADR-001/009."
+description = "Host bindings: uniffi-bindgen-react-native (RN), flutter_rust_bridge-generated Dart, wasm-bindgen (web) — ADR-001/024."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,6 +17,7 @@ el-runtime = { workspace = true }
 # flutter_rust_bridge v2 works with plain Rust — codegen runs externally.
 # el-engine-candle and el-cloud wire the real LlmProvider backends (ADR-010).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+anyhow = "1"
 uniffi = { version = "0.28", features = ["tokio"] }
 flutter_rust_bridge = "=2.12.0"
 el-engine-candle = { workspace = true }

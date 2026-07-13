@@ -1,6 +1,6 @@
 # ADR-001: WebAssembly (Wasmtime) as the portable target, alongside native ARM
 
-- **Status**: accepted
+- **Status**: accepted - partially amended by [ADR-024](./ADR-024-dart-only-platform-agnostic-pub-dev-sdk.md)
 - **Date**: 2026-06-10
 - **Deciders**:
 - **Tags**: runtime, portability, wasm, rust, core
@@ -40,7 +40,7 @@ identical across targets. Host bindings are generated from **one Rust API in
 | Consumer | Tool | Output |
 |----------|------|--------|
 | React Native (Android + iOS) | **`uniffi-bindgen-react-native`** | TypeScript + JSI C++ + Turbo Module |
-| Flutter (Android + iOS + desktop) | **`flutter_rust_bridge` v2** | Dart package + Rust glue (see [ADR-009](./ADR-009-flutter-rust-bridge-for-dart-bindings.md)) |
+| Dart / pub.dev | Dart FFI/WASM bindings | Framework-neutral Dart package (see [ADR-024](./ADR-024-dart-only-platform-agnostic-pub-dev-sdk.md)) |
 | Web / npm | **`wasm-bindgen`** | TypeScript ESM package |
 
 `uniffi-bindgen-react-native` (Mozilla/Filament, 2024) generates TypeScript and
@@ -56,8 +56,8 @@ boundary via shared linear memory (WASM) or shared `Arc<[u8]>` buffers (native).
 - Wasmtime keeps the entire stack in Rust (no C++ runtime dependency).
 - `uniffi-bindgen-react-native` generates TypeScript + JSI C++ directly —
   no hand-written JNI, Obj-C, or intermediate Kotlin/Swift bridge layer.
-- `flutter_rust_bridge` v2 gives Flutter a `Stream<String>` token callback
-  and opaque handles without any hand-written `dart:ffi`.
+- The Dart pub.dev surface gives framework-neutral `Future`/`Stream` APIs and
+  opaque handles without making Flutter the package identity.
 
 ### Negative
 - Two active targets (native + wasm32) widen the test matrix and require
@@ -74,5 +74,6 @@ boundary via shared linear memory (WASM) or shared `Arc<[u8]>` buffers (native).
 - PRD: `docs/prd.md` §"Proposed Edge-Native Pipeline" → "Runtime & Target Selection"
 - DDD: [Inference Runtime context](../ddd/bounded-contexts/01-inference-runtime.md)
 - Driven by: [ADR-008](./ADR-008-implement-the-sdk-in-rust-instead-of-c-cpp.md)
-- Extended by: [ADR-009](./ADR-009-flutter-rust-bridge-for-dart-bindings.md) (Flutter bindings)
+- Extended by: [ADR-024](./ADR-024-dart-only-platform-agnostic-pub-dev-sdk.md) (Dart pub.dev SDK surface)
+- Superseded binding note: [ADR-009](./ADR-009-flutter-rust-bridge-for-dart-bindings.md) is superseded by ADR-024
 - Related: [ADR-002](./ADR-002-candle-as-rust-native-inference-engine.md), [ADR-003](./ADR-003-static-memory-planning-with-zero-allocation-arena.md)

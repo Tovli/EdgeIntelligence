@@ -6,7 +6,7 @@ rustflags = ["-C", "target-feature=+neon,+dotprod,+i8mm"]
 # Linker: set CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER to the NDK clang path.
 # In CI this is set by nttld/setup-ndk; locally:
 #   export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=\
-#     $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/<host-os>-x86_64/bin/aarch64-linux-android35-clang
+#     $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/<host-os>-x86_64/bin/aarch64-linux-android24-clang
 
 [target.aarch64-apple-ios]
 rustflags = ["-C", "target-feature=+neon,+dotprod,+i8mm"]

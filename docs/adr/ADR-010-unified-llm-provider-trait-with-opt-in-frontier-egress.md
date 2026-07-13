@@ -10,10 +10,10 @@
 The SDK was originally designed as air-gapped by default
 ([ADR-004](./ADR-004-air-gapped-by-default-with-opt-in-hybrid-mode.md)), with all
 inference running on-device via Candle ([ADR-002](./ADR-002-candle-as-rust-native-inference-engine.md)).
-Flutter and React Native are now confirmed deployment targets
-([ADR-009](./ADR-009-flutter-rust-bridge-for-dart-bindings.md),
-[ADR-001](./ADR-001-adopt-webassembly-as-cross-platform-sdk-runtime.md)), and
-the requirement has been extended: **the SDK must support frontier LLMs (OpenAI,
+React Native, Dart/pub.dev, and web are confirmed deployment surfaces
+([ADR-001](./ADR-001-adopt-webassembly-as-cross-platform-sdk-runtime.md),
+[ADR-024](./ADR-024-dart-only-platform-agnostic-pub-dev-sdk.md)), and the
+requirement has been extended: **the SDK must support frontier LLMs (OpenAI,
 Anthropic, Gemini, Ollama, and compatible providers) as an opt-in backend**
 alongside the primary local Candle path.
 
@@ -102,8 +102,8 @@ air-gap guarantee is preserved by default. Apps using `el-cloud` emit a
 ### Positive
 - Single `LlmProvider` trait: mobile apps swap local ↔ frontier backend
   with one constructor change, no API surface difference.
-- Frontier LLMs work from both native binding surfaces (React Native,
-  Flutter); the npm/web surface fails explicitly rather than silently
+- Frontier LLMs work from both native binding surfaces (React Native and
+  Dart native); the npm/web surface fails explicitly rather than silently
   (see Negative).
 - Ollama as a provider means local models served by Ollama (on a dev machine
   or LAN server) are also reachable — useful for development and privacy-first
@@ -134,5 +134,5 @@ air-gap guarantee is preserved by default. Apps using `el-cloud` emit a
 - Depends on: [ADR-002](./ADR-002-candle-as-rust-native-inference-engine.md) (local path),
   [ADR-008](./ADR-008-implement-the-sdk-in-rust-instead-of-c-cpp.md)
 - Related: [ADR-001](./ADR-001-adopt-webassembly-as-cross-platform-sdk-runtime.md),
-  [ADR-009](./ADR-009-flutter-rust-bridge-for-dart-bindings.md)
+  [ADR-024](./ADR-024-dart-only-platform-agnostic-pub-dev-sdk.md)
 - Crates: `el-core` (trait), `crates/adapters/el-cloud` (new)

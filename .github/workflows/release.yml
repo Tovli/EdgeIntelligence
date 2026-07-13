@@ -94,42 +94,76 @@ jobs:
   # ── Stage 2: Build artefacts ───────────────────────────────────────────────
 
   build-android:
-    name: Build Android (aarch64) + RN codegen
+    name: Build Android (armv7 + arm64 + x64) + RN codegen
     needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: armv7-linux-androideabi,aarch64-linux-android,x86_64-linux-android
       - uses: Swatinem/rust-cache@v2
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
-          ndk-version: r27c
+          ndk-version: r28c
+      - name: Cross-compile el-ffi → armv7-linux-androideabi
+        env:
+          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang
+          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_AR: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          CC_armv7_linux_androideabi: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang
+          AR_armv7_linux_androideabi: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          RANLIB_armv7_linux_androideabi: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
+        run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target armv7-linux-androideabi --release
       - name: Cross-compile el-ffi → aarch64-linux-android
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: >-
-            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
           CARGO_TARGET_AARCH64_LINUX_ANDROID_AR: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
           CC_aarch64_linux_android: >-
-            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
           AR_aarch64_linux_android: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
           RANLIB_aarch64_linux_android: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
         run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target aarch64-linux-android --release
+      - name: Cross-compile el-ffi → x86_64-linux-android
+        env:
+          CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang
+          CARGO_TARGET_X86_64_LINUX_ANDROID_AR: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          CC_x86_64_linux_android: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang
+          AR_x86_64_linux_android: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          RANLIB_x86_64_linux_android: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
+        run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target x86_64-linux-android --release
+      - name: Verify Android 16 KB page alignment
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          python3 scripts/verify-android-page-alignment.py \
+            "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+            target/aarch64-linux-android/release/libel_ffi.so \
+            target/x86_64-linux-android/release/libel_ffi.so
       - name: Install uniffi-bindgen-react-native
         run: npm install --global uniffi-bindgen-react-native@0.31.0-3
       - name: Codegen — React Native (TypeScript + JSI)
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: >-
-            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
           CARGO_TARGET_AARCH64_LINUX_ANDROID_AR: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
           CC_aarch64_linux_android: >-
-            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
           AR_aarch64_linux_android: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
           RANLIB_aarch64_linux_android: >-
@@ -140,28 +174,103 @@ jobs:
         with:
           name: rn-bindings
           path: out/rn/
-      - name: Upload Android native library
+      - name: Stage Android native libraries
+        run: |
+          mkdir -p out/android-libs/armeabi-v7a out/android-libs/arm64-v8a out/android-libs/x86_64
+          cp target/armv7-linux-androideabi/release/libel_ffi.so out/android-libs/armeabi-v7a/libel_ffi.so
+          cp target/aarch64-linux-android/release/libel_ffi.so out/android-libs/arm64-v8a/libel_ffi.so
+          cp target/x86_64-linux-android/release/libel_ffi.so out/android-libs/x86_64/libel_ffi.so
+      - name: Upload Android native libraries
         uses: actions/upload-artifact@v4
         with:
-          name: android-lib
-          path: target/aarch64-linux-android/release/libel_ffi.so
+          name: android-libs
+          path: out/android-libs/
+          if-no-files-found: error
 
   build-ios:
-    name: Build iOS (aarch64)
+    name: Build iOS (device + simulator)
     needs: verify
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
       - uses: Swatinem/rust-cache@v2
-      - name: Cross-compile el-ffi → aarch64-apple-ios
-        run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target aarch64-apple-ios --release
+      - name: Build el-ffi iOS XCFramework
+        run: bash scripts/build-ios-xcframework.sh
+      - name: Stage iOS XCFramework
+        run: |
+          mkdir -p target/ios-artifact
+          cp -R target/ios-xcframework/el_ffi.xcframework target/ios-artifact/el_ffi.xcframework
       - uses: actions/upload-artifact@v4
         with:
           name: ios-lib
           path: target/aarch64-apple-ios/release/libel_ffi.a
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-xcframework
+          path: target/ios-artifact/
+          if-no-files-found: error
+
+  build-linux-x64:
+    name: Build Linux desktop (x64)
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build el-ffi → x86_64-unknown-linux-gnu
+        run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64-lib
+          path: target/release/libel_ffi.so
+          if-no-files-found: error
+
+  build-macos-universal:
+    name: Build macOS desktop (universal)
+    needs: verify
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build el-ffi → macOS universal dylib
+        run: |
+          cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target x86_64-apple-darwin --release
+          cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target aarch64-apple-darwin --release
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create \
+            target/x86_64-apple-darwin/release/libel_ffi.dylib \
+            target/aarch64-apple-darwin/release/libel_ffi.dylib \
+            -output target/universal-apple-darwin/release/libel_ffi.dylib
+          lipo -info target/universal-apple-darwin/release/libel_ffi.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal-lib
+          path: target/universal-apple-darwin/release/libel_ffi.dylib
+          if-no-files-found: error
+
+  build-windows-x64:
+    name: Build Windows desktop (x64)
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build el-ffi → x86_64-pc-windows-msvc
+        run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-lib
+          path: target/release/el_ffi.dll
+          if-no-files-found: error
 
   build-wasm:
     name: Build WASM (web surface)
@@ -196,8 +305,8 @@ jobs:
           path: out/web/
           if-no-files-found: error
 
-  build-flutter:
-    name: Flutter/Dart codegen
+  build-dart:
+    name: Dart codegen
     needs: verify
     runs-on: ubuntu-latest
     env:
@@ -208,22 +317,57 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: dart-lang/setup-dart@v1
-      - name: Install Flutter codegen cargo tools
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Install Dart codegen cargo tools
         run: |
           bash scripts/install-cargo-tool.sh flutter_rust_bridge_codegen flutter_rust_bridge_codegen "$FRB_CODEGEN_VERSION"
           bash scripts/install-cargo-tool.sh cargo-expand cargo-expand "$CARGO_EXPAND_VERSION"
-      - name: Codegen — Flutter/Dart
-        run: make codegen-flutter
+      - name: Codegen — Dart
+        run: make codegen-dart
+      - name: Assert Dart FRB Rust glue is committed
+        run: |
+          git ls-files --error-unmatch crates/adapters/el-ffi/src/frb_generated.rs
+          git diff --exit-code -- crates/adapters/el-ffi/src/frb_generated.rs
+      - name: Resolve Flutter plugin dependencies
+        run: flutter pub get --no-example
+        working-directory: out/dart
       - name: Stamp pub.dev version from tag
         run: |
           sed -i "s/^version: .*/version: $VERSION/" pubspec.yaml
           printf '# Changelog\n\n## %s\n\n- Release %s.\n' "$VERSION" "$VERSION" > CHANGELOG.md
-        working-directory: out/flutter
+        working-directory: out/dart
       - uses: actions/upload-artifact@v4
         with:
-          name: flutter-bindings
-          path: out/flutter/
+          name: dart-bindings
+          path: out/dart/
+          if-no-files-found: error
+
+  verify-flutter-ios:
+    name: Verify Flutter iOS package
+    needs: [build-dart, build-ios]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dart-bindings
+          path: assembly/
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-xcframework
+          path: assembly/ios/Frameworks/
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Resolve Flutter example dependencies
+        run: flutter pub get
+        working-directory: assembly/example/
+      - name: Run Flutter iOS package smoke build
+        run: flutter build ios --simulator --debug
+        working-directory: assembly/example/
 
   # ── Stage 2b: Assemble distribution packages ──────────────────────────────
   # Both assembly jobs wait for the native build jobs so each package contains
@@ -250,8 +394,8 @@ jobs:
           path: assembly/src/rn/
       - uses: actions/download-artifact@v4
         with:
-          name: android-lib
-          path: assembly/android/jniLibs/arm64-v8a/
+          name: android-libs
+          path: assembly/android/jniLibs/
       - uses: actions/download-artifact@v4
         with:
           name: ios-lib
@@ -285,9 +429,19 @@ jobs:
           name: npm-package
           path: assembly/
 
-  assemble-flutter:
+  assemble-dart:
     name: Assemble edge_intelligence pub.dev package
-    needs: [verify, build-android, build-ios, build-wasm, build-flutter]
+    needs:
+      [
+        verify,
+        build-linux-x64,
+        build-macos-universal,
+        build-windows-x64,
+        build-dart,
+        build-android,
+        build-ios,
+        verify-flutter-ios,
+      ]
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.verify.outputs.version }}
@@ -295,25 +449,118 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: flutter-bindings
+          name: dart-bindings
           path: assembly/
       - uses: actions/download-artifact@v4
         with:
-          name: android-lib
-          path: assembly/android/src/main/jniLibs/arm64-v8a/
+          name: linux-x64-lib
+          path: native-artifacts/linux/x64/
       - uses: actions/download-artifact@v4
         with:
-          name: ios-lib
-          path: assembly/ios/
+          name: macos-universal-lib
+          path: native-artifacts/macos/
       - uses: actions/download-artifact@v4
         with:
-          name: wasm-output
-          path: assembly/pkg/
-      - uses: dart-lang/setup-dart@v1
+          name: windows-x64-lib
+          path: native-artifacts/windows/x64/
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-libs
+          path: native-artifacts/android/
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-xcframework
+          path: native-artifacts/ios/
+      - name: Copy Dart package native runtime artifacts
+        run: |
+          mkdir -p assembly/lib/native/linux/x64
+          mkdir -p assembly/lib/native/macos
+          mkdir -p assembly/lib/native/windows/x64
+          mkdir -p assembly/android/src/main/jniLibs/armeabi-v7a
+          mkdir -p assembly/android/src/main/jniLibs/arm64-v8a
+          mkdir -p assembly/android/src/main/jniLibs/x86_64
+          mkdir -p assembly/ios/Frameworks
+          cp native-artifacts/linux/x64/libel_ffi.so assembly/lib/native/linux/x64/libel_ffi.so
+          cp native-artifacts/macos/libel_ffi.dylib assembly/lib/native/macos/libel_ffi.dylib
+          cp native-artifacts/windows/x64/el_ffi.dll assembly/lib/native/windows/x64/el_ffi.dll
+          cp native-artifacts/android/armeabi-v7a/libel_ffi.so assembly/android/src/main/jniLibs/armeabi-v7a/libel_ffi.so
+          cp native-artifacts/android/arm64-v8a/libel_ffi.so assembly/android/src/main/jniLibs/arm64-v8a/libel_ffi.so
+          cp native-artifacts/android/x86_64/libel_ffi.so assembly/android/src/main/jniLibs/x86_64/libel_ffi.so
+          cp -R native-artifacts/ios/el_ffi.xcframework assembly/ios/Frameworks/el_ffi.xcframework
+      - name: Assert native library artifacts are non-empty
+        run: |
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          MIN_BYTES = 10 * 1024  # A real shared library is always larger than 10 KiB
+          artifacts = [
+              "assembly/lib/native/linux/x64/libel_ffi.so",
+              "assembly/lib/native/macos/libel_ffi.dylib",
+              "assembly/lib/native/windows/x64/el_ffi.dll",
+              "assembly/android/src/main/jniLibs/armeabi-v7a/libel_ffi.so",
+              "assembly/android/src/main/jniLibs/arm64-v8a/libel_ffi.so",
+              "assembly/android/src/main/jniLibs/x86_64/libel_ffi.so",
+          ]
+          errors = []
+          for path_str in artifacts:
+              p = Path(path_str)
+              size = p.stat().st_size
+              print(f"{p.name}: {size} bytes")
+              if size < MIN_BYTES:
+                  errors.append(f"{p}: {size} bytes (expected >= {MIN_BYTES}; empty or corrupt artifact?)")
+          if errors:
+              raise SystemExit("\n".join(["Native library size check failed:"] + errors))
+          PY
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
       - name: Assert pub.dev package includes README.md
         run: bash scripts/assert-release-readmes.sh pub assembly
-      - name: dart pub publish --dry-run (validation gate)
-        run: dart pub publish --dry-run
+      - name: Check pub.dev package size
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # pub.dev enforces a ~100 MB compressed archive limit.
+          # Native binaries compress poorly, so guard at 100 MiB uncompressed
+          # to catch obviously oversized packages before the dry-run publish.
+          max_uncompressed_bytes = 100 * 1024 * 1024
+          total = sum(path.stat().st_size for path in Path(".").rglob("*") if path.is_file())
+          print(f"pub.dev package uncompressed size: {total} bytes")
+          if total > max_uncompressed_bytes:
+              raise SystemExit(
+                  "pub.dev package exceeds 100 MiB uncompressed (pub.dev cap is "
+                  "~100 MB compressed; native binaries compress poorly); split "
+                  "runtime artifacts or exclude unnecessary files"
+              )
+          PY
+        working-directory: assembly/
+      - name: Resolve Flutter plugin dependencies
+        run: flutter pub get --no-example
+        working-directory: assembly/
+      - name: Run Dart package runtime smoke tests
+        run: |
+          dart test test/packaged_runtime_smoke_test.dart
+          mv lib/native/linux/x64/libel_ffi.so lib/native/linux/x64/libel_ffi.so.missing
+          trap 'mv lib/native/linux/x64/libel_ffi.so.missing lib/native/linux/x64/libel_ffi.so' EXIT
+          dart test test/missing_runtime_test.dart
+        working-directory: assembly/
+      - name: Run Flutter example tests
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+        working-directory: assembly/example/
+      - name: Run Flutter Android package smoke build
+        run: |
+          flutter build apk --debug --target-platform android-arm,android-arm64,android-x64
+          unzip -l build/app/outputs/flutter-apk/app-debug.apk | grep 'lib/armeabi-v7a/libel_ffi.so'
+          unzip -l build/app/outputs/flutter-apk/app-debug.apk | grep 'lib/arm64-v8a/libel_ffi.so'
+          unzip -l build/app/outputs/flutter-apk/app-debug.apk | grep 'lib/x86_64/libel_ffi.so'
+        working-directory: assembly/example/
+      - name: flutter pub publish --dry-run (validation gate)
+        run: flutter pub publish --dry-run
         working-directory: assembly/
       - uses: actions/upload-artifact@v4
         with:
@@ -325,11 +572,11 @@ jobs:
   # first publish — gate it on BOTH assembly jobs (which include the pub.dev
   # dry-run and npm package assembly). Each registry then gates on the previous
   # one: if crates fails, npm and pub are not touched; if npm fails, pub is not.
-  # publish-crates → assemble-{npm,flutter} transitively covers all build jobs.
+  # publish-crates → assemble-{npm,dart} transitively covers all build jobs.
 
   publish-crates:
     name: Publish → crates.io
-    needs: [verify, assemble-npm, assemble-flutter]
+    needs: [verify, assemble-npm, assemble-dart]
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.verify.outputs.version }}
@@ -366,14 +613,17 @@ jobs:
 
   publish-pub:
     name: Publish → pub.dev
-    needs: [publish-npm, assemble-flutter]
+    needs: [publish-npm, assemble-dart]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: pub-package
           path: pub-package/
-      - uses: dart-lang/setup-dart@v1
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
       - name: Assert pub.dev package artifact includes README.md
         run: test -s pub-package/README.md
       - name: Configure pub.dev credentials
@@ -381,5 +631,5 @@ jobs:
           mkdir -p ~/.config/dart
           echo '${{ secrets.PUB_CREDENTIALS }}' > ~/.config/dart/pub-credentials.json
       - name: Publish edge_intelligence
-        run: dart pub publish --force
+        run: flutter pub publish --force
         working-directory: pub-package/

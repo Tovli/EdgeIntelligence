@@ -7,10 +7,10 @@
 //! Turbo Module. Streaming via `StreamHandler` callback interface (UniFFI
 //! cannot export `impl FnMut` parameters).
 //!
-//! ## Flutter — `flutter_rust_bridge` v2 (ADR-009)
+//! ## Dart / pub.dev — `flutter_rust_bridge` v2 codegen (ADR-024)
 //! `#[frb(opaque)]` on `EdgeLlm` → Dart opaque handle. `ask()` →
-//! `Future<String>`, `ask_stream()` (closure variant) → `Stream<String>`.
-//! FRB v2 handles `impl FnMut` natively.
+//! `Future<String>`, `edge_llm_ask_stream()` + `StreamSink<String>` →
+//! `Stream<String>`.
 //!
 //! ## Web / npm — `wasm-bindgen` (ADR-001)
 //! `#[wasm_bindgen]` on both the struct **and** the impl block → ESM TypeScript
@@ -23,7 +23,11 @@
 //! implementation, so `EdgeLlm.cloud` throws an explicit error there instead
 //! of silently degrading.
 
-#![forbid(unsafe_code)]
+// `#![forbid(unsafe_code)]` cannot be used: `forbid` is unoverridable even by
+// inner `#[allow]`, so `frb_generated` (generated FFI glue) would not compile.
+// `deny` permits the scoped override below. Invariant: the only permitted use
+// of `#[allow(unsafe_code)]` in this crate is on `mod frb_generated`.
+#![deny(unsafe_code)]
 
 #[cfg(not(target_arch = "wasm32"))]
 use el_core::CredentialRef;
@@ -34,7 +38,15 @@ use el_core::{ChatMessage, ChatRequest, ChatToken, LlmProvider};
 uniffi::setup_scaffolding!("el_ffi");
 
 #[cfg(not(target_arch = "wasm32"))]
+use flutter_rust_bridge::for_generated::DcoCodec;
+#[cfg(not(target_arch = "wasm32"))]
 use flutter_rust_bridge::frb;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(unsafe_code)]
+mod frb_generated;
+#[cfg(not(target_arch = "wasm32"))]
+use frb_generated::StreamSink;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -72,6 +84,18 @@ impl From<el_core::EdgeError> for SdkError {
     }
 }
 
+fn emit_stream_error(
+    result: std::result::Result<(), SdkError>,
+    sink_closed: bool,
+    mut emit: impl FnMut(String),
+) {
+    if let Err(error) = result {
+        if !sink_closed {
+            emit(error.to_string());
+        }
+    }
+}
+
 // ── Streaming callback interface (UniFFI / React Native) ─────────────────────
 
 /// Token-by-token callback for streaming on React Native.
@@ -80,7 +104,8 @@ impl From<el_core::EdgeError> for SdkError {
 /// [`EdgeLlm::ask_stream_cb`]. Each call delivers one text fragment; the
 /// method returns (and calls nothing more) when generation is complete.
 ///
-/// Flutter uses the closure-based [`EdgeLlm::ask_stream`] instead.
+/// Dart bindings use the `edge_llm_ask_stream` FRB wrapper and
+/// `StreamSink<String>` instead.
 #[cfg(not(target_arch = "wasm32"))]
 #[uniffi::export(callback_interface)]
 pub trait StreamHandler: Send + Sync {
@@ -93,7 +118,7 @@ pub trait StreamHandler: Send + Sync {
 ///
 /// Annotated for all three binding surfaces:
 /// - `uniffi::Object` (native) → opaque UniFFI / React Native handle
-/// - `frb(opaque)` (native) → opaque Flutter/Dart handle via FRB v2
+/// - `frb(opaque)` (native) → opaque Dart handle via FRB v2 codegen
 /// - `wasm_bindgen` (wasm32) → satisfies `IntoWasmAbi`/`WasmDescribe` so
 ///   that `#[wasm_bindgen] impl EdgeLlm { ... }` compiles
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Object))]
@@ -107,9 +132,8 @@ pub struct EdgeLlm {
 
 /// UniFFI-exported methods: constructors, blocking chat, and reset.
 ///
-/// `ask_stream` (closure variant) lives in a separate plain impl block —
-/// UniFFI cannot export `impl FnMut` parameters. The RN streaming surface is
-/// `ask_stream_cb` in the block below.
+/// Dart uses the `edge_llm_*` free-function wrappers below so FRB does not
+/// need to parse the UniFFI-decorated impl block after macro expansion.
 #[cfg_attr(not(target_arch = "wasm32"), uniffi::export)]
 impl EdgeLlm {
     /// Construct with the local Candle engine (air-gapped, ADR-002/004).
@@ -180,7 +204,7 @@ impl EdgeLlm {
     /// `"gemini/gemini-2.0-flash"`, or any OpenAI-compat base URL.
     /// `api_key` must come from the platform keystore — never embedded.
     ///
-    /// **Native only** (React Native / Flutter). On wasm32 this constructor
+    /// **Native only** (React Native / Dart native). On wasm32 this constructor
     /// does not exist — the web surface exposes a throwing `cloud` instead
     /// (see the wasm32 impl block below and the ADR-010 amendment).
     #[cfg(not(target_arch = "wasm32"))]
@@ -217,6 +241,23 @@ impl EdgeLlm {
     }
 }
 
+impl EdgeLlm {
+    fn ask_stream_with(
+        &self,
+        prompt: String,
+        mut on_token: impl FnMut(String),
+    ) -> Result<(), SdkError> {
+        let req = ChatRequest::new(self.default_model.clone(), vec![ChatMessage::user(prompt)]);
+        self.provider
+            .chat_stream(&req, &mut |t: ChatToken| {
+                if !t.is_final {
+                    on_token(t.text);
+                }
+            })
+            .map_err(SdkError::from)
+    }
+}
+
 /// Streaming via callback interface — exported for React Native (UniFFI).
 ///
 /// Separated from the main block because UniFFI cannot export `impl FnMut`.
@@ -232,37 +273,68 @@ impl EdgeLlm {
         prompt: String,
         handler: Box<dyn StreamHandler>,
     ) -> Result<(), SdkError> {
-        let req = ChatRequest::new(self.default_model.clone(), vec![ChatMessage::user(prompt)]);
-        self.provider
-            .chat_stream(&req, &mut |t: ChatToken| {
-                if !t.is_final {
-                    handler.on_token(t.text);
-                }
-            })
-            .map_err(SdkError::from)
+        self.ask_stream_with(prompt, |token| handler.on_token(token))
     }
 }
 
-/// Closure-based streaming — used by Flutter (FRB v2) and tests.
+/// Dart / FRB wrappers.
 ///
-/// FRB v2 wraps `impl FnMut` into a Dart `Stream<String>` automatically.
-impl EdgeLlm {
-    /// Stream tokens via closure (Flutter / FRB path).
-    ///
-    /// Returns `Err` on provider failure so the stream is not silently truncated.
-    pub fn ask_stream(
-        &self,
-        prompt: String,
-        mut on_token: impl FnMut(String),
-    ) -> Result<(), SdkError> {
-        let req = ChatRequest::new(self.default_model.clone(), vec![ChatMessage::user(prompt)]);
-        self.provider
-            .chat_stream(&req, &mut |t: ChatToken| {
-                if !t.is_final {
-                    on_token(t.text.clone());
+/// These are intentionally separate from the UniFFI impl blocks. FRB parses
+/// these plain Rust functions and the Dart facade wraps them into the public
+/// `EdgeLlm` class API.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dart_api {
+    use super::*;
+
+    #[frb]
+    pub fn edge_llm_local(model_uri: String) -> anyhow::Result<EdgeLlm> {
+        EdgeLlm::local(model_uri).map_err(to_anyhow)
+    }
+
+    #[frb]
+    pub fn edge_llm_cloud(model: String, api_key: String) -> EdgeLlm {
+        EdgeLlm::cloud(model, api_key)
+    }
+
+    #[frb]
+    pub fn edge_llm_ask(sdk: &EdgeLlm, prompt: String) -> anyhow::Result<String> {
+        sdk.ask(prompt).map_err(to_anyhow)
+    }
+
+    #[frb]
+    pub fn edge_llm_reset(sdk: &EdgeLlm) {
+        sdk.reset();
+    }
+
+    #[frb]
+    pub fn edge_llm_ask_stream(sdk: &EdgeLlm, prompt: String, sink: StreamSink<String, DcoCodec>) {
+        let mut sink_closed = false;
+        let result = sdk.ask_stream_with(prompt, |token| {
+            if !sink_closed {
+                if sink.add(token).is_err() {
+                    // Dart cancelled the stream (e.g. take(n), listen().cancel()).
+                    // LlmProvider has no cancellation hook so generation runs to
+                    // completion; remaining tokens are silently dropped.
+                    sink_closed = true;
                 }
-            })
-            .map_err(SdkError::from)
+            }
+        });
+
+        // The returned Dart Stream is the consumer-facing error channel.
+        // Completing the generated task successfully prevents its unawaited
+        // future from reporting a duplicate global error.
+        emit_stream_error(result, sink_closed, |message| {
+            let _ = sink.add_error(message);
+        });
+    }
+
+    // Converts SdkError to an anyhow string error for FRB's Dart propagation.
+    // FRB surfaces this as a Dart AnyhowException(message) — variant type is
+    // erased. If SdkError grows structured variants (e.g. AuthError { code }),
+    // replace this with a #[frb]-annotated error enum in dart_api and return
+    // Result<_, DartError> directly instead of going through anyhow.
+    fn to_anyhow(error: SdkError) -> anyhow::Error {
+        anyhow::anyhow!(error.to_string())
     }
 }
 
@@ -289,7 +361,7 @@ impl EdgeLlm {
     /// `el-cloud`'s blocking HTTP transport has no wasm implementation, and
     /// the synchronous `LlmProvider` trait cannot await the browser's async
     /// `fetch`. Always throws so callers fail loudly instead of silently
-    /// receiving an echo stub. Use a native binding (React Native / Flutter)
+    /// receiving an echo stub. Use a native binding (React Native / Dart native)
     /// for cloud access.
     #[wasm_bindgen]
     pub fn cloud(_model: String, _api_key: String) -> Result<EdgeLlm, JsValue> {
@@ -398,7 +470,7 @@ mod tests {
     fn stream_ends_with_final_and_has_content() {
         let sdk = EdgeLlm::local("".into()).expect("toy model never fails");
         let mut parts: Vec<String> = Vec::new();
-        sdk.ask_stream("hi".into(), |t| parts.push(t))
+        sdk.ask_stream_with("hi".into(), |t| parts.push(t))
             .expect("local toy model stream should not error");
         assert!(!parts.is_empty());
     }
@@ -415,6 +487,21 @@ mod tests {
             !r.unwrap().starts_with("error:"),
             "response must not look like a swallowed error"
         );
+    }
+
+    #[test]
+    fn active_dart_stream_receives_one_provider_error() {
+        let mut errors = Vec::new();
+
+        emit_stream_error(
+            Err(SdkError::ProviderError {
+                message: "stream interrupted".into(),
+            }),
+            false,
+            |error| errors.push(error),
+        );
+
+        assert_eq!(errors, vec!["stream interrupted"]);
     }
 
     #[test]

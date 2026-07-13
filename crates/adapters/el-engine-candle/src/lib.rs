@@ -404,6 +404,49 @@ pub struct QwenEngine {
     cache_dirty: bool,
 }
 
+/// Whether a failed forward has already appended the token to Candle's KV.
+///
+/// `next_logits` cannot return an error to the runtime. It must therefore know
+/// whether to consume the committed token before returning neutral logits.
+enum ForwardOneError {
+    BeforeForward(EdgeError),
+    AfterForward(EdgeError),
+}
+
+impl ForwardOneError {
+    fn into_edge(self) -> EdgeError {
+        match self {
+            Self::BeforeForward(error) | Self::AfterForward(error) => error,
+        }
+    }
+}
+
+fn apply_committed_forward_result(
+    result: std::result::Result<Vec<i32>, ForwardOneError>,
+    token: Token,
+    cached: &mut Vec<Token>,
+    fed: &mut usize,
+    last_logits: &mut Vec<i32>,
+    vocab: usize,
+) -> Option<Vec<i32>> {
+    match result {
+        Ok(logits) => {
+            *last_logits = logits;
+            cached.push(token);
+            *fed += 1;
+            None
+        }
+        Err(ForwardOneError::AfterForward(_)) => {
+            // Candle has already appended this token. Consume it in the Rust
+            // bookkeeping too so the next decode step cannot feed it twice.
+            cached.push(token);
+            *fed += 1;
+            Some(vec![0; vocab.max(1)])
+        }
+        Err(ForwardOneError::BeforeForward(_)) => Some(vec![0; vocab.max(1)]),
+    }
+}
+
 impl QwenEngine {
     /// Load Qwen2 weights from a consumer-supplied GGUF file.
     pub fn from_path(path: impl AsRef<std::path::Path>, eos: Token) -> Result<Self> {
@@ -431,32 +474,33 @@ impl QwenEngine {
 
     /// One forward over a single token at the current position; advances the KV
     /// cache and returns milli-logits for the next token.
-    fn forward_one(&mut self, token: Token) -> Result<Vec<i32>> {
+    fn forward_one(&mut self, token: Token) -> std::result::Result<Vec<i32>, ForwardOneError> {
         // Any forward may write conversation K/V into candle's cache; mark dirty
         // before the fallible call so a forward that fails part-way still leaves
         // the cache flagged for clearing (ADR-018).
         self.cache_dirty = true;
         let t_total = bench::enabled().then(std::time::Instant::now);
 
-        let input = Tensor::from_vec(vec![token], (1, 1), &self.device)
-            .map_err(|_| EdgeError::Engine("candle: input tensor build failed"))?;
+        let input = Tensor::from_vec(vec![token], (1, 1), &self.device).map_err(|_| {
+            ForwardOneError::BeforeForward(EdgeError::Engine("candle: input tensor build failed"))
+        })?;
 
         let t_model = bench::enabled().then(std::time::Instant::now);
-        let logits = self
-            .model
-            .forward(&input, self.index_pos)
-            .map_err(|_| EdgeError::Engine("candle: Qwen2 forward failed"))?;
+        let logits = self.model.forward(&input, self.index_pos).map_err(|_| {
+            ForwardOneError::BeforeForward(EdgeError::Engine("candle: Qwen2 forward failed"))
+        })?;
+        // Candle appends to its KV cache inside `forward`, before logits are
+        // extracted below. Keep the logical position aligned if extraction fails.
+        self.index_pos += 1;
         let model_dur = t_model.map(|t| t.elapsed()).unwrap_or_default();
 
-        self.index_pos += 1;
-        let row = logits
-            .squeeze(0)
-            .map_err(|_| EdgeError::Engine("candle: squeeze logits failed"))?;
-        let floats = row
-            .to_vec1::<f32>()
-            .map_err(|_| EdgeError::Engine("candle: logits to vec failed"))?;
+        let row = logits.squeeze(0).map_err(|_| {
+            ForwardOneError::AfterForward(EdgeError::Engine("candle: squeeze logits failed"))
+        })?;
+        let floats = row.to_vec1::<f32>().map_err(|_| {
+            ForwardOneError::AfterForward(EdgeError::Engine("candle: logits to vec failed"))
+        })?;
         let out: Vec<i32> = floats.iter().map(|x| (x * 1000.0).round() as i32).collect();
-
         if let Some(t) = t_total {
             bench::record(t.elapsed(), model_dur);
         }
@@ -471,7 +515,7 @@ impl InferenceEngine for QwenEngine {
         self.prompt = tokens.to_vec(); // retained for rollback replay
         self.cached = Vec::with_capacity(tokens.len());
         for &t in tokens {
-            self.last_logits = self.forward_one(t)?;
+            self.last_logits = self.forward_one(t).map_err(ForwardOneError::into_edge)?;
             self.cached.push(t);
         }
         self.vocab = self.last_logits.len();
@@ -484,12 +528,16 @@ impl InferenceEngine for QwenEngine {
         // token the runtime just sampled and returns the next distribution.
         while self.fed < committed.len() {
             let t = committed[self.fed];
-            match self.forward_one(t) {
-                Ok(l) => self.last_logits = l,
-                Err(_) => return vec![0; self.vocab.max(1)],
+            if let Some(fallback) = apply_committed_forward_result(
+                self.forward_one(t),
+                t,
+                &mut self.cached,
+                &mut self.fed,
+                &mut self.last_logits,
+                self.vocab,
+            ) {
+                return fallback;
             }
-            self.cached.push(t); // keep `cached` == the KV's token sequence
-            self.fed += 1;
         }
         self.last_logits.clone()
     }
@@ -509,14 +557,14 @@ impl InferenceEngine for QwenEngine {
         // by `max_rollbacks` (ADR-012).
         self.index_pos = 0;
         self.fed = 0;
+        self.cached = Vec::with_capacity(self.prompt.len());
         for i in 0..self.prompt.len() {
             let t = self.prompt[i];
-            self.last_logits = self.forward_one(t)?;
+            self.last_logits = self.forward_one(t).map_err(ForwardOneError::into_edge)?;
+            // Keep cached in lock-step with index_pos so a mid-replay error
+            // leaves the invariant intact rather than holding the old value.
+            self.cached.push(t);
         }
-        // The cache now represents exactly the replayed prompt; the session
-        // re-feeds the retained committed prefix via `next_logits`, extending
-        // `cached` back in lock-step.
-        self.cached = self.prompt.clone();
         Ok(())
     }
 
@@ -544,7 +592,7 @@ impl InferenceEngine for QwenEngine {
             // fails after replacing some layers, it stays set so the next call
             // re-clears (a partially-cleared cache is never reported as clean).
             self.index_pos = 0;
-            self.forward_one(0)?;
+            self.forward_one(0).map_err(ForwardOneError::into_edge)?;
             self.cache_dirty = false;
         }
         self.index_pos = 0;
@@ -583,7 +631,7 @@ impl InferenceEngine for QwenEngine {
             // Fast path: the cache is an exact prefix of `full_context`. Feed only
             // the new suffix at the live position; the existing KV is reused as-is.
             for &t in &full_context[reuse..] {
-                self.last_logits = self.forward_one(t)?;
+                self.last_logits = self.forward_one(t).map_err(ForwardOneError::into_edge)?;
                 self.cached.push(t);
             }
         } else {
@@ -597,7 +645,7 @@ impl InferenceEngine for QwenEngine {
             self.cached = Vec::with_capacity(full_context.len());
             self.last_logits = Vec::new();
             for &t in full_context {
-                self.last_logits = self.forward_one(t)?;
+                self.last_logits = self.forward_one(t).map_err(ForwardOneError::into_edge)?;
                 self.cached.push(t);
             }
         }
@@ -784,6 +832,10 @@ struct ExpertState {
 /// GGUF gives real steering.
 pub struct QwenExpert {
     state: std::sync::Mutex<ExpertState>,
+    /// Last-known vocab size, updated after each successful `logits()` call.
+    /// Enables returning zeros of the correct length on mutex poison, where
+    /// `ExpertState` is inaccessible. Initialized from the primed engine.
+    vocab: std::sync::atomic::AtomicUsize,
     /// Evidence the expert weights passed the ADR-006 load gate (R5). Held for
     /// the engine's lifetime; never used after construction.
     _permit: LoadPermit,
@@ -801,8 +853,10 @@ impl QwenExpert {
     ) -> Result<Self> {
         let mut engine = QwenEngine::from_path(path, eos)?;
         engine.prefill(prompt)?;
+        let init_vocab = engine.vocab;
         Ok(Self {
             state: std::sync::Mutex::new(ExpertState { engine, fed: 0 }),
+            vocab: std::sync::atomic::AtomicUsize::new(init_vocab),
             _permit: permit,
         })
     }
@@ -818,8 +872,10 @@ impl QwenExpert {
             .lock()
             .map_err(|_| EdgeError::Engine("expert mutex poisoned"))?;
         st.engine.reset_cache()?;
-        st.engine.prefill(prompt)?;
+        // reset_cache succeeded: engine is blank. Set fed to 0 before prefill so
+        // a prefill failure leaves fed consistent with the blank engine state.
         st.fed = 0;
+        st.engine.prefill(prompt)?;
         Ok(())
     }
 
@@ -840,7 +896,14 @@ impl ExpertLogits for QwenExpert {
     fn logits(&self, committed: &[Token]) -> Vec<i32> {
         let mut st = match self.state.lock() {
             Ok(st) => st,
-            Err(_) => return Vec::new(),
+            Err(_) => {
+                // Mutex is poisoned: a prior call panicked while holding the lock.
+                // Return zeros of the last-known vocab size — a neutral expert
+                // signal — rather than an empty vec that would mismatch the base
+                // logit length in the steerer.
+                let v = self.vocab.load(std::sync::atomic::Ordering::Relaxed);
+                return vec![0; v.max(1)];
+            }
         };
         // Base rolled back? `committed` shrank below what we've fed. Re-prime the
         // expert to the prompt (QwenEngine::rollback replays the prompt and
@@ -848,12 +911,17 @@ impl ExpertLogits for QwenExpert {
         // state — keeping the contrastive context aligned with the base. Cost is
         // bounded by `max_rollbacks` (ADR-012), same as the base engine.
         if committed.len() < st.fed {
-            if st.engine.rollback(0).is_err() {
-                return Vec::new();
+            if st.engine.rollback(committed.len() as u32).is_err() {
+                return vec![0; st.engine.vocab.max(1)];
             }
             st.fed = 0;
         }
         let out = st.engine.next_logits(committed);
+        let vocab = out.len();
+        if vocab > 0 {
+            self.vocab
+                .store(vocab, std::sync::atomic::Ordering::Relaxed);
+        }
         st.fed = committed.len();
         out
     }
@@ -1181,8 +1249,12 @@ impl LlmProvider for QwenChatProvider {
             // conversation (clearing the engine's possibly half-fed cache) and
             // start fresh instead.
             _ => {
+                let dirty_phase = session.phase().as_str();
                 session.reset()?;
                 session.load_prompt(&ports, &prompt_tokens)?;
+                eprintln!(
+                    "[session] partial state ({dirty_phase}) detected — context reset, this turn starts fresh"
+                );
             }
         }
         let d_prefill = t_prefill.map(|t| t.elapsed()).unwrap_or_default();
@@ -1699,6 +1771,29 @@ mod tests {
         assert_eq!(longest_common_prefix(&[1, 9, 3], &[1, 2, 3]), 1); // diverges at idx 1
         assert_eq!(longest_common_prefix(&[1, 2, 3], &[1, 2]), 2); // shorter context
         assert_eq!(longest_common_prefix(&[5, 6], &[1, 2]), 0); // immediate divergence
+    }
+
+    #[test]
+    fn post_forward_decode_error_consumes_the_committed_token_once() {
+        let mut cached = vec![10];
+        let mut fed = 0;
+        let mut last_logits = vec![7, 8, 9, 10];
+
+        let fallback = apply_committed_forward_result(
+            Err(ForwardOneError::AfterForward(EdgeError::Engine(
+                "logit extraction failed",
+            ))),
+            11,
+            &mut cached,
+            &mut fed,
+            &mut last_logits,
+            4,
+        );
+
+        assert_eq!(fallback, Some(vec![0, 0, 0, 0]));
+        assert_eq!(cached, vec![10, 11]);
+        assert_eq!(fed, 1);
+        assert_eq!(last_logits, vec![7, 8, 9, 10]);
     }
 
     #[test]

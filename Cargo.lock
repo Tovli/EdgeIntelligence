@@ -840,6 +840,7 @@ dependencies = [
 name = "el-ffi"
 version = "0.3.11"
 dependencies = [
+ "anyhow",
  "el-cloud",
  "el-core",
  "el-engine-candle",

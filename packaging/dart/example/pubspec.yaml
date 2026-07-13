@@ -1,0 +1,23 @@
+name: edge_intelligence_example
+description: Flutter Android and iOS example for edge_intelligence.
+publish_to: none
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  edge_intelligence:
+    path: ..
+  # 11.0.2 omits its Kotlin plugin classes under Flutter 3.44 / AGP 9.
+  file_picker: 10.3.10
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

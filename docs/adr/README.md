@@ -8,7 +8,7 @@ the `adr-patterns` namespace.
 
 | ADR | Title | Status | Tags |
 |-----|-------|--------|------|
-| [001](./ADR-001-adopt-webassembly-as-cross-platform-sdk-runtime.md) | WebAssembly (Wasmtime) as the portable target, alongside native ARM | accepted | runtime, wasm, rust, core |
+| [001](./ADR-001-adopt-webassembly-as-cross-platform-sdk-runtime.md) | WebAssembly (Wasmtime) as the portable target, alongside native ARM | accepted - partially amended by ADR-024 | runtime, wasm, rust, core |
 | [002](./ADR-002-candle-as-rust-native-inference-engine.md) | Candle as the Rust-native inference engine | accepted | runtime, candle, rust, core |
 | [003](./ADR-003-static-memory-planning-with-zero-allocation-arena.md) | Static memory planning with a zero-allocation arena (Runtime↔Memory Shared Kernel) | accepted | memory, shared-kernel, core |
 | [004](./ADR-004-air-gapped-by-default-with-opt-in-hybrid-mode.md) | Air-gapped by default with opt-in local-network HybridMode | accepted | privacy, networking, invariant |
@@ -16,9 +16,9 @@ the `adr-patterns` namespace.
 | [006](./ADR-006-mandatory-ed25519-model-signature-verification-load-gate.md) | Mandatory ED25519 model-signature verification as a hard load gate | accepted | security, provenance, generic |
 | [007](./ADR-007-content-free-domain-events-privacy-by-construction-telemetry.md) | Content-free domain events for privacy-by-construction telemetry | accepted | privacy, telemetry, generic |
 | [008](./ADR-008-implement-the-sdk-in-rust-instead-of-c-cpp.md) | Implement the SDK in Rust instead of C/C++ | accepted | language, rust, foundational |
-| [009](./ADR-009-flutter-rust-bridge-for-dart-bindings.md) | flutter_rust_bridge v2 for Dart/Flutter bindings | accepted | ffi, flutter, dart, mobile |
+| [009](./ADR-009-flutter-rust-bridge-for-dart-bindings.md) | flutter_rust_bridge v2 for Dart/Flutter bindings | superseded by ADR-024 | ffi, flutter, dart, mobile |
 | [010](./ADR-010-unified-llm-provider-trait-with-opt-in-frontier-egress.md) | Unified LlmProvider trait with opt-in frontier LLM cloud egress | accepted | llm, cloud, networking, trait |
-| [011](./ADR-011-multi-registry-release-ci-crates-io-npm-pub-dev.md) | Multi-Registry Release CI (crates.io, npm, pub.dev) | accepted | ci, release, crates.io, npm, pub.dev, packaging |
+| [011](./ADR-011-multi-registry-release-ci-crates-io-npm-pub-dev.md) | Multi-Registry Release CI (crates.io, npm, pub.dev) | accepted - partially amended by ADR-024 | ci, release, crates.io, npm, pub.dev, packaging |
 | [012](./ADR-012-layered-decode-time-safety-control-loop-with-checkpointed-rollback.md) | Layered decode-time safety control loop with checkpointed rollback | accepted | safety, security, on-device, runtime, supporting |
 | [013](./ADR-013-model-backed-steering-layers-for-the-hybrid-safety-control-loop.md) | Model-backed steering layers for the hybrid safety control loop | proposed | safety, security, on-device, runtime, follow-up |
 | [018](./ADR-018-persistent-model-instances-and-stateful-sessions.md) | Persistent model instances and stateful inference sessions | proposed | runtime, performance, on-device, follow-up, P0 |
@@ -27,6 +27,7 @@ the `adr-patterns` namespace.
 | [021](./ADR-021-memory-mapped-verified-gguf-loading.md) | Memory-mapped verified GGUF loading | proposed | runtime, performance, provenance, on-device, follow-up, P0 |
 | [022](./ADR-022-two-tier-quantized-kv-cache-with-attention-aware-eviction.md) | Two-tier quantized KV cache with attention-aware eviction | proposed | memory, runtime, performance, on-device, follow-up, P0 |
 | [023](./ADR-023-baseline-performance-instrumentation.md) | Baseline performance instrumentation | proposed | telemetry, performance, testing, follow-up, P0 |
+| [024](./ADR-024-dart-only-platform-agnostic-pub-dev-sdk.md) | Dart-first pub.dev SDK with Flutter mobile runtimes | accepted | dart, flutter, pub.dev, bindings, packaging, platform-agnostic |
 
 ## Decision relationships
 
@@ -36,7 +37,8 @@ flowchart LR
     A008 --> A002[002 Candle engine]
     A008 --> A006[006 ed25519-dalek load gate]
     A001 --> A002
-    A001 --> A009[009 flutter_rust_bridge]
+    A001 --> A024[024 Dart-first pub.dev SDK]
+    A009[009 flutter_rust_bridge] -. superseded by .-> A024
     A002 --> A003[003 Static memory / Shared Kernel]
     A002 --> A010[010 LlmProvider + el-cloud]
     A004[004 Air-gap + HybridMode] --> A005[005 On-device tiered safety]
@@ -64,6 +66,7 @@ flowchart LR
     A023 -. measures .-> A020
     A023 -. measures .-> A021
     A023 -. measures .-> A022
+    A011[011 Multi-registry release CI] -. pub.dev identity amended by .-> A024
 ```
 
 > **ADR-008 is foundational** (the language decision) and drives the revisions to

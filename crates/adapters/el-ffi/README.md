@@ -1,4 +1,4 @@
-# el-ffi — host bindings (React Native, Flutter, Web)
+# el-ffi — host bindings (React Native, Dart, Web)
 
 One Rust API surface exported three ways, so mobile and web apps can call the
 SDK in their native idiom (ADR-001, ADR-009, ADR-010):
@@ -6,11 +6,12 @@ SDK in their native idiom (ADR-001, ADR-009, ADR-010):
 | Surface | Tool | Output |
 |---------|------|--------|
 | **React Native** | `uniffi-bindgen-react-native` | TypeScript + JSI C++ + Turbo Module |
-| **Flutter** | `flutter_rust_bridge` v2 | Dart opaque handle, `Future`/`Stream` |
+| **Dart / Flutter / pub.dev** | `flutter_rust_bridge` v2 codegen | Dart opaque handle, `Future`/`Stream` |
 | **Web / npm** | `wasm-bindgen` | ESM TypeScript package via `wasm-pack` |
 
-No `unsafe` (`#![forbid(unsafe_code)]`). The crate is `cdylib` + `staticlib` +
-`lib` so each toolchain can link the form it needs.
+Hand-written code denies `unsafe`; generated flutter_rust_bridge glue is the
+only module allowed to contain FFI `unsafe`. The crate is `cdylib` +
+`staticlib` + `lib` so each toolchain can link the form it needs.
 
 ## What it provides
 
@@ -23,10 +24,11 @@ No `unsafe` (`#![forbid(unsafe_code)]`). The crate is `cdylib` + `staticlib` +
     **Native only** — see the web limitation below. `api_key` must come from the
     platform keystore, never embedded.
   - `ask(prompt) -> Result<String, SdkError>` — blocking chat.
-  - `ask_stream(prompt, |token| …)` — closure streaming (Flutter / FRB v2).
   - `ask_stream_cb(prompt, handler)` — `StreamHandler` callback streaming
     (React Native; UniFFI cannot export `impl FnMut`).
   - `reset()`.
+- **Dart / Flutter / pub.dev wrappers** — `edge_llm_*` FRB functions wrapped by the Dart
+  facade as `EdgeLlm.local`, `EdgeLlm.cloud`, `ask`, `askStream`, and `reset`.
 - **`SdkError`** — a thin, FFI-safe projection of `el_core::EdgeError`
   (`el-core`'s `Box<str>`/Rust-specific variants are not FFI-safe). Projects to
   the host language's exception type, or a JS exception on wasm.
@@ -47,9 +49,6 @@ const QWEN_0_5B_GGUF: &str = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
 let sdk = EdgeLlm::local(QWEN_0_5B_GGUF.into())?;
 let reply = sdk.ask("Summarize edge inference in one sentence.".into())?;
 assert!(!reply.is_empty());
-
-// Streaming (Flutter / closure form):
-sdk.ask_stream("Give me two deployment tips.".into(), |fragment| print!("{fragment}"))?;
 # Ok::<(), el_ffi::SdkError>(())
 ```
 
@@ -88,17 +87,28 @@ sdk.ask_stream_cb("Give me two deployment tips.", {
 });
 ```
 
-## Usage (pub.dev / Flutter)
+## Usage (pub.dev / Dart and Flutter)
 
 ```dart
+import "dart:io";
+
 import "package:edge_intelligence/edge_intelligence.dart";
 
-final qwen05b = "/path/to/app/models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
-final sdk = await EdgeLlm.local(qwen05b);
+Future<void> main() async {
+  await initEdgeIntelligence();
 
-final reply = await sdk.ask("Summarize edge inference in one sentence.");
-await for (final token in sdk.askStream("Give me two deployment tips.")) {
-  stdout.write(token);
+  try {
+    const qwen05b = "/path/to/app/models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
+    final sdk = await EdgeLlm.local(qwen05b);
+
+    final reply = await sdk.ask("Summarize edge inference in one sentence.");
+    print(reply);
+    await for (final token in sdk.askStream("Give me two deployment tips.")) {
+      stdout.write(token);
+    }
+  } finally {
+    disposeEdgeIntelligence();
+  }
 }
 ```
 
@@ -110,10 +120,11 @@ codegen run via the [`Makefile`](../../../Makefile):
 ```sh
 make build-android    # cargo build --target aarch64-linux-android  (shared lib)
 make build-ios        # cargo build --target aarch64-apple-ios       (static lib)
+make build-ios-xcframework # device + simulator framework for Flutter iOS
 make build-wasm       # wasm-pack build → out/web ESM package
 
 make codegen-rn       # React Native JSI bindings (needs build-android)
-make codegen-flutter  # flutter_rust_bridge v2 Dart bindings
+make codegen-dart     # flutter_rust_bridge v2 Dart bindings
 make bindings         # all three surfaces
 ```
 
@@ -127,7 +138,7 @@ On `wasm32` the local path currently uses a dev-stage echo placeholder until
 Candle-on-wasm is wired, and the **cloud backend is not available on web**
 (ADR-010 amendment): `el-cloud`'s blocking HTTP transport has no wasm
 implementation, so `EdgeLlm.cloud` throws an explicit error there instead of
-silently degrading. Use a native binding (React Native / Flutter) for cloud
+silently degrading. Use a native binding (React Native / Dart native) for cloud
 access.
 
 ## Status
@@ -142,5 +153,5 @@ out-of-band.
 
 Part of the [Edge Intelligence](../../../README.md) workspace. Realizes
 [ADR-001](../../../docs/adr/ADR-001-adopt-webassembly-as-cross-platform-sdk-runtime.md),
-[ADR-009](../../../docs/adr/ADR-009-flutter-rust-bridge-for-dart-bindings.md),
+[ADR-024](../../../docs/adr/ADR-024-dart-only-platform-agnostic-pub-dev-sdk.md),
 and [ADR-010](../../../docs/adr/ADR-010-unified-llm-provider-trait-with-opt-in-frontier-egress.md).

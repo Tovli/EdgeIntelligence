@@ -1,6 +1,6 @@
 # ADR-009: flutter_rust_bridge for Dart/Flutter bindings
 
-- **Status**: accepted
+- **Status**: superseded by [ADR-024](./ADR-024-dart-only-platform-agnostic-pub-dev-sdk.md)
 - **Date**: 2026-06-10
 - **Deciders**:
 - **Tags**: ffi, flutter, dart, bindings, mobile
@@ -73,6 +73,7 @@ build), keeping the offline-build guarantee of the 7 core crates intact.
   `.so`/`.dylib`; the Rust workspace itself is unchanged.
 
 ## Links
+- Superseded by: [ADR-024](./ADR-024-dart-only-platform-agnostic-pub-dev-sdk.md)
 - Supersedes: nothing; extends ADR-001's binding strategy
 - Related: [ADR-001](./ADR-001-adopt-webassembly-as-cross-platform-sdk-runtime.md),
   [ADR-008](./ADR-008-implement-the-sdk-in-rust-instead-of-c-cpp.md)

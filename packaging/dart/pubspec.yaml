@@ -1,0 +1,24 @@
+name: edge_intelligence
+version: 0.1.0
+description: Dart bindings for the Edge Intelligence SDK, with Flutter mobile and native desktop runtimes.
+repository: https://github.com/Tovli/EdgeIntelligence
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+platforms:
+  android:
+  ios:
+  linux:
+  macos:
+  windows:
+dependencies:
+  flutter_rust_bridge: ">=2.12.0 <2.12.1"
+dev_dependencies:
+  test: ^1.25.0
+flutter:
+  plugin:
+    platforms:
+      android:
+        ffiPlugin: true
+      ios:
+        ffiPlugin: true

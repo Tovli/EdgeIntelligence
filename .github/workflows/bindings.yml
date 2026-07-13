@@ -8,8 +8,11 @@ on:
       - 'crates/el-core/**'
       - 'crates/el-runtime/**'
       - 'crates/adapters/el-engine-candle/**'
+      - 'packaging/dart/**'
       - '.cargo/config.toml'
       - 'Makefile'
+      - 'scripts/build-ios-xcframework.sh'
+      - 'scripts/verify-android-page-alignment.py'
       - 'scripts/install-cargo-tool.sh'
       - 'scripts/retry-command.sh'
       - 'tests/check_ci_workflows.py'
@@ -22,10 +25,13 @@ on:
       - 'crates/el-core/**'
       - 'crates/el-runtime/**'
       - 'crates/adapters/el-engine-candle/**'
+      - 'packaging/dart/**'
       - '.cargo/config.toml'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'Makefile'
+      - 'scripts/build-ios-xcframework.sh'
+      - 'scripts/verify-android-page-alignment.py'
       - 'scripts/install-cargo-tool.sh'
       - 'scripts/retry-command.sh'
       - 'tests/check_ci_workflows.py'
@@ -53,42 +59,77 @@ jobs:
 
   # ── Android: aarch64-linux-android cross-compile ──────────────────────────
   android:
-    name: Android aarch64 cross-compile
+    name: Android armv7 + arm64 + x64 cross-compile
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: armv7-linux-androideabi,aarch64-linux-android,x86_64-linux-android
       - uses: Swatinem/rust-cache@v2
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
-          ndk-version: r27c
+          ndk-version: r28c
+      - name: Cross-compile el-ffi → armv7-linux-androideabi
+        env:
+          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang
+          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_AR: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          CC_armv7_linux_androideabi: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang
+          AR_armv7_linux_androideabi: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          RANLIB_armv7_linux_androideabi: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
+        run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target armv7-linux-androideabi --release
       - name: Cross-compile el-ffi → aarch64-linux-android
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: >-
-            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
           CARGO_TARGET_AARCH64_LINUX_ANDROID_AR: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
           CC_aarch64_linux_android: >-
-            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
           AR_aarch64_linux_android: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
           RANLIB_aarch64_linux_android: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
         run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target aarch64-linux-android --release
 
+      - name: Cross-compile el-ffi → x86_64-linux-android
+        env:
+          CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang
+          CARGO_TARGET_X86_64_LINUX_ANDROID_AR: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          CC_x86_64_linux_android: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang
+          AR_x86_64_linux_android: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
+          RANLIB_x86_64_linux_android: >-
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
+        run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target x86_64-linux-android --release
+      - name: Verify Android 16 KB page alignment
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          python3 scripts/verify-android-page-alignment.py \
+            "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+            target/aarch64-linux-android/release/libel_ffi.so \
+            target/x86_64-linux-android/release/libel_ffi.so
+
       - name: Install uniffi-bindgen-react-native
         run: npm install --global uniffi-bindgen-react-native@0.31.0-3
       - name: Codegen — React Native (TypeScript + JSI)
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: >-
-            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
           CARGO_TARGET_AARCH64_LINUX_ANDROID_AR: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
           CC_aarch64_linux_android: >-
-            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang
+            ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
           AR_aarch64_linux_android: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
           RANLIB_aarch64_linux_android: >-
@@ -102,16 +143,16 @@ jobs:
 
   # ── iOS: aarch64-apple-ios cross-compile ──────────────────────────────────
   ios:
-    name: iOS aarch64 cross-compile
+    name: iOS device + simulator XCFramework
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
       - uses: Swatinem/rust-cache@v2
-      - name: Cross-compile el-ffi → aarch64-apple-ios
-        run: cargo build --manifest-path crates/adapters/el-ffi/Cargo.toml --target aarch64-apple-ios --release
+      - name: Build el-ffi iOS XCFramework
+        run: bash scripts/build-ios-xcframework.sh
 
   # ── Web: wasm32-unknown-unknown + wasm-pack ───────────────────────────────
   wasm:
@@ -146,9 +187,9 @@ jobs:
           name: web-bindings
           path: out/web/
 
-  # ── Flutter: Dart binding codegen ────────────────────────────────────────
-  flutter:
-    name: Flutter/Dart codegen
+  # ── Dart binding codegen ─────────────────────────────────────────────────
+  dart:
+    name: Dart codegen
     runs-on: ubuntu-latest
     env:
       FRB_CODEGEN_VERSION: 2.12.0
@@ -158,14 +199,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: dart-lang/setup-dart@v1
-      - name: Install Flutter codegen cargo tools
+      - name: Install Dart codegen cargo tools
         run: |
           bash scripts/install-cargo-tool.sh flutter_rust_bridge_codegen flutter_rust_bridge_codegen "$FRB_CODEGEN_VERSION"
           bash scripts/install-cargo-tool.sh cargo-expand cargo-expand "$CARGO_EXPAND_VERSION"
-      - name: Codegen — Flutter/Dart
-        run: make codegen-flutter
+      - name: Codegen — Dart
+        run: make codegen-dart
+      - name: Assert Dart FRB Rust glue is committed
+        run: |
+          git ls-files --error-unmatch crates/adapters/el-ffi/src/frb_generated.rs
+          git diff --exit-code -- crates/adapters/el-ffi/src/frb_generated.rs
       - uses: actions/upload-artifact@v4
         if: github.event_name != 'pull_request'
         with:
-          name: flutter-bindings
-          path: out/flutter/
+          name: dart-bindings
+          path: out/dart/

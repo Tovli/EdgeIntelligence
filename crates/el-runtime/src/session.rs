@@ -193,6 +193,10 @@ impl<E: InferenceEngine> InferenceSession<E> {
                 found: self.phase.as_str(),
             });
         }
+        // Reset step so this turn's events start from 0 (same as a fresh turn
+        // via `new` + `load_prompt`). Events are drained per-turn, so per-turn
+        // step numbering is the right level of granularity.
+        self.step = 0;
         // The whole re-rendered conversation is this turn's prompt for ADR-013
         // ingress triage (re-scored in `generate_with_policy`).
         self.prompt = full_context.to_vec();
@@ -211,6 +215,8 @@ impl<E: InferenceEngine> InferenceSession<E> {
         self.emit(DomainEvent::PrefillCompleted {
             prompt_tokens: full_context.len() as u32,
             kv_len,
+            // `prefill_reuse` reports final KV length, not the number of tokens
+            // forwarded. Reporting a rate here would count reused tokens too.
             prefill_tps: 0,
         });
         self.phase = Phase::Decoding;
@@ -1681,6 +1687,7 @@ mod tests {
         /// When set, the favoured token is always EOS so `generate` terminates on
         /// the first decode step (keeps the reuse-savings test deterministic).
         eos_immediately: bool,
+        prefill_delay: std::time::Duration,
     }
     impl ReuseEngine {
         fn new(eos: Token, vocab: usize, eos_immediately: bool) -> Self {
@@ -1694,7 +1701,18 @@ mod tests {
                 last_logits: Vec::new(),
                 forwards: std::rc::Rc::new(std::cell::Cell::new(0)),
                 eos_immediately,
+                prefill_delay: std::time::Duration::ZERO,
             }
+        }
+        fn with_prefill_delay(
+            eos: Token,
+            vocab: usize,
+            eos_immediately: bool,
+            prefill_delay: std::time::Duration,
+        ) -> Self {
+            let mut engine = Self::new(eos, vocab, eos_immediately);
+            engine.prefill_delay = prefill_delay;
+            engine
         }
         fn forward(&mut self, t: Token) {
             self.forwards.set(self.forwards.get() + 1);
@@ -1764,6 +1782,7 @@ mod tests {
             Ok(())
         }
         fn prefill_reuse(&mut self, full_context: &[Token]) -> Result<u32> {
+            std::thread::sleep(self.prefill_delay);
             let reuse = self
                 .cached
                 .iter()
@@ -1847,6 +1866,40 @@ mod tests {
         s.generate(&ports, 8).unwrap();
         assert_eq!(s.output(), &[1]);
         assert_eq!(s.phase(), Phase::Completed);
+    }
+
+    #[test]
+    fn continue_prompt_does_not_report_throughput_for_reused_tokens() {
+        let engine =
+            ReuseEngine::with_prefill_delay(1, 4, true, std::time::Duration::from_millis(2));
+        let mut s =
+            InferenceSession::new(SessionId(55), SessionConfig::default(), engine, permit());
+        let ports = Ports::permissive();
+
+        s.load_prompt(&ports, &[10, 11]).unwrap();
+        s.generate(&ports, 8).unwrap();
+        s.drain_events();
+
+        s.continue_prompt(&ports, &[10, 11, 20, 21, 22]).unwrap();
+        let prefill = s
+            .drain_events()
+            .into_iter()
+            .find_map(|envelope| match envelope.event {
+                DomainEvent::PrefillCompleted {
+                    prompt_tokens,
+                    kv_len,
+                    prefill_tps,
+                } => Some((prompt_tokens, kv_len, prefill_tps)),
+                _ => None,
+            })
+            .expect("continue_prompt emits PrefillCompleted");
+
+        assert_eq!(prefill.0, 5);
+        assert_eq!(prefill.1, 5);
+        assert_eq!(
+            prefill.2, 0,
+            "the engine API does not report forwarded-token count, so reused tokens must not be included in prefill throughput"
+        );
     }
 
     #[test]

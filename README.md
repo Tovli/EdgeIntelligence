@@ -68,7 +68,7 @@ comes from three layers, each with a clear entry point:
 
 | Layer | Crate · symbol | Where it fits |
 |-------|----------------|---------------|
-| **Device SDK facade** | [`el-ffi`](crates/adapters/el-ffi) · `EdgeLlm` | The composition root shipped to devices. Wires the local engine and opt-in cloud behind one flat API and projects it to React Native (UniFFI/JSI), Flutter (FRB), and Web (wasm-bindgen). **Start here to build an app.** |
+| **Device SDK facade** | [`el-ffi`](crates/adapters/el-ffi) · `EdgeLlm` | The composition root shipped to devices. Wires the local engine and opt-in cloud behind one flat API and projects it to React Native (UniFFI/JSI), Dart/pub.dev desktop and Flutter mobile runtimes (FRB-generated Dart), and Web/npm (wasm-bindgen). **Start here to build an app.** |
 | **Rust API seam** | [`el-core`](crates/el-core) · `LlmProvider` | The single trait every backend implements and every Rust consumer calls (ADR-010). **Start here to embed the SDK in Rust.** |
 | **Orchestrator** | [`el-runtime`](crates/el-runtime) · `InferenceSession` | Composes provenance, memory, safety, and grammar into the decode loop — the engine the providers drive. |
 
@@ -95,11 +95,12 @@ comes from three layers, each with a clear entry point:
 <details>
 <summary><b>Which entry point should I use?</b></summary>
 
-- **Building a mobile or web app** → use [`el-ffi`](crates/adapters/el-ffi)'s
+- **Building a device, desktop, mobile, or web app** → use [`el-ffi`](crates/adapters/el-ffi)'s
   `EdgeLlm`. Construct `EdgeLlm::local(model_uri)` (air-gapped) or
-  `EdgeLlm::cloud(model, api_key)` (opt-in), then call `ask(...)` /
-  `ask_stream(...)`. The crate compiles to a native library and a wasm package
-  and ships generated TypeScript/Dart bindings.
+  `EdgeLlm::cloud(model, api_key)` (opt-in), then call `ask(...)`; use
+  `ask_stream_cb(...)` from React Native, `askStream(...)` from Dart, or the
+  wasm-bindgen web stream surface from npm. The crate compiles to native and
+  wasm artifacts and ships generated TypeScript/Dart bindings.
 - **Embedding the SDK in Rust** → construct a concrete provider and talk to it
   through [`el_core::LlmProvider`](crates/el-core): `el_engine_candle::QwenChatProvider`
   for on-device chat, or `el_cloud::CloudProvider` for a frontier backend.
@@ -255,7 +256,7 @@ identify the runnable clients.
 | [`crates/adapters/el-provenance-ed25519`](crates/adapters/el-provenance-ed25519) | Real ED25519 signature verification | Implemented and tested |
 | [`crates/adapters/el-engine-candle`](crates/adapters/el-engine-candle) | Candle inference adapter: engine-seam proof plus a real Qwen2 transformer engine and chat provider | Implemented; real on-device chat |
 | [`crates/adapters/el-cloud`](crates/adapters/el-cloud) | Opt-in OpenAI-compatible provider backend | Implemented; egress opt-in at construction |
-| [`crates/adapters/el-ffi`](crates/adapters/el-ffi) | **Device SDK facade (`EdgeLlm`):** Flutter / UniFFI / wasm-bindgen binding surfaces | Implemented and tested; host build is a workspace member, cross-target builds via `make` |
+| [`crates/adapters/el-ffi`](crates/adapters/el-ffi) | **Device SDK facade (`EdgeLlm`):** Dart/pub.dev desktop, Flutter Android/iOS, UniFFI, and wasm-bindgen binding surfaces | Implemented and tested; host build is a workspace member, cross-target builds via `make` |
 | [`crates/adapters/el-grammar-llguidance`](crates/adapters/el-grammar-llguidance) | llguidance JSON-schema token masking | Implemented and tested; workspace-excluded (crates.io deps) |
 | [`apps/el-chat`](apps/el-chat) | Interactive chat test client; SDK-only deps, drives the runtime end-to-end | Implemented; runs real on-device chat |
 | [`apps/el-bench`](apps/el-bench) | Benchmark harness; SDK-only deps, replays quality/safety task sets through the runtime | Implemented; model-agnostic, reproducible |
@@ -343,8 +344,9 @@ ADRs.
 | [ADR-006](docs/adr/ADR-006-mandatory-ed25519-model-signature-verification-load-gate.md) | Mandatory ED25519 model-signature verification |
 | [ADR-007](docs/adr/ADR-007-content-free-domain-events-privacy-by-construction-telemetry.md) | Content-free domain events for privacy-preserving telemetry |
 | [ADR-008](docs/adr/ADR-008-implement-the-sdk-in-rust-instead-of-c-cpp.md) | Rust instead of C/C++ |
-| [ADR-009](docs/adr/ADR-009-flutter-rust-bridge-for-dart-bindings.md) | Flutter Rust Bridge for Dart bindings |
+| [ADR-009](docs/adr/ADR-009-flutter-rust-bridge-for-dart-bindings.md) | Superseded Flutter Rust Bridge framing |
 | [ADR-010](docs/adr/ADR-010-unified-llm-provider-trait-with-opt-in-frontier-egress.md) | Unified local/cloud `LlmProvider` trait |
+| [ADR-024](docs/adr/ADR-024-dart-only-platform-agnostic-pub-dev-sdk.md) | Dart-first pub.dev SDK with Flutter mobile runtimes |
 
 See the full index in [`docs/adr/README.md`](docs/adr/README.md).
 

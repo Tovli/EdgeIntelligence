@@ -13,6 +13,7 @@ PACKAGE = ROOT / "packaging" / "npm"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 BINDINGS_WORKFLOW = ROOT / ".github" / "workflows" / "bindings.yml"
 ADR = ROOT / "docs" / "adr" / "ADR-025-react-native-expo-autolink-ready-native-distribution.md"
+UBRN_CMAKE_PATCH = ROOT / "scripts" / "patch-ubrn-cmake.py"
 UBRN_VERSION = "0.31.0-3"
 
 
@@ -20,6 +21,14 @@ def load_ci_checker():
     spec = importlib.util.spec_from_file_location(
         "check_ci_workflows", ROOT / "tests" / "check_ci_workflows.py"
     )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_ubrn_cmake_patch():
+    spec = importlib.util.spec_from_file_location("patch_ubrn_cmake", UBRN_CMAKE_PATCH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -350,6 +359,39 @@ def test_contract_runs_for_pull_requests() -> None:
     assert "python3 tests/test_react_native_package_contract.py" in workflow
     assert "Assemble React Native package for Android smoke" in workflow
     assert "Run Expo Android native build smoke" in workflow
+
+
+def test_premerge_expo_smoke_installs_the_packed_sdk() -> None:
+    """Keep CMake's Node resolution identical to a consumer installation."""
+    workflow = BINDINGS_WORKFLOW.read_text(encoding="utf-8")
+
+    assert 'tarball="$(npm pack .. --pack-destination . --silent)"' in workflow
+    assert 'npm pkg set "dependencies.edge-intelligence-sdk=file:./$tarball"' in workflow
+    assert "bash ../../scripts/retry-command.sh npm ci" in workflow
+
+
+def test_ubrn_cmake_patch_uses_the_exported_runtime_entrypoint() -> None:
+    patch = load_ubrn_cmake_patch()
+    generated = """execute_process(
+    COMMAND node -p \"require.resolve('uniffi-bindgen-react-native/package.json')\"
+)
+"""
+
+    with tempfile.TemporaryDirectory() as directory:
+        cmake = Path(directory) / "CMakeLists.txt"
+        cmake.write_text(generated, encoding="utf-8")
+        patch.patch_cmake(cmake)
+        patch.patch_cmake(cmake)
+        patched = cmake.read_text(encoding="utf-8")
+
+    assert "require.resolve('uniffi-bindgen-react-native/package.json')" not in patched
+    assert "require.resolve('uniffi-bindgen-react-native')" in patched
+    assert "'../../../..'" in patched
+
+    for workflow in (BINDINGS_WORKFLOW, RELEASE_WORKFLOW):
+        assert "patch-ubrn-cmake.py android/CMakeLists.txt" in workflow.read_text(
+            encoding="utf-8"
+        )
 
 
 def run_contract_tests(namespace=None) -> int:

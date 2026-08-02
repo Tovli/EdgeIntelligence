@@ -424,9 +424,10 @@ jobs:
           test -s src/rn/cpp/el_ffi.hpp
       - name: Generate UniFFI React Native Turbo Module glue
         working-directory: assembly
-        run: >-
-          bash ../scripts/retry-command.sh npx --yes uniffi-bindgen-react-native@0.31.0-3
-          generate jsi turbo-module el_ffi --native-bindings --config ubrn.config.yaml
+        run: |
+          bash ../scripts/retry-command.sh npx --yes uniffi-bindgen-react-native@0.31.0-3 \
+            generate jsi turbo-module el_ffi --native-bindings --config ubrn.config.yaml
+          python3 ../scripts/patch-ubrn-cmake.py android/CMakeLists.txt
       - name: Run React Native package type check
         working-directory: assembly
         run: |

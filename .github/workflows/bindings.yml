@@ -169,6 +169,7 @@ jobs:
             cd assembly
             uniffi-bindgen-react-native generate jsi turbo-module el_ffi \
               --native-bindings --config ubrn.config.yaml
+            python3 ../scripts/patch-ubrn-cmake.py android/CMakeLists.txt
           )
       - name: Run React Native package type check
         working-directory: assembly
@@ -179,7 +180,13 @@ jobs:
       - name: Run Expo Android native build smoke
         working-directory: assembly/example-expo
         run: |
-          bash ../../scripts/retry-command.sh npm install
+          # A packed install places the UBRN runtime where CMake resolves it:
+          # node_modules/edge-intelligence-sdk/android -> ../../node_modules.
+          # A file:.. fixture instead leaves CMake in the sibling assembly tree.
+          tarball="$(npm pack .. --pack-destination . --silent)"
+          npm pkg set "dependencies.edge-intelligence-sdk=file:./$tarball"
+          bash ../../scripts/retry-command.sh npm install --package-lock-only --ignore-scripts
+          bash ../../scripts/retry-command.sh npm ci
           npx expo prebuild --platform android --no-install
           (cd android && ./gradlew :app:assembleRelease)
           grep -R "edge-intelligence-sdk" android/build/generated/autolinking

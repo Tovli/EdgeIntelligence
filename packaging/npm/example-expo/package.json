@@ -1,0 +1,15 @@
+{
+  "private": true,
+  "name": "edge-intelligence-expo-example",
+  "version": "0.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "edge-intelligence-sdk": "file:..",
+    "expo": "~57.0.8",
+    "react": "19.2.3",
+    "react-native": "0.86.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.29.0"
+  }
+}

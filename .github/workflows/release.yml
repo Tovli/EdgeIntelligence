@@ -1,6 +1,6 @@
 name: Release — crates.io · npm · pub.dev
 
-# Triggered by an explicit semver tag pushed to the repository.
+# Triggered by an explicit semver tag, or manually for a non-publishing smoke.
 # Workflow: verify → build artefacts (parallel) → assemble packages → publish (serialized: crates → npm → pub).
 # Prerequisites before tagging:
 #   1. cargo install cargo-edit   # one-time local install
@@ -13,6 +13,7 @@ on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -32,20 +33,27 @@ jobs:
       - name: Extract semver from tag
         id: tag
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.name == "el-core") | .version')"
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Releasing $VERSION"
+          echo "Validating $VERSION"
 
       # Fail fast: Cargo.toml version must already match the tag.
       # Fix: cargo set-version --workspace <ver>, commit, then re-tag.
-      - name: Assert Cargo workspace version matches tag
+      - name: Assert tag version matches Cargo workspace
+        if: github.event_name == 'push'
+        env:
+          EXPECTED_VERSION: ${{ steps.tag.outputs.version }}
         run: |
           CARGO_VER=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "el-core") | .version')
-          TAG_VER="${GITHUB_REF_NAME#v}"
-          if [ "$CARGO_VER" != "$TAG_VER" ]; then
-            echo "ERROR: Cargo workspace version ($CARGO_VER) != tag ($TAG_VER)"
-            echo "Run: cargo set-version --workspace $TAG_VER"
+          if [ "$CARGO_VER" != "$EXPECTED_VERSION" ]; then
+            echo "ERROR: Cargo workspace version ($CARGO_VER) != expected ($EXPECTED_VERSION)"
+            echo "Run: cargo set-version --workspace $EXPECTED_VERSION"
             echo "Then commit, and push a corrected tag."
             exit 1
           fi
@@ -87,6 +95,9 @@ jobs:
 
       - name: Check CI workflow tool dependencies
         run: python3 tests/check_ci_workflows.py
+
+      - name: Check React Native package contract
+        run: python3 tests/test_react_native_package_contract.py
 
       - name: cargo fmt --check
         run: cargo fmt --check
@@ -155,7 +166,9 @@ jobs:
             target/aarch64-linux-android/release/libel_ffi.so \
             target/x86_64-linux-android/release/libel_ffi.so
       - name: Install uniffi-bindgen-react-native
-        run: npm install --global uniffi-bindgen-react-native@0.31.0-3
+        run: >-
+          bash scripts/retry-command.sh npm install --global
+          uniffi-bindgen-react-native@0.31.0-3
       - name: Codegen — React Native (TypeScript + JSI)
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: >-
@@ -203,11 +216,6 @@ jobs:
         run: |
           mkdir -p target/ios-artifact
           cp -R target/ios-xcframework/el_ffi.xcframework target/ios-artifact/el_ffi.xcframework
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ios-lib
-          path: target/aarch64-apple-ios/release/libel_ffi.a
-          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: ios-xcframework
@@ -381,9 +389,11 @@ jobs:
       VERSION: ${{ needs.verify.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22.13'
       - uses: actions/download-artifact@v4
         with:
           name: wasm-output
@@ -395,39 +405,62 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: android-libs
-          path: assembly/android/jniLibs/
+          path: assembly/android/src/main/jniLibs/
       - uses: actions/download-artifact@v4
         with:
-          name: ios-lib
+          name: ios-xcframework
           path: assembly/ios/
-      - name: Write package.json
+      - name: Add React Native native-module metadata
         run: |
-          jq -n \
-            --arg name "edge-intelligence-sdk" \
-            --arg version "$VERSION" \
-            --arg desc "Edge-native LLM inference SDK — Web (WASM) + React Native" \
-            '{
-              name: $name,
-              version: $version,
-              description: $desc,
-              exports: {
-                ".": {
-                  browser: "./src/web/el_ffi.js",
-                  "react-native": "./src/rn/el_ffi.ts"
-                }
-               },
-               types: "./src/web/el_ffi.d.ts",
-               files: ["src/", "android/", "ios/", "README.md"],
-               license: "Apache-2.0"
-             }' > assembly/package.json
-      - name: Copy README.md
-        run: cp packaging/npm/README.md assembly/README.md
+          cp -R packaging/npm/. assembly/
+          cp LICENSE assembly/LICENSE
+      - name: Verify downloaded UniFFI React Native bindings
+        working-directory: assembly
+        run: |
+          # `generate jsi bindings` in build-android owns these files. The
+          # turbo-module command below consumes them and adds host scaffolding.
+          test -s src/rn/el_ffi.ts
+          test -s src/rn/cpp/el_ffi.cpp
+          test -s src/rn/cpp/el_ffi.hpp
+      - name: Generate UniFFI React Native Turbo Module glue
+        working-directory: assembly
+        run: >-
+          bash ../scripts/retry-command.sh npx --yes uniffi-bindgen-react-native@0.31.0-3
+          generate jsi turbo-module el_ffi --native-bindings --config ubrn.config.yaml
+      - name: Run React Native package type check
+        working-directory: assembly
+        run: |
+          trap 'rm -rf node_modules' EXIT
+          bash ../scripts/retry-command.sh npm install --ignore-scripts --package-lock=false
+          npx tsc --noEmit --project tsconfig.rn.json
+      - name: Set React Native package release version
+        run: |
+          npm pkg set version="$VERSION" --prefix assembly
+          sed -i "s/0.0.0-development/$VERSION/g" assembly/edge-intelligence-sdk.podspec
+      - name: Verify native package artifact layout
+        working-directory: assembly
+        run: |
+          test -f android/src/main/jniLibs/arm64-v8a/libel_ffi.so
+          test -d ios/el_ffi.xcframework
+          test -f android/CMakeLists.txt
+          test -f android/src/main/java/com/edgeintelligence/EdgeIntelligenceSdkModule.java
+          test -f ios/EdgeIntelligenceSdk.mm
+          test -f src/rn/native.ts
+          test -f src/rn/NativeEdgeIntelligenceSdk.ts
+          test ! -f EdgeIntelligenceSdk.podspec
+          test ! -f android/proguard-rules.pro
+          grep -qF 'vendored_frameworks' edge-intelligence-sdk.podspec
+          grep -qF -- '-keep class com.sun.jna.*' android/consumer-rules.pro
+          ! grep -qF 'package=' android/src/main/AndroidManifest.xml
+          grep -qF "require('./native')" src/rn/index.ts
+          grep -qF 'localEdgeLlm' src/rn/index.ts
       - name: Assert npm package ships README.md
         run: bash scripts/assert-release-readmes.sh npm assembly
       - uses: actions/upload-artifact@v4
         with:
           name: npm-package
           path: assembly/
+          include-hidden-files: true
 
   assemble-dart:
     name: Assemble edge_intelligence pub.dev package
@@ -567,16 +600,110 @@ jobs:
           name: pub-package
           path: assembly/
 
+  smoke-expo-native-module:
+    name: Expo ${{ matrix.platform }} native-module smoke
+    needs: assemble-npm
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: android
+            runner: ubuntu-latest
+          - platform: ios
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: npm-package/
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13'
+      - uses: actions/setup-java@v4
+        if: matrix.platform == 'android'
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Install the packed SDK in an isolated Expo fixture
+        run: |
+          cp -R npm-package/example-expo expo-smoke
+          tarball="$(npm pack ./npm-package --pack-destination expo-smoke --silent)"
+          (
+            cd expo-smoke
+            npm pkg set "dependencies.edge-intelligence-sdk=file:./$tarball"
+            # Refresh only the local SDK entry; the committed fixture lock keeps
+            # the Expo/React Native dependency graph pinned.
+            bash ../scripts/retry-command.sh npm install --package-lock-only --ignore-scripts
+            bash ../scripts/retry-command.sh npm ci
+          )
+      - name: Prebuild and verify native autolinking
+        working-directory: expo-smoke
+        run: |
+          npx expo prebuild --platform ${{ matrix.platform }} --no-install
+          if [ "${{ matrix.platform }}" = "android" ]; then
+            (cd android && ./gradlew :app:assembleRelease)
+            grep -R "edge-intelligence-sdk" android/build/generated/autolinking
+            grep -R "build/generated/source/codegen/jni/CMakeLists.txt" \
+              android/build/generated/autolinking
+            unzip -l android/app/build/outputs/apk/release/app-release.apk \
+              | grep -F "lib/arm64-v8a/libel_ffi.so"
+            unzip -l android/app/build/outputs/apk/release/app-release.apk \
+              | grep -F "lib/x86_64/libel_ffi.so"
+          else
+            (cd ios && pod install)
+            workspace="$(find ios -name '*.xcworkspace' -print -quit)"
+            scheme="$(basename "${workspace%.xcworkspace}")"
+            xcodebuild -workspace "$workspace" -scheme "$scheme" \
+               -configuration Release -sdk iphonesimulator \
+               -derivedDataPath ios/build-smoke CODE_SIGNING_ALLOWED=NO build
+            grep -qF "edge-intelligence-sdk" ios/Podfile.lock
+            find ios/build-smoke/Build/Products/Release-iphonesimulator \
+              -path "*/Frameworks/el_ffi.framework/el_ffi" -type f \
+              -print -quit | grep -F "el_ffi.framework/el_ffi"
+          fi
+      - name: Enable KVM
+        if: matrix.platform == 'android'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run Android local-session smoke
+        if: matrix.platform == 'android'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: |
+            adb install -r expo-smoke/android/app/build/outputs/apk/release/app-release.apk
+            adb logcat -c
+            adb shell monkey -p com.tovli.edgeintelligence.example 1
+            for _ in $(seq 1 60); do
+              adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+              if adb shell cat /sdcard/window.xml 2>/dev/null \
+                | grep -qF "Edge Intelligence native bridge loaded."; then
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "Local-session success UI was not found; logcat follows." >&2
+            adb logcat -d
+            exit 1
+
   # ── Stage 3: Publish (serialized: crates → npm → pub) ─────────────────────
   # crates.io is immutable, so it must be the LAST thing validated before the
-  # first publish — gate it on BOTH assembly jobs (which include the pub.dev
-  # dry-run and npm package assembly). Each registry then gates on the previous
-  # one: if crates fails, npm and pub are not touched; if npm fails, pub is not.
-  # publish-crates → assemble-{npm,dart} transitively covers all build jobs.
+  # first publish. Gate it on both package assemblies and the Expo native smoke
+  # job; each registry then gates on the previous one. If crates fails, npm and
+  # pub are not touched; if npm fails, pub is not touched.
 
   publish-crates:
+    if: github.event_name == 'push'
     name: Publish → crates.io
-    needs: [verify, assemble-npm, assemble-dart]
+    needs: [verify, assemble-npm, assemble-dart, smoke-expo-native-module]
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.verify.outputs.version }}
@@ -590,6 +717,7 @@ jobs:
         run: bash scripts/publish-crates.sh
 
   publish-npm:
+    if: github.event_name == 'push'
     name: Publish → npmjs.com
     needs: [publish-crates, assemble-npm]
     runs-on: ubuntu-latest
@@ -612,6 +740,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-pub:
+    if: github.event_name == 'push'
     name: Publish → pub.dev
     needs: [publish-npm, assemble-dart]
     runs-on: ubuntu-latest

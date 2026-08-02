@@ -1,0 +1,25 @@
+rust:
+  directory: ..
+  manifestPath: crates/adapters/el-ffi/Cargo.toml
+bindings:
+  cpp: src/rn/cpp
+  ts: src/rn
+android:
+  directory: android
+  apiLevel: 24
+  jniLibs: src/main/jniLibs
+  useSharedLibrary: true
+ios:
+  directory: ios
+turboModule:
+  cpp: src/rn/cpp
+  ts: src/rn
+  spec: EdgeIntelligenceSdk
+  entrypoint: src/rn/native.ts
+noOverwrite:
+  - "*.podspec"
+  - android/build.gradle
+  - android/proguard-rules.pro
+  - android/src/main/AndroidManifest.xml
+  - src/rn/index.ts
+  - src/rn/index.d.ts

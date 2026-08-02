@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "name": "Edge Intelligence Example",
+    "slug": "edge-intelligence-example",
+    "android": {
+      "package": "com.tovli.edgeintelligence.example"
+    },
+    "ios": {
+      "bundleIdentifier": "com.tovli.edgeintelligence.example"
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "noEmit": true,
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "customConditions": ["react-native"],
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "files": [
+    "src/rn/index.ts",
+    "src/rn/index.d.ts",
+    "typecheck/rn-public-api.ts"
+  ]
+}

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Validate CI dependencies that are easy to accidentally leave implicit."""
 
+from __future__ import annotations
+
 from pathlib import Path
 import re
 import sys
@@ -12,6 +14,12 @@ WORKFLOWS = [
 ]
 
 RN_RETRY_COMMAND = "bash scripts/retry-command.sh make codegen-rn"
+UBRN_OCCURRENCE_PATTERN = re.compile(r"uniffi-bindgen-react-native@")
+RETRY_WRAPPED_UBRN_PREFIX = re.compile(
+    r"bash\s+(?:\.\./)?scripts/retry-command\.sh\s+"
+    r"(?:npm\s+(?:install|i)\s+(?:--global|-g)|npx\s+(?:--yes|-y))\s*$"
+)
+UBRN_NPX_PREFIX = re.compile(r"npx\s+(?:--yes|-y)\s*$")
 WASM_RETRY_COMMAND = "bash scripts/retry-command.sh curl -fsSL"
 BINDINGS_UPLOAD_IF = "if: github.event_name != 'pull_request'"
 DART_FRB_STALENESS_CHECK = (
@@ -39,6 +47,16 @@ REQUIRED_INSTALLS = [
 ]
 
 
+def workflow_job_body(text: str, job_name: str) -> str | None:
+    """Return one top-level workflow job without depending on its successor."""
+    match = re.search(
+        rf"(?ms)^  {re.escape(job_name)}:\s*\n"
+        rf"(.*?)(?=^  [A-Za-z0-9_-]+:\s*$|\Z)",
+        text,
+    )
+    return match.group(1) if match else None
+
+
 def check_workflow(path: Path) -> list[str]:
     text = path.read_text(encoding="utf-8")
     errors: list[str] = []
@@ -62,6 +80,14 @@ def check_workflow(path: Path) -> list[str]:
 
     if rn_codegen_pos >= 0 and RN_RETRY_COMMAND not in text:
         errors.append(f"{path}: React Native codegen must run through retry wrapper")
+    for invocation in UBRN_OCCURRENCE_PATTERN.finditer(text):
+        prefix = text[max(0, invocation.start() - 512) : invocation.start()]
+        if RETRY_WRAPPED_UBRN_PREFIX.search(prefix):
+            continue
+        if UBRN_NPX_PREFIX.search(prefix):
+            errors.append(f"{path}: UBRN npx invocation must run through retry wrapper")
+        else:
+            errors.append(f"{path}: UBRN installation must run through retry wrapper")
 
     if "aarch64-linux-android" in text:
         for mobile_build_requirement in (
@@ -116,11 +142,58 @@ def check_workflow(path: Path) -> list[str]:
             errors.append(f"{path}: missing Flutter iOS package verification job")
         if "Run Flutter iOS package smoke build" not in text:
             errors.append(f"{path}: missing Flutter iOS simulator smoke build")
-        parts = text.split("  assemble-dart:", 1)
-        if len(parts) < 2:
+        assemble_npm = workflow_job_body(text, "assemble-npm")
+        if assemble_npm is None:
+            errors.append(f"{path}: missing assemble-npm job")
+        else:
+            generation_pos = assemble_npm.find("generate jsi turbo-module")
+            if generation_pos < 0:
+                errors.append(f"{path}: npm assembly missing turbo-module generation step")
+            else:
+                for required_input in (
+                    "test -s src/rn/el_ffi.ts",
+                    "test -s src/rn/cpp/el_ffi.cpp",
+                    "test -s src/rn/cpp/el_ffi.hpp",
+                    "test ! -f android/proguard-rules.pro",
+                    "node-version: '22.13'",
+                    "uses: dtolnay/rust-toolchain@stable",
+                    "uses: Swatinem/rust-cache@v2",
+                ):
+                    if required_input not in assemble_npm:
+                        errors.append(
+                            f"{path}: npm assembly missing {required_input!r}"
+                        )
+                    elif required_input.startswith("test -s src/rn/"):
+                        if assemble_npm.find(required_input) > generation_pos:
+                            errors.append(
+                                f"{path}: npm assembly must validate downloaded "
+                                f"{required_input.removeprefix('test -s ')} before turbo-module generation"
+                            )
+                for generated_output in (
+                    "test -f android/src/main/java/com/edgeintelligence/EdgeIntelligenceSdkModule.java",
+                    "test -f ios/EdgeIntelligenceSdk.mm",
+                    "test -f src/rn/native.ts",
+                    "test -f src/rn/NativeEdgeIntelligenceSdk.ts",
+                ):
+                    if generated_output not in assemble_npm:
+                        errors.append(
+                            f"{path}: npm assembly missing generated output "
+                            f"{generated_output.removeprefix('test -f ')}"
+                        )
+                    elif assemble_npm.find(generated_output) < generation_pos:
+                        errors.append(
+                            f"{path}: npm assembly validates generated output "
+                            f"{generated_output.removeprefix('test -f ')} before generation"
+                        )
+        expo_smoke = workflow_job_body(text, "smoke-expo-native-module")
+        if expo_smoke is None:
+            errors.append(f"{path}: missing smoke-expo-native-module job")
+        elif "lib/x86_64/libel_ffi.so" not in expo_smoke:
+            errors.append(f"{path}: Expo Android smoke must assert the x86_64 Rust library")
+        assemble_dart = workflow_job_body(text, "assemble-dart")
+        if assemble_dart is None:
             errors.append(f"{path}: missing assemble-dart job")
             return errors
-        assemble_dart = parts[1].split("\n  publish-crates:", 1)[0]
         for artifact in PUB_DESKTOP_ARTIFACTS + PUB_MOBILE_ARTIFACTS:
             if artifact not in assemble_dart:
                 errors.append(f"{path}: pub.dev assembly must include {artifact}")
@@ -230,7 +303,7 @@ def main() -> int:
         print("\n".join(errors), file=sys.stderr)
         return 1
 
-    print("OK: CI workflows guard Dart codegen tools and retry external codegen downloads")
+    print("OK: CI workflows guard tool dependencies and retry external downloads")
     return 0
 
 

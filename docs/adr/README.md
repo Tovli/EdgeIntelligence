@@ -28,6 +28,7 @@ the `adr-patterns` namespace.
 | [022](./ADR-022-two-tier-quantized-kv-cache-with-attention-aware-eviction.md) | Two-tier quantized KV cache with attention-aware eviction | proposed | memory, runtime, performance, on-device, follow-up, P0 |
 | [023](./ADR-023-baseline-performance-instrumentation.md) | Baseline performance instrumentation | proposed | telemetry, performance, testing, follow-up, P0 |
 | [024](./ADR-024-dart-only-platform-agnostic-pub-dev-sdk.md) | Dart-first pub.dev SDK with Flutter mobile runtimes | accepted | dart, flutter, pub.dev, bindings, packaging, platform-agnostic |
+| [025](./ADR-025-react-native-expo-autolink-ready-native-distribution.md) | Expo-autolink-ready React Native native distribution | accepted | react-native, expo, npm, packaging, jsi, bindings |
 
 ## Decision relationships
 
@@ -67,6 +68,9 @@ flowchart LR
     A023 -. measures .-> A021
     A023 -. measures .-> A022
     A011[011 Multi-registry release CI] -. pub.dev identity amended by .-> A024
+    A001 --> A025[025 Expo/autolink-ready RN distribution]
+    A011 --> A025
+    A024 -. separate Dart package .-> A025
 ```
 
 > **ADR-008 is foundational** (the language decision) and drives the revisions to

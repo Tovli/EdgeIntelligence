@@ -1,0 +1,13 @@
+* text=auto
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+*.gradle text eol=lf
+*.podspec text eol=lf
+*.pro text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.png binary

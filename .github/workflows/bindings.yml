@@ -9,6 +9,7 @@ on:
       - 'crates/el-runtime/**'
       - 'crates/adapters/el-engine-candle/**'
       - 'packaging/dart/**'
+      - 'packaging/npm/**'
       - '.cargo/config.toml'
       - 'Makefile'
       - 'scripts/build-ios-xcframework.sh'
@@ -16,9 +17,11 @@ on:
       - 'scripts/install-cargo-tool.sh'
       - 'scripts/retry-command.sh'
       - 'tests/check_ci_workflows.py'
+      - 'tests/test_react_native_package_contract.py'
       - 'tests/test-install-cargo-tool.sh'
       - 'tests/test-retry-command.sh'
       - '.github/workflows/bindings.yml'
+      - '.github/workflows/release.yml'
   pull_request:
     paths:
       - 'crates/adapters/el-ffi/**'
@@ -26,6 +29,7 @@ on:
       - 'crates/el-runtime/**'
       - 'crates/adapters/el-engine-candle/**'
       - 'packaging/dart/**'
+      - 'packaging/npm/**'
       - '.cargo/config.toml'
       - 'Cargo.lock'
       - 'Cargo.toml'
@@ -35,9 +39,11 @@ on:
       - 'scripts/install-cargo-tool.sh'
       - 'scripts/retry-command.sh'
       - 'tests/check_ci_workflows.py'
+      - 'tests/test_react_native_package_contract.py'
       - 'tests/test-install-cargo-tool.sh'
       - 'tests/test-retry-command.sh'
       - '.github/workflows/bindings.yml'
+      - '.github/workflows/release.yml'
 
 jobs:
   # ── Host: compile + test el-ffi on the native target ─────────────────────
@@ -56,6 +62,8 @@ jobs:
         run: bash tests/test-retry-command.sh
       - name: Check CI workflow tool dependencies
         run: python3 tests/check_ci_workflows.py
+      - name: Check React Native package contract
+        run: python3 tests/test_react_native_package_contract.py
 
   # ── Android: aarch64-linux-android cross-compile ──────────────────────────
   android:
@@ -67,6 +75,13 @@ jobs:
         with:
           targets: armv7-linux-androideabi,aarch64-linux-android,x86_64-linux-android
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
@@ -121,7 +136,9 @@ jobs:
             target/x86_64-linux-android/release/libel_ffi.so
 
       - name: Install uniffi-bindgen-react-native
-        run: npm install --global uniffi-bindgen-react-native@0.31.0-3
+        run: >-
+          bash scripts/retry-command.sh npm install --global
+          uniffi-bindgen-react-native@0.31.0-3
       - name: Codegen — React Native (TypeScript + JSI)
         env:
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: >-
@@ -135,6 +152,50 @@ jobs:
           RANLIB_aarch64_linux_android: >-
             ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib
         run: bash scripts/retry-command.sh make codegen-rn
+      - name: Assemble React Native package for Android smoke
+        run: |
+          mkdir -p assembly/src/rn assembly/android/src/main/jniLibs/armeabi-v7a
+          mkdir -p assembly/android/src/main/jniLibs/arm64-v8a
+          mkdir -p assembly/android/src/main/jniLibs/x86_64
+          cp -R packaging/npm/. assembly/
+          cp -R out/rn/. assembly/src/rn/
+          cp target/armv7-linux-androideabi/release/libel_ffi.so \
+            assembly/android/src/main/jniLibs/armeabi-v7a/libel_ffi.so
+          cp target/aarch64-linux-android/release/libel_ffi.so \
+            assembly/android/src/main/jniLibs/arm64-v8a/libel_ffi.so
+          cp target/x86_64-linux-android/release/libel_ffi.so \
+            assembly/android/src/main/jniLibs/x86_64/libel_ffi.so
+          (
+            cd assembly
+            uniffi-bindgen-react-native generate jsi turbo-module el_ffi \
+              --native-bindings --config ubrn.config.yaml
+            python3 ../scripts/patch-ubrn-cmake.py android/CMakeLists.txt
+          )
+      - name: Run React Native package type check
+        working-directory: assembly
+        run: |
+          trap 'rm -rf node_modules' EXIT
+          bash ../scripts/retry-command.sh npm install --ignore-scripts --package-lock=false
+          npx tsc --noEmit --project tsconfig.rn.json
+      - name: Run Expo Android native build smoke
+        working-directory: assembly/example-expo
+        run: |
+          # A packed install places the UBRN runtime where CMake resolves it:
+          # node_modules/edge-intelligence-sdk/android -> ../../node_modules.
+          # A file:.. fixture instead leaves CMake in the sibling assembly tree.
+          tarball="$(npm pack .. --pack-destination . --silent)"
+          npm pkg set "dependencies.edge-intelligence-sdk=file:./$tarball"
+          bash ../../scripts/retry-command.sh npm install --package-lock-only --ignore-scripts
+          bash ../../scripts/retry-command.sh npm ci
+          npx expo prebuild --platform android --no-install
+          (cd android && ./gradlew :app:assembleRelease)
+          grep -R "edge-intelligence-sdk" android/build/generated/autolinking
+          grep -R "build/generated/source/codegen/jni/CMakeLists.txt" \
+            android/build/generated/autolinking
+          unzip -l android/app/build/outputs/apk/release/app-release.apk \
+            | grep -F "lib/arm64-v8a/libel_ffi.so"
+          unzip -l android/app/build/outputs/apk/release/app-release.apk \
+            | grep -F "lib/x86_64/libel_ffi.so"
       - uses: actions/upload-artifact@v4
         if: github.event_name != 'pull_request'
         with:

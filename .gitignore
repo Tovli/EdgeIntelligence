@@ -3,6 +3,15 @@ ruvector.db
 .claude-flow/
 target/
 out/
+.gradle/
+__pycache__/
+*.py[cod]
+packaging/npm/example-expo/android/
+packaging/npm/example-expo/ios/
+packaging/npm/example-expo/node_modules/
+packaging/npm/example-expo/.expo/
+packaging/npm/example-expo/npm-debug.log*
+packaging/npm/node_modules/
 # Local model assets for the el-chat test client (downloaded, not committed).
 models/
 # Claude Code local state (worktrees, settings.local.json)

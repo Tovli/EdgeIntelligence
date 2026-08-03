@@ -17,6 +17,7 @@ on:
       - 'scripts/install-cargo-tool.sh'
       - 'scripts/retry-command.sh'
       - 'tests/check_ci_workflows.py'
+      - 'tests/test_dart_package_contract.py'
       - 'tests/test_react_native_package_contract.py'
       - 'tests/test-install-cargo-tool.sh'
       - 'tests/test-retry-command.sh'
@@ -39,6 +40,7 @@ on:
       - 'scripts/install-cargo-tool.sh'
       - 'scripts/retry-command.sh'
       - 'tests/check_ci_workflows.py'
+      - 'tests/test_dart_package_contract.py'
       - 'tests/test_react_native_package_contract.py'
       - 'tests/test-install-cargo-tool.sh'
       - 'tests/test-retry-command.sh'
@@ -62,6 +64,8 @@ jobs:
         run: bash tests/test-retry-command.sh
       - name: Check CI workflow tool dependencies
         run: python3 tests/check_ci_workflows.py
+      - name: Check Dart package contract
+        run: python3 tests/test_dart_package_contract.py
       - name: Check React Native package contract
         run: python3 tests/test_react_native_package_contract.py
 

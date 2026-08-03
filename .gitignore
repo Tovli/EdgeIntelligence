@@ -12,6 +12,7 @@ packaging/npm/example-expo/node_modules/
 packaging/npm/example-expo/.expo/
 packaging/npm/example-expo/npm-debug.log*
 packaging/npm/node_modules/
+packaging/dart/ios/edge_intelligence/Frameworks/el_ffi.xcframework/
 # Local model assets for the el-chat test client (downloaded, not committed).
 models/
 # Claude Code local state (worktrees, settings.local.json)

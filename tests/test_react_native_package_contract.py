@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import importlib.util
 from pathlib import Path
+import re
+import shutil
+import subprocess
 import tempfile
 
 
@@ -205,6 +208,10 @@ def test_expo_fixture_targets_current_supported_host() -> None:
     assert lock["packages"]["node_modules/expo"]["version"] == "57.0.9"
     assert lock["packages"]["node_modules/react-native"]["version"] == "0.86.0"
     assert "Edge Intelligence native bridge loaded." in app
+    smoke_script = (
+        ROOT / "scripts" / "expo-android-local-session-smoke.sh"
+    ).read_text(encoding="utf-8")
+    assert "Edge Intelligence native bridge loaded." in smoke_script
     assert "release smoke fixture" in app
     assert "export const sdk" not in app
     assert '"plugins"' not in app_config
@@ -219,6 +226,42 @@ def test_expo_fixture_targets_current_supported_host() -> None:
     assert "bash ../scripts/retry-command.sh npm ci" in workflow
     assert "Run React Native package type check" in workflow
     assert "npx tsc --noEmit --project tsconfig.rn.json" in workflow
+
+
+def test_expo_ios_smoke_selects_only_top_level_workspace() -> None:
+    checker = load_ci_checker()
+    workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    expo_smoke = checker.workflow_job_body(workflow, "smoke-expo-native-module")
+    assert expo_smoke is not None
+    assert "ios/*.xcworkspace" in expo_smoke
+    assert "find ios -name '*.xcworkspace'" not in expo_smoke
+
+
+def test_android_emulator_runner_receives_a_single_command() -> None:
+    checker = load_ci_checker()
+    workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    expo_smoke = checker.workflow_job_body(workflow, "smoke-expo-native-module")
+    assert expo_smoke is not None
+    emulator_step = expo_smoke.split(
+        "uses: reactivecircus/android-emulator-runner@v2", 1
+    )[1]
+    scalar = re.search(r"(?m)^\s+script:\s*(\S.*?)\s*$", emulator_step)
+    assert scalar is not None
+    command = scalar.group(1)
+    assert command == "sh scripts/expo-android-local-session-smoke.sh"
+    assert "\r" not in command and "\n" not in command
+
+    smoke_script = ROOT / "scripts" / "expo-android-local-session-smoke.sh"
+    assert smoke_script.is_file()
+    shell = shutil.which("sh")
+    if shell:
+        syntax_check = subprocess.run(
+            [shell, "-n", str(smoke_script)],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        assert syntax_check.returncode == 0, syntax_check.stderr
 
 
 def test_documentation_uses_generated_typescript_names() -> None:

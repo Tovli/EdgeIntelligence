@@ -96,6 +96,9 @@ jobs:
       - name: Check CI workflow tool dependencies
         run: python3 tests/check_ci_workflows.py
 
+      - name: Check Dart package contract
+        run: python3 tests/test_dart_package_contract.py
+
       - name: Check React Native package contract
         run: python3 tests/test_react_native_package_contract.py
 
@@ -365,17 +368,35 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: ios-xcframework
-          path: assembly/ios/Frameworks/
+          path: assembly/ios/edge_intelligence/Frameworks/
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
+      - name: Verify Flutter iOS native artifact layout
+        run: test -d ios/edge_intelligence/Frameworks/el_ffi.xcframework
+        working-directory: assembly/
+      - name: Configure Flutter iOS CocoaPods smoke
+        run: flutter config --no-enable-swift-package-manager
       - name: Resolve Flutter example dependencies
         run: flutter pub get
         working-directory: assembly/example/
-      - name: Run Flutter iOS package smoke build
-        run: flutter build ios --simulator --debug
+      - name: Run Flutter iOS CocoaPods package smoke build
+        run: |
+          flutter build ios --simulator --debug
+          test -f build/ios/iphonesimulator/Runner.app/Frameworks/el_ffi.framework/el_ffi
         working-directory: assembly/example/
+      - name: Run Flutter iOS SwiftPM package smoke build
+        run: |
+          flutter config --enable-swift-package-manager
+          flutter clean
+          flutter pub get
+          flutter build ios --simulator --debug
+          test -f build/ios/iphonesimulator/Runner.app/Frameworks/el_ffi.framework/el_ffi
+        working-directory: assembly/example/
+      - name: Restore Flutter SwiftPM configuration
+        if: always()
+        run: flutter config --enable-swift-package-manager
 
   # ── Stage 2b: Assemble distribution packages ──────────────────────────────
   # Both assembly jobs wait for the native build jobs so each package contains
@@ -513,14 +534,14 @@ jobs:
           mkdir -p assembly/android/src/main/jniLibs/armeabi-v7a
           mkdir -p assembly/android/src/main/jniLibs/arm64-v8a
           mkdir -p assembly/android/src/main/jniLibs/x86_64
-          mkdir -p assembly/ios/Frameworks
+          mkdir -p assembly/ios/edge_intelligence/Frameworks
           cp native-artifacts/linux/x64/libel_ffi.so assembly/lib/native/linux/x64/libel_ffi.so
           cp native-artifacts/macos/libel_ffi.dylib assembly/lib/native/macos/libel_ffi.dylib
           cp native-artifacts/windows/x64/el_ffi.dll assembly/lib/native/windows/x64/el_ffi.dll
           cp native-artifacts/android/armeabi-v7a/libel_ffi.so assembly/android/src/main/jniLibs/armeabi-v7a/libel_ffi.so
           cp native-artifacts/android/arm64-v8a/libel_ffi.so assembly/android/src/main/jniLibs/arm64-v8a/libel_ffi.so
           cp native-artifacts/android/x86_64/libel_ffi.so assembly/android/src/main/jniLibs/x86_64/libel_ffi.so
-          cp -R native-artifacts/ios/el_ffi.xcframework assembly/ios/Frameworks/el_ffi.xcframework
+          cp -R native-artifacts/ios/el_ffi.xcframework assembly/ios/edge_intelligence/Frameworks/el_ffi.xcframework
       - name: Assert native library artifacts are non-empty
         run: |
           python3 - <<'PY'
@@ -654,8 +675,10 @@ jobs:
               | grep -F "lib/x86_64/libel_ffi.so"
           else
             (cd ios && pod install)
-            workspace="$(find ios -name '*.xcworkspace' -print -quit)"
-            scheme="$(basename "${workspace%.xcworkspace}")"
+            workspaces=(ios/*.xcworkspace)
+            workspace="${workspaces[0]}"
+            test -d "$workspace"
+            scheme="$(basename "$workspace" .xcworkspace)"
             xcodebuild -workspace "$workspace" -scheme "$scheme" \
                -configuration Release -sdk iphonesimulator \
                -derivedDataPath ios/build-smoke CODE_SIGNING_ALLOWED=NO build
@@ -679,21 +702,7 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: |
-            adb install -r expo-smoke/android/app/build/outputs/apk/release/app-release.apk
-            adb logcat -c
-            adb shell monkey -p com.tovli.edgeintelligence.example 1
-            for _ in $(seq 1 60); do
-              adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
-              if adb shell cat /sdcard/window.xml 2>/dev/null \
-                | grep -qF "Edge Intelligence native bridge loaded."; then
-                exit 0
-              fi
-              sleep 2
-            done
-            echo "Local-session success UI was not found; logcat follows." >&2
-            adb logcat -d
-            exit 1
+          script: sh scripts/expo-android-local-session-smoke.sh
 
   # ── Stage 3: Publish (serialized: crates → npm → pub) ─────────────────────
   # crates.io is immutable, so it must be the LAST thing validated before the

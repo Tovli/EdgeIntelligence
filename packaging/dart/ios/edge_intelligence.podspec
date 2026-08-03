@@ -9,7 +9,7 @@ Precompiled Rust runtime used by the framework-neutral Edge Intelligence Dart AP
   s.license          = { :file => '../LICENSE' }
   s.author           = { 'Tovli' => 'opensource@tovli.com' }
   s.source           = { :path => '.' }
-  s.vendored_frameworks = 'Frameworks/el_ffi.xcframework'
+  s.vendored_frameworks = 'edge_intelligence/Frameworks/el_ffi.xcframework'
   s.dependency 'Flutter'
   s.platform = :ios, '13.0'
   s.pod_target_xcconfig = {

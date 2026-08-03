@@ -140,8 +140,12 @@ def check_workflow(path: Path) -> list[str]:
             errors.append(f"{path}: pub.dev publishing must run in Flutter context")
         if "verify-flutter-ios:" not in text:
             errors.append(f"{path}: missing Flutter iOS package verification job")
-        if "Run Flutter iOS package smoke build" not in text:
-            errors.append(f"{path}: missing Flutter iOS simulator smoke build")
+        for smoke_name in (
+            "Run Flutter iOS CocoaPods package smoke build",
+            "Run Flutter iOS SwiftPM package smoke build",
+        ):
+            if smoke_name not in text:
+                errors.append(f"{path}: missing {smoke_name}")
         assemble_npm = workflow_job_body(text, "assemble-npm")
         if assemble_npm is None:
             errors.append(f"{path}: missing assemble-npm job")
@@ -217,7 +221,7 @@ def check_workflow(path: Path) -> list[str]:
             "assembly/android/src/main/jniLibs/armeabi-v7a/libel_ffi.so",
             "assembly/android/src/main/jniLibs/arm64-v8a/libel_ffi.so",
             "assembly/android/src/main/jniLibs/x86_64/libel_ffi.so",
-            "assembly/ios/Frameworks/el_ffi.xcframework",
+            "assembly/ios/edge_intelligence/Frameworks/el_ffi.xcframework",
         )
         for mobile_path in required_mobile_paths:
             if mobile_path not in assemble_dart:

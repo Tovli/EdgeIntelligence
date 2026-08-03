@@ -23,7 +23,7 @@ let package = Package(
         ),
         .binaryTarget(
             name: "el_ffi",
-            path: "../Frameworks/el_ffi.xcframework"
+            path: "Frameworks/el_ffi.xcframework"
         )
     ]
 )

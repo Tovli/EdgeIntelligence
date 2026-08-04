@@ -37,7 +37,7 @@
     "LICENSE"
   ],
   "codegenConfig": {
-    "name": "EdgeIntelligenceSdk",
+    "name": "EdgeIntelligenceSdkSpec",
     "type": "modules",
     "jsSrcsDir": "src/rn",
     "android": {

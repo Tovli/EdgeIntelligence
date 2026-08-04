@@ -61,6 +61,26 @@ def test_package_declares_generated_runtime_dependencies() -> None:
         )
 
 
+def test_rust_uniffi_matches_ubrn_codegen_abi() -> None:
+    metadata = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert metadata.returncode == 0, metadata.stderr
+
+    packages = json.loads(metadata.stdout)["packages"]
+    ffi = next(package for package in packages if package["name"] == "el-ffi")
+    uniffi = next(
+        dependency for dependency in ffi["dependencies"] if dependency["name"] == "uniffi"
+    )
+    expected_uniffi = UBRN_VERSION.rsplit("-", 1)[0]
+
+    assert uniffi["req"] == f"={expected_uniffi}"
+
+
 def test_adr_matches_the_expo_autolinking_dependency_contract() -> None:
     adr = ADR.read_text(encoding="utf-8")
     normalized = " ".join(adr.split())
@@ -78,10 +98,15 @@ def test_package_codegen_names_match_ubrn_turbo_module() -> None:
         encoding="utf-8"
     )
 
-    assert package["codegenConfig"]["name"] == "EdgeIntelligenceSdk"
+    codegen_name = package["codegenConfig"]["name"]
+    configured_spec = re.search(r"(?m)^\s+spec:\s+(\S+)\s*$", config)
+    assert configured_spec is not None
+    assert codegen_name == "EdgeIntelligenceSdkSpec"
+    module_name = codegen_name.removesuffix("Spec")
+    assert module_name == "EdgeIntelligenceSdk"
+    assert configured_spec.group(1) == codegen_name
     assert "outputDir" not in package["codegenConfig"]
     assert "cmakeListsPath" not in react_native_config
-    assert "spec: EdgeIntelligenceSdk" in config
     assert "entrypoint: src/rn/native.ts" in config
     assert "android/build.gradle" in config
     assert "android/src/main/AndroidManifest.xml" in config
@@ -91,7 +116,7 @@ def test_package_codegen_names_match_ubrn_turbo_module() -> None:
     gradle = (PACKAGE / "android" / "build.gradle").read_text(encoding="utf-8")
     assert 'apply plugin: "com.facebook.react"' in gradle
     assert 'path "CMakeLists.txt"' in gradle
-    assert 'libraryName = "EdgeIntelligenceSdk"' in gradle
+    assert f'libraryName = "{module_name}"' in gradle
     assert "JavaVersion.VERSION_17" in gradle
     assert "crates/ubrn_cli/src/jsi/android/codegen.rs:32-40" in gradle
     assert "kotlin" not in gradle.lower()

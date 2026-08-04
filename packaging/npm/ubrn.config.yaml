@@ -14,7 +14,7 @@ ios:
 turboModule:
   cpp: src/rn/cpp
   ts: src/rn
-  spec: EdgeIntelligenceSdk
+  spec: EdgeIntelligenceSdkSpec
   entrypoint: src/rn/native.ts
 noOverwrite:
   - "*.podspec"

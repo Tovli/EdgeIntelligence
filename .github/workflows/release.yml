@@ -342,19 +342,22 @@ jobs:
         run: |
           git ls-files --error-unmatch crates/adapters/el-ffi/src/frb_generated.rs
           git diff --exit-code -- crates/adapters/el-ffi/src/frb_generated.rs
-      - name: Resolve Flutter plugin dependencies
-        run: flutter pub get --no-example
-        working-directory: out/dart
       - name: Stamp pub.dev version from tag
         run: |
           sed -i "s/^version: .*/version: $VERSION/" pubspec.yaml
           printf '# Changelog\n\n## %s\n\n- Release %s.\n' "$VERSION" "$VERSION" > CHANGELOG.md
         working-directory: out/dart
+      - name: Stage Dart validation workspace
+        run: cp -R out/dart validation
+      - name: Resolve Flutter plugin dependencies
+        run: flutter pub get --no-example
+        working-directory: validation/
       - uses: actions/upload-artifact@v4
         with:
           name: dart-bindings
           path: out/dart/
           if-no-files-found: error
+          include-hidden-files: true
 
   verify-flutter-ios:
     name: Verify Flutter iOS package
@@ -566,10 +569,6 @@ jobs:
           if errors:
               raise SystemExit("\n".join(["Native library size check failed:"] + errors))
           PY
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
       - name: Assert pub.dev package includes README.md
         run: bash scripts/assert-release-readmes.sh pub assembly
       - name: Check pub.dev package size
@@ -591,36 +590,49 @@ jobs:
               )
           PY
         working-directory: assembly/
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Stage pub.dev validation workspace
+        run: cp -R assembly validation
       - name: Resolve Flutter plugin dependencies
         run: flutter pub get --no-example
-        working-directory: assembly/
+        working-directory: validation/
       - name: Run Dart package runtime smoke tests
         run: |
           dart test test/packaged_runtime_smoke_test.dart
           mv lib/native/linux/x64/libel_ffi.so lib/native/linux/x64/libel_ffi.so.missing
           trap 'mv lib/native/linux/x64/libel_ffi.so.missing lib/native/linux/x64/libel_ffi.so' EXIT
           dart test test/missing_runtime_test.dart
-        working-directory: assembly/
+        working-directory: validation/
       - name: Run Flutter example tests
         run: |
           flutter pub get
           flutter analyze
           flutter test
-        working-directory: assembly/example/
+        working-directory: validation/example/
       - name: Run Flutter Android package smoke build
         run: |
           flutter build apk --debug --target-platform android-arm,android-arm64,android-x64
           unzip -l build/app/outputs/flutter-apk/app-debug.apk | grep 'lib/armeabi-v7a/libel_ffi.so'
           unzip -l build/app/outputs/flutter-apk/app-debug.apk | grep 'lib/arm64-v8a/libel_ffi.so'
           unzip -l build/app/outputs/flutter-apk/app-debug.apk | grep 'lib/x86_64/libel_ffi.so'
-        working-directory: assembly/example/
+        working-directory: validation/example/
+      - name: Stage pub.dev dry-run workspace
+        run: cp -R assembly dry-run
+      - name: Resolve pub.dev dry-run dependencies
+        run: flutter pub get --no-example
+        working-directory: dry-run/
       - name: flutter pub publish --dry-run (validation gate)
         run: flutter pub publish --dry-run
-        working-directory: assembly/
+        working-directory: dry-run/
       - uses: actions/upload-artifact@v4
         with:
           name: pub-package
           path: assembly/
+          if-no-files-found: error
+          include-hidden-files: true
 
   smoke-expo-native-module:
     name: Expo ${{ matrix.platform }} native-module smoke

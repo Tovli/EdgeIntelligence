@@ -279,3 +279,4 @@ jobs:
         with:
           name: dart-bindings
           path: out/dart/
+          include-hidden-files: true

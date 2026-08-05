@@ -85,12 +85,13 @@ codegen-dart:
 	@mkdir -p $(OUT)/dart/lib/src
 	@rm -rf $(OUT)/dart/android $(OUT)/dart/ios $(OUT)/dart/example
 	@cp packaging/dart/pubspec.yaml $(OUT)/dart/pubspec.yaml
+	@cp packaging/dart/.gitignore $(OUT)/dart/.gitignore
 	@cp LICENSE $(OUT)/dart/LICENSE
 	@cp packaging/dart/README.md $(OUT)/dart/README.md
 	@cp packaging/dart/lib/edge_intelligence.dart $(OUT)/dart/lib/edge_intelligence.dart
 	@cp -R packaging/dart/android $(OUT)/dart/android
 	@cp -R packaging/dart/ios $(OUT)/dart/ios
-	@cp -R packaging/dart/example $(OUT)/dart/example
+	@python3 scripts/stage_dart_example.py packaging/dart $(OUT)/dart
 	@cp -R packaging/dart/test $(OUT)/dart/test
 	@printf '%s\n' \
 		'# Changelog' \

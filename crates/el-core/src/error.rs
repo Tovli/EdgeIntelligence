@@ -18,6 +18,10 @@ pub enum EdgeError {
     },
     /// The static memory plan exceeds the configured budget (ADR-003).
     MemoryBudgetExceeded { requested: u64, budget: u64 },
+    /// A requested model profile is unavailable on this host or capability tier.
+    UnsupportedCapability(&'static str),
+    /// A GGUF declares a transformer family the selected profile cannot load.
+    UnsupportedArchitecture(Box<str>),
     /// A network egress was attempted while air-gapped (ADR-004).
     AirGapViolation,
     /// Engine/adapter failure (message is a static descriptor, not user data).
@@ -45,6 +49,13 @@ impl fmt::Display for EdgeError {
                     "memory plan needs {requested} bytes > budget {budget} (ADR-003)"
                 )
             }
+            EdgeError::UnsupportedCapability(reason) => {
+                write!(f, "unsupported capability: {reason}")
+            }
+            EdgeError::UnsupportedArchitecture(architecture) => write!(
+                f,
+                "unsupported GGUF architecture: {architecture} (supported: qwen2, qwen3)"
+            ),
             EdgeError::AirGapViolation => {
                 write!(f, "network egress attempted while air-gapped (ADR-004)")
             }

@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use el_core::{ChatMessage, ChatRequest, LlmProvider};
-use el_engine_candle::QwenChatProvider;
+use el_engine_candle::{DictaLmBundlePaths, DictaLmCapability, QwenChatProvider};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -64,6 +64,8 @@ struct Task {
 struct Args {
     model: PathBuf,
     tokenizer: PathBuf,
+    dictalm_template: Option<PathBuf>,
+    dictalm_signature: Option<PathBuf>,
     tasks_dir: PathBuf,
     out: PathBuf,
     system: String,
@@ -76,6 +78,8 @@ fn parse_args() -> Result<Args, String> {
     let mut a = Args {
         model: PathBuf::from(DEFAULT_MODEL),
         tokenizer: PathBuf::from(DEFAULT_TOKENIZER),
+        dictalm_template: None,
+        dictalm_signature: None,
         tasks_dir: PathBuf::from(DEFAULT_TASKS_DIR),
         out: PathBuf::from(DEFAULT_OUT),
         system: DEFAULT_SYSTEM.to_string(),
@@ -89,6 +93,12 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--model" | "-m" => a.model = PathBuf::from(next("--model")?),
             "--tokenizer" | "-t" => a.tokenizer = PathBuf::from(next("--tokenizer")?),
+            "--dictalm-template" => {
+                a.dictalm_template = Some(PathBuf::from(next("--dictalm-template")?))
+            }
+            "--dictalm-signature" => {
+                a.dictalm_signature = Some(PathBuf::from(next("--dictalm-signature")?))
+            }
             "--tasks-dir" => a.tasks_dir = PathBuf::from(next("--tasks-dir")?),
             "--out" | "-o" => a.out = PathBuf::from(next("--out")?),
             "--system" | "-s" => a.system = next("--system")?,
@@ -113,6 +123,8 @@ fn usage() {
          OPTIONS:\n\
          \x20 -m, --model <PATH>       GGUF model file        [default: {DEFAULT_MODEL}]\n\
          \x20 -t, --tokenizer <PATH>   tokenizer.json         [default: {DEFAULT_TOKENIZER}]\n\
+         \x20     --dictalm-template <PATH>  use the pinned DictaLM 3 Qwen3 profile\n\
+         \x20     --dictalm-signature <PATH> detached signature for the DictaLM profile manifest\n\
          \x20     --tasks-dir <DIR>    dir of *.jsonl tasks   [default: {DEFAULT_TASKS_DIR}]\n\
          \x20 -o, --out <PATH>         transcript JSONL out   [default: {DEFAULT_OUT}]\n\
          \x20 -s, --system <TEXT>      system prompt under test\n\
@@ -209,7 +221,22 @@ fn main() {
     // Measure the *raw* model: the SDK's on-device safety layer (ADR-005/012,
     // on by default in the provider) is evaluated separately, so the baseline
     // benchmark must disable it to score the model itself.
-    let provider = match QwenChatProvider::from_paths(&args.model, &args.tokenizer) {
+    let loaded = match (&args.dictalm_template, &args.dictalm_signature) {
+        (Some(template), Some(signature)) => QwenChatProvider::from_dictalm_bundle(
+            DictaLmBundlePaths::new(
+                args.model.clone(),
+                args.tokenizer.clone(),
+                template.clone(),
+                signature.clone(),
+            ),
+            DictaLmCapability::high_memory(),
+        ),
+        (Some(_), None) | (None, Some(_)) => Err(el_core::EdgeError::Engine(
+            "DictaLM requires both --dictalm-template and --dictalm-signature",
+        )),
+        (None, None) => QwenChatProvider::from_paths(&args.model, &args.tokenizer),
+    };
+    let provider = match loaded {
         Ok(p) => p.with_safety(el_core::SafetyMode::Off),
         Err(e) => {
             eprintln!("\nerror: failed to load model: {e}");

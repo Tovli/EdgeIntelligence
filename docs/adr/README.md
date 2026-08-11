@@ -30,6 +30,7 @@ the `adr-patterns` namespace.
 | [024](./ADR-024-dart-only-platform-agnostic-pub-dev-sdk.md) | Dart-first pub.dev SDK with Flutter mobile runtimes | accepted | dart, flutter, pub.dev, bindings, packaging, platform-agnostic |
 | [025](./ADR-025-react-native-expo-autolink-ready-native-distribution.md) | Expo-autolink-ready React Native native distribution | accepted | react-native, expo, npm, packaging, jsi, bindings |
 | [026](./ADR-026-tokenizer-aware-qwen-local-sessions-for-react-native.md) | Tokenizer-aware Qwen local sessions for React Native | proposed | react-native, npm, qwen, tokenizer, bindings, on-device, api |
+| [027](./ADR-027-official-dictalm-3-qwen3-gguf-model-profile.md) | Official DictaLM 3.0 Qwen3 GGUF model profile | accepted | runtime, qwen3, dictalm, gguf, hebrew, supported-model, high-memory |
 
 ## Decision relationships
 
@@ -76,6 +77,11 @@ flowchart LR
     A004 --> A026
     A018 --> A026
     A025 --> A026
+    A002 --> A027[027 Official DictaLM 3 / Qwen3 support]
+    A018 --> A027
+    A003 -. high-memory gate .-> A027
+    A006 -. signed bundle .-> A027
+    A023 -. measures .-> A027
 ```
 
 > **ADR-008 is foundational** (the language decision) and drives the revisions to

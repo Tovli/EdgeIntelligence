@@ -299,17 +299,20 @@ impl LlmProvider for LocalLlmProvider {
     }
 }
 
-// ── Real Qwen2 transformer engine + chat provider (ADR-002 + ADR-010) ────────
+// ── Real Qwen2/Qwen3 transformer engine + chat provider (ADR-002 + ADR-010) ──
 //
 // Unlike `CandleEngine` (a single linear projection used as the engine-seam
-// proof) this runs a genuine Qwen2 transformer forward via `candle-transformers`
+// proof) this runs a genuine Qwen-family transformer forward via `candle-transformers`
 // with a real HuggingFace tokenizer, so it produces coherent chat. It plugs into
 // the SAME `el_runtime::InferenceSession` decode loop as every other engine —
 // nothing in the SDK pipeline is bypassed.
 
-use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
+use candle_transformers::models::{
+    quantized_qwen2::ModelWeights as Qwen2Weights, quantized_qwen3::ModelWeights as Qwen3Weights,
+};
 use el_core::{ModelId, ModelVersion};
 use el_provenance::{ModelArtifact, SignatureVerifier};
+use el_provenance_ed25519::Ed25519Verifier;
 use tokenizers::Tokenizer;
 
 // ── Opt-in benchmark instrumentation (EL_BENCH=1) ────────────────────────────
@@ -354,15 +357,62 @@ mod bench {
     }
 }
 
-/// A real Qwen2 transformer `InferenceEngine`.
+/// The transformer implementation selected by the GGUF architecture metadata.
+/// Qwen3 has different tensor requirements, so it must never be routed through
+/// the Qwen2 loader as a metadata compatibility shim.
+enum QwenWeights {
+    Qwen2(Qwen2Weights),
+    Qwen3(Qwen3Weights),
+}
+
+impl QwenWeights {
+    fn forward(&mut self, input: &Tensor, index_pos: usize) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Qwen2(model) => model.forward(input, index_pos),
+            Self::Qwen3(model) => model.forward(input, index_pos),
+        }
+    }
+
+    fn clear_kv_cache(&mut self) {
+        match self {
+            Self::Qwen2(model) => model.clear_kv_cache(),
+            Self::Qwen3(model) => model.clear_kv_cache(),
+        }
+    }
+}
+
+fn gguf_architecture_from_file(file: &mut std::fs::File) -> Result<String> {
+    use candle_core::quantized::gguf_file;
+    use std::io::{Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| EdgeError::Engine("model file is not seekable"))?;
+    let content = gguf_file::Content::read(file)
+        .map_err(|_| EdgeError::Engine("GGUF: invalid or unrecognised file"))?;
+    let architecture = content
+        .metadata
+        .get("general.architecture")
+        .and_then(|value| value.to_string().ok())
+        .cloned()
+        .ok_or(EdgeError::Engine("GGUF: missing general.architecture"));
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| EdgeError::Engine("model file is not seekable"))?;
+    architecture
+}
+
+fn gguf_architecture(path: &std::path::Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|_| EdgeError::Engine("model file not found or not readable"))?;
+    gguf_architecture_from_file(&mut file)
+}
+
+/// A real Qwen2/Qwen3 transformer `InferenceEngine`.
 ///
 /// Holds candle's stateful KV cache. Within one generation it is fed
 /// incrementally (prefill, then one new token per `next_logits` call). The engine
-/// is **loaded once and reused across conversations** (ADR-018): candle exposes no
-/// public cache-clear, but its attention *replaces* the cache on a forward at
-/// `index_pos == 0`, so [`reset_cache`](InferenceEngine::reset_cache) evicts the
-/// previous conversation's KV with a single benign position-0 forward — no engine
-/// reconstruction and no reload from disk between turns.
+/// is **loaded once and reused across conversations** (ADR-018): Candle's Qwen
+/// loaders expose `clear_kv_cache`, so [`reset_cache`](InferenceEngine::reset_cache)
+/// evicts the previous conversation without reconstructing or reloading weights.
 ///
 /// Across turns of the *same* conversation it also reuses the unchanged prefix's
 /// KV: [`prefill_reuse`](InferenceEngine::prefill_reuse) feeds only the suffix the
@@ -371,20 +421,20 @@ mod bench {
 ///
 /// A *within-generation* safety backtrack (ADR-012) is supported via
 /// [`InferenceEngine::rollback`]: candle's attention discards its cache when a
-/// forward runs at `index_pos == 0`, so we retain the prompt and replay it from
-/// position 0 to rebuild the cache for the safe prefix (the session then
+/// cache is cleared before replay, so we retain the prompt and rebuild the safe
+/// prefix (the session then
 /// re-feeds the retained committed tokens). Float logits are quantised to
 /// integer milli-logits at the seam, exactly like [`CandleEngine`], so the
 /// runtime stays float-free.
 pub struct QwenEngine {
-    model: Qwen2Weights,
+    model: QwenWeights,
     device: Device,
     /// Absolute KV position written so far (candle's `index_pos`).
     index_pos: usize,
     /// How many of the runtime-`committed` tokens have already been fed.
     fed: usize,
-    /// The prefill prompt, retained so a rollback can replay it from position 0
-    /// to rebuild candle's KV cache (which has no public truncation).
+    /// The prefill prompt, retained so a rollback can replay it after clearing
+    /// Candle's KV cache (which has no public truncation).
     prompt: Vec<Token>,
     /// The exact token sequence currently represented by the KV cache —
     /// `prompt` plus the committed tokens fed so far. Its length equals
@@ -395,7 +445,7 @@ pub struct QwenEngine {
     /// Milli-logits produced after the most recent forward.
     last_logits: Vec<i32>,
     vocab: usize,
-    eos: Token,
+    stop_tokens: Vec<Token>,
     /// Whether candle's per-layer KV cache may hold conversation-derived K/V that
     /// still needs clearing (ADR-018). Set by every `forward_one` (before the
     /// fallible model forward) and cleared **only** after a fully successful
@@ -448,16 +498,46 @@ fn apply_committed_forward_result(
 }
 
 impl QwenEngine {
-    /// Load Qwen2 weights from a consumer-supplied GGUF file.
-    pub fn from_path(path: impl AsRef<std::path::Path>, eos: Token) -> Result<Self> {
-        use candle_core::quantized::gguf_file;
-        let mut file = std::fs::File::open(path.as_ref())
+    /// Load an explicitly supported Qwen-family GGUF after inspecting its
+    /// architecture metadata. The dispatch happens before tensor allocation so
+    /// Qwen3 can never fall through to a Qwen2 loader.
+    pub fn from_path(path: impl AsRef<std::path::Path>, stop_tokens: Vec<Token>) -> Result<Self> {
+        let file = std::fs::File::open(path.as_ref())
             .map_err(|_| EdgeError::Engine("model file not found or not readable"))?;
+        Self::from_file(file, stop_tokens)
+    }
+
+    fn from_file(mut file: std::fs::File, stop_tokens: Vec<Token>) -> Result<Self> {
+        use candle_core::quantized::gguf_file;
         let content = gguf_file::Content::read(&mut file)
             .map_err(|_| EdgeError::Engine("GGUF: invalid or unrecognised file"))?;
+        let architecture = content
+            .metadata
+            .get("general.architecture")
+            .and_then(|value| value.to_string().ok())
+            .cloned()
+            .unwrap_or_else(|| "<missing>".to_string());
         let device = Device::Cpu;
-        let model = Qwen2Weights::from_gguf(content, &mut file, &device)
-            .map_err(|_| EdgeError::Engine("GGUF: failed to load Qwen2 weights"))?;
+        let model = match architecture.as_str() {
+            "qwen2" => QwenWeights::Qwen2(
+                Qwen2Weights::from_gguf(content, &mut file, &device)
+                    .map_err(|_| EdgeError::Engine("GGUF: failed to load Qwen2 weights"))?,
+            ),
+            "qwen3" => QwenWeights::Qwen3(
+                Qwen3Weights::from_gguf(content, &mut file, &device)
+                    .map_err(|_| EdgeError::Engine("GGUF: failed to load Qwen3 weights"))?,
+            ),
+            _ => {
+                return Err(EdgeError::UnsupportedArchitecture(
+                    architecture.into_boxed_str(),
+                ))
+            }
+        };
+        if stop_tokens.is_empty() {
+            return Err(EdgeError::Engine(
+                "Qwen profile must declare at least one stop token",
+            ));
+        }
         Ok(Self {
             model,
             device,
@@ -467,7 +547,7 @@ impl QwenEngine {
             cached: Vec::new(),
             last_logits: Vec::new(),
             vocab: 0,
-            eos,
+            stop_tokens,
             cache_dirty: false,
         })
     }
@@ -487,7 +567,7 @@ impl QwenEngine {
 
         let t_model = bench::enabled().then(std::time::Instant::now);
         let logits = self.model.forward(&input, self.index_pos).map_err(|_| {
-            ForwardOneError::BeforeForward(EdgeError::Engine("candle: Qwen2 forward failed"))
+            ForwardOneError::BeforeForward(EdgeError::Engine("candle: Qwen forward failed"))
         })?;
         // Candle appends to its KV cache inside `forward`, before logits are
         // extracted below. Keep the logical position aligned if extraction fails.
@@ -510,6 +590,7 @@ impl QwenEngine {
 
 impl InferenceEngine for QwenEngine {
     fn prefill(&mut self, tokens: &[Token]) -> Result<u32> {
+        self.model.clear_kv_cache();
         self.index_pos = 0;
         self.fed = 0;
         self.prompt = tokens.to_vec(); // retained for rollback replay
@@ -543,18 +624,21 @@ impl InferenceEngine for QwenEngine {
     }
 
     fn eos_token(&self) -> Token {
-        self.eos
+        self.stop_tokens[0]
+    }
+
+    fn is_stop_token(&self, token: Token) -> bool {
+        self.stop_tokens.contains(&token)
     }
 
     fn rollback(&mut self, _keep_committed: u32) -> Result<()> {
-        // candle's KV cache is append-only with no public truncation, but its
-        // attention discards the cache on a forward at `index_pos == 0` (see
-        // quantized_qwen2). So rebuild deterministically: replay the prompt from
-        // position 0 — the first forward resets the cache, the rest re-append it —
+        // Candle's KV cache has no public truncation. Clear it, then rebuild
+        // deterministically by replaying the prompt from position 0 —
         // leaving the engine in its exact post-prefill state. We reset `fed` to 0
         // so the session's next `next_logits` re-feeds the retained committed
         // prefix (already truncated to `keep_committed`) on top. Cost is bounded
         // by `max_rollbacks` (ADR-012).
+        self.model.clear_kv_cache();
         self.index_pos = 0;
         self.fed = 0;
         self.cached = Vec::with_capacity(self.prompt.len());
@@ -572,27 +656,17 @@ impl InferenceEngine for QwenEngine {
     /// loaded** (ADR-018) — the separation of conversation lifecycle from model
     /// lifecycle, and the engine half of [`InferenceSession::close`] / `reset`.
     ///
-    /// candle's `quantized_qwen2` owns its per-layer KV with no public clear API,
-    /// but its attention *ignores and replaces* the cache on a forward at
-    /// `index_pos == 0`. So one forward over a benign token (id 0) drops the prior
-    /// (user) K/V tensors — freeing that memory and clearing the user's data from
-    /// the cache (PRD line 131) — without touching the weights. What remains is a
-    /// single non-user token's KV, itself overwritten by the next prefill or freed
-    /// when the engine is dropped. Skipped when nothing has been cached yet
-    /// (`index_pos == 0`), so a pristine or already-cleared engine does no work.
+    /// Candle's Qwen loaders expose an explicit KV clear, which releases the prior
+    /// conversation's data without touching resident weights (PRD line 131).
     ///
     /// Distinct from `rollback`, which *replays* a retained prefix to rewind
     /// within a single generation. Fallible (it runs a forward); on error the
     /// caller (`reset`/`close`) leaves session state untouched and surfaces it.
     fn reset_cache(&mut self) -> Result<()> {
         if self.cache_dirty {
-            // Overwrite (and thereby drop) the user K/V by forwarding a benign
-            // token at position 0; the resulting logits are discarded. `cache_dirty`
-            // is cleared **only after** a fully successful forward — if candle
-            // fails after replacing some layers, it stays set so the next call
-            // re-clears (a partially-cleared cache is never reported as clean).
-            self.index_pos = 0;
-            self.forward_one(0).map_err(ForwardOneError::into_edge)?;
+            // Clear the user-derived K/V. `cache_dirty` is reset only after this
+            // explicit lifecycle operation completes.
+            self.model.clear_kv_cache();
             self.cache_dirty = false;
         }
         self.index_pos = 0;
@@ -635,12 +709,12 @@ impl InferenceEngine for QwenEngine {
                 self.cached.push(t);
             }
         } else {
-            // Divergence (or a shorter context): rebuild from scratch. Setting
-            // `index_pos = 0` makes the first `forward_one` discard candle's old
-            // cache, exactly as a fresh `prefill` would. Clear `last_logits` first
+            // Divergence (or a shorter context): clear then rebuild from scratch.
+            // Clear `last_logits` first
             // so an *empty* `full_context` leaves no stale distribution behind —
             // matching `reset_cache()` + `prefill(&[])`; a non-empty context
             // overwrites it in the loop.
+            self.model.clear_kv_cache();
             self.index_pos = 0;
             self.cached = Vec::with_capacity(full_context.len());
             self.last_logits = Vec::new();
@@ -851,7 +925,7 @@ impl QwenExpert {
         prompt: &[Token],
         permit: LoadPermit,
     ) -> Result<Self> {
-        let mut engine = QwenEngine::from_path(path, eos)?;
+        let mut engine = QwenEngine::from_path(path, vec![eos])?;
         engine.prefill(prompt)?;
         let init_vocab = engine.vocab;
         Ok(Self {
@@ -959,6 +1033,201 @@ enum ChatSession {
     Swapping,
 }
 
+/// The immutable asset identity and capability policy for the official
+/// DictaLM 3.0 Q4_K_M profile (ADR-027).  The profile is intentionally narrow:
+/// callers cannot accidentally present an arbitrary Qwen3 GGUF as DictaLM.
+pub struct DictaLmBundlePaths {
+    pub model: std::path::PathBuf,
+    pub tokenizer: std::path::PathBuf,
+    pub chat_template: std::path::PathBuf,
+    /// Detached Ed25519 signature over the canonical profile manifest.
+    pub manifest_signature: std::path::PathBuf,
+}
+
+/// Host-provided, explicit admission evidence for the first DictaLM device
+/// tier. It must be checked before opening/parsing model tensors: SessionConfig
+/// alone is created too late to protect the loader from an over-sized artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DictaLmCapability {
+    pub high_end: bool,
+    pub memory_budget_bytes: u64,
+}
+
+impl DictaLmCapability {
+    pub const fn high_memory() -> Self {
+        Self {
+            high_end: true,
+            memory_budget_bytes: DICTALM_HIGH_MEMORY_BUDGET,
+        }
+    }
+
+    fn validate(self) -> Result<()> {
+        if !self.high_end {
+            return Err(EdgeError::UnsupportedCapability(
+                "DictaLM requires the HighEnd device tier",
+            ));
+        }
+        if self.memory_budget_bytes < DICTALM_HIGH_MEMORY_BUDGET {
+            return Err(EdgeError::MemoryBudgetExceeded {
+                requested: DICTALM_HIGH_MEMORY_BUDGET,
+                budget: self.memory_budget_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl DictaLmBundlePaths {
+    pub fn new(
+        model: impl Into<std::path::PathBuf>,
+        tokenizer: impl Into<std::path::PathBuf>,
+        chat_template: impl Into<std::path::PathBuf>,
+        manifest_signature: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            model: model.into(),
+            tokenizer: tokenizer.into(),
+            chat_template: chat_template.into(),
+            manifest_signature: manifest_signature.into(),
+        }
+    }
+}
+
+const DICTALM_MODEL_BYTES: u64 = 1_107_404_704;
+const DICTALM_MODEL_SHA256: &str =
+    "68998faec0aee53a93ba116dd0a89e9857092a3e693578aff52502148a3d6707";
+const DICTALM_TOKENIZER_BYTES: u64 = 11_422_648;
+const DICTALM_TOKENIZER_SHA256: &str =
+    "3c3dfe474a8bbe89b0e83627fd9ff784ad71027f12fd8c618708c818e808789d";
+const DICTALM_TEMPLATE_BYTES: u64 = 3_435;
+const DICTALM_TEMPLATE_SHA256: &str =
+    "00d3026f698ff7f844f9b489b1491b5423ed872b2e5bd7e68b0596c53f7ed784";
+const DICTALM_SIGNING_KEY_ID: u32 = 27;
+const DICTALM_CONTEXT_LIMIT: u32 = 2_048;
+const DICTALM_HIGH_MEMORY_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
+const DICTALM_IM_END: Token = 151_645;
+const DICTALM_END_OF_TEXT: Token = 151_643;
+const DICTALM_DEFAULT_SYSTEM: &str = "You are a helpful AI assistant named Dicta-LM 3.0, Trained by Dicta, the Israel Center for Text Analysis. Your role is to provide accurate, helpful, and well-structured responses to user questions and requests.\nProvide clear, logical, and precise answers that thoroughly address what the user is asking for. Structure your responses in a way that is easy to understand and follow.";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatProfile {
+    Qwen,
+    DictaLm,
+}
+
+#[cfg(test)]
+fn sha256_file(path: &std::path::Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|_| EdgeError::Engine("profile asset is not readable"))?;
+    sha256_open_file(&mut file)
+}
+
+fn sha256_open_file(file: &mut std::fs::File) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| EdgeError::Engine("profile asset is not seekable"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| EdgeError::Engine("profile asset checksum failed"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| EdgeError::Engine("profile asset is not seekable"))?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn verify_dictalm_open_file(
+    file: &mut std::fs::File,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> Result<()> {
+    let bytes = file
+        .metadata()
+        .map_err(|_| EdgeError::Engine("DictaLM bundle asset is missing"))?
+        .len();
+    if bytes != expected_bytes || sha256_open_file(file)? != expected_sha256 {
+        return Err(EdgeError::Engine(
+            "DictaLM bundle asset does not match the pinned manifest",
+        ));
+    }
+    Ok(())
+}
+
+fn read_verified_dictalm_asset(
+    path: &std::path::Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> Result<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+
+    let bytes =
+        std::fs::read(path).map_err(|_| EdgeError::Engine("DictaLM bundle asset is missing"))?;
+    if bytes.len() as u64 != expected_bytes
+        || format!("{:x}", Sha256::digest(&bytes)) != expected_sha256
+    {
+        return Err(EdgeError::Engine(
+            "DictaLM bundle asset does not match the pinned manifest",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn verify_dictalm_template(path: &std::path::Path) -> Result<Vec<u8>> {
+    read_verified_dictalm_asset(path, DICTALM_TEMPLATE_BYTES, DICTALM_TEMPLATE_SHA256)
+}
+
+fn dictalm_manifest_bytes() -> Vec<u8> {
+    format!(
+        "edge-intelligence/dictalm-profile/v1\nquant_revision=2f41ecf9bdeb2d75ff4dd85266970402c59c14d8\nsource_revision=5add44d6941d6ffb9eb6cc6b516f9fb4fd472494\nmodel_bytes={DICTALM_MODEL_BYTES}\nmodel_sha256={DICTALM_MODEL_SHA256}\ntokenizer_bytes={DICTALM_TOKENIZER_BYTES}\ntokenizer_sha256={DICTALM_TOKENIZER_SHA256}\ntemplate_bytes={DICTALM_TEMPLATE_BYTES}\ntemplate_sha256={DICTALM_TEMPLATE_SHA256}\n"
+    )
+    .into_bytes()
+}
+
+fn trusted_dictalm_key() -> Result<[u8; 32]> {
+    let hex = option_env!("EDGE_DICTALM_ED25519_PUBLIC_KEY_HEX").ok_or(
+        EdgeError::UnsupportedCapability("this build has no trusted DictaLM bundle signing key"),
+    )?;
+    if hex.len() != 64 {
+        return Err(EdgeError::UnsupportedCapability(
+            "the configured DictaLM bundle signing key is malformed",
+        ));
+    }
+    let mut key = [0u8; 32];
+    for (index, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).map_err(|_| {
+            EdgeError::UnsupportedCapability(
+                "the configured DictaLM bundle signing key is malformed",
+            )
+        })?;
+    }
+    Ok(key)
+}
+
+fn verify_dictalm_bundle_signature(paths: &DictaLmBundlePaths) -> Result<LoadPermit> {
+    let signature =
+        std::fs::read(&paths.manifest_signature).map_err(|_| EdgeError::SignatureRejected)?;
+    let mut verifier = Ed25519Verifier::new();
+    verifier
+        .register(DICTALM_SIGNING_KEY_ID, trusted_dictalm_key()?)
+        .map_err(|_| EdgeError::SignatureRejected)?;
+    let mut artifact = ModelArtifact::new(
+        ModelId(27),
+        ModelVersion::new(3, 0, 0),
+        el_core::ModelFormat::Gguf,
+    );
+    let manifest = dictalm_manifest_bytes();
+    artifact.verify(&verifier, &manifest, &signature, DICTALM_SIGNING_KEY_ID);
+    artifact.ensure_loadable()
+}
+
 /// A real local chat backend: a Qwen2 GGUF model + its tokenizer, driven
 /// through [`el_runtime::InferenceSession`].
 ///
@@ -978,6 +1247,8 @@ pub struct QwenChatProvider {
     tokenizer: Tokenizer,
     permit: LoadPermit,
     eos: Token,
+    profile: ChatProfile,
+    context_limit: Option<u32>,
     default_max_tokens: u32,
     model_label: String,
     safety: SafetyConfig,
@@ -1006,6 +1277,12 @@ impl QwenChatProvider {
         if !model_path.exists() {
             return Err(EdgeError::Engine("model file not found"));
         }
+        let architecture = gguf_architecture(&model_path)?;
+        if architecture != "qwen2" {
+            return Err(EdgeError::UnsupportedArchitecture(
+                format!("{architecture}; generic Qwen profile accepts Qwen2 only").into_boxed_str(),
+            ));
+        }
         let tokenizer = Tokenizer::from_file(tokenizer_path.as_ref())
             .map_err(|_| EdgeError::Engine("failed to load tokenizer.json"))?;
 
@@ -1024,14 +1301,75 @@ impl QwenChatProvider {
         // ADR-018: load the weights ONCE here and keep them resident, instead of
         // re-reading the GGUF on every `chat`. The first `chat` promotes this into
         // a reusable session (see `ChatSession`).
-        let engine = QwenEngine::from_path(&model_path, eos)?;
+        let stop_tokens = vec![eos];
+        let engine = QwenEngine::from_path(&model_path, stop_tokens.clone())?;
 
         Ok(Self {
             tokenizer,
             permit,
             eos,
+            profile: ChatProfile::Qwen,
+            context_limit: None,
             default_max_tokens: 512,
             model_label,
+            safety,
+            expert_model: None,
+            steer_alpha_milli: 1000,
+            session: std::sync::Mutex::new(ChatSession::Loaded(engine)),
+            expert: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Load the official, pinned DictaLM 3.0 Qwen3 profile. The model and
+    /// tokenizer are verified against ADR-027's immutable bundle digests before
+    /// GGUF parsing or tokenizer construction; the supplied template is checked
+    /// for the upstream plain-chat envelope. Tool calling is deliberately not
+    /// exposed by the current `ChatMessage` API.
+    pub fn from_dictalm_bundle(
+        paths: DictaLmBundlePaths,
+        capability: DictaLmCapability,
+    ) -> Result<Self> {
+        capability.validate()?;
+        // Validate the detached manifest and trust anchor before touching the
+        // 1.1 GiB GGUF. This is the hard provenance gate; asset digests below
+        // bind the manifest to the exact file handles used for loading.
+        let permit = verify_dictalm_bundle_signature(&paths)?;
+        let mut model_file = std::fs::File::open(&paths.model)
+            .map_err(|_| EdgeError::Engine("DictaLM bundle asset is missing"))?;
+        // Keep this handle for the subsequent architecture read and tensor load:
+        // a pathname replacement after validation cannot swap in different
+        // weights between the integrity gate and Candle construction.
+        verify_dictalm_open_file(&mut model_file, DICTALM_MODEL_BYTES, DICTALM_MODEL_SHA256)?;
+        let tokenizer_bytes = read_verified_dictalm_asset(
+            &paths.tokenizer,
+            DICTALM_TOKENIZER_BYTES,
+            DICTALM_TOKENIZER_SHA256,
+        )?;
+        let _template_bytes = verify_dictalm_template(&paths.chat_template)?;
+        let architecture = gguf_architecture_from_file(&mut model_file)?;
+        if architecture != "qwen3" {
+            return Err(EdgeError::UnsupportedArchitecture(
+                format!("{architecture}; DictaLM profile requires Qwen3").into_boxed_str(),
+            ));
+        }
+
+        let tokenizer = Tokenizer::from_bytes(tokenizer_bytes)
+            .map_err(|_| EdgeError::Engine("failed to load DictaLM tokenizer.json"))?;
+        let stop_tokens = dictalm_stop_tokens(&tokenizer)?;
+        // The signature above plus these pinned member digests forms the
+        // whole-bundle provenance gate. Generic local-file trust is never used
+        // on this public Qwen3 path.
+        let engine = QwenEngine::from_file(model_file, stop_tokens.clone())?;
+        let safety = SafetyConfig::lightweight(&tokenizer);
+
+        Ok(Self {
+            tokenizer,
+            permit,
+            eos: DICTALM_IM_END,
+            profile: ChatProfile::DictaLm,
+            context_limit: Some(DICTALM_CONTEXT_LIMIT),
+            default_max_tokens: 512,
+            model_label: "local/dictalm-3.0-1.7b-instruct-q4_k_m".to_string(),
             safety,
             expert_model: None,
             steer_alpha_milli: 1000,
@@ -1174,13 +1512,45 @@ fn qwen_chatml_eos(tokenizer: &Tokenizer) -> Result<Token> {
     Ok(im_end)
 }
 
+/// Validate DictaLM's two upstream stop controls. `tokenizer.json` is pinned
+/// separately because Candle GGUF loading does not consume the embedded
+/// tokenizer metadata; accepting either a missing control or a mismatched ID
+/// would produce runaway turns or decode the wrong vocabulary.
+fn dictalm_stop_tokens(tokenizer: &Tokenizer) -> Result<Vec<Token>> {
+    let added = tokenizer.get_added_vocabulary();
+    for (control, expected) in [
+        ("<|im_end|>", DICTALM_IM_END),
+        ("<|endoftext|>", DICTALM_END_OF_TEXT),
+    ] {
+        if !added.is_special_token(control)
+            || added.get_vocab().get(control).copied() != Some(expected)
+        {
+            return Err(EdgeError::Engine(
+                "DictaLM tokenizer special-token IDs do not match the pinned profile",
+            ));
+        }
+    }
+    Ok(vec![DICTALM_IM_END, DICTALM_END_OF_TEXT])
+}
+
 impl LlmProvider for QwenChatProvider {
     fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
-        let prompt = render_chatml(&req.messages);
+        let prompt = match self.profile {
+            ChatProfile::Qwen => render_chatml(&req.messages),
+            ChatProfile::DictaLm => render_dictalm_chatml(&req.messages),
+        };
 
         let t_encode = bench::enabled().then(std::time::Instant::now);
         let prompt_tokens = self.encode(&prompt)?;
         let d_encode = t_encode.map(|t| t.elapsed()).unwrap_or_default();
+        let max = req.max_tokens.unwrap_or(self.default_max_tokens);
+        if let Some(limit) = self.context_limit {
+            if prompt_tokens.len().saturating_add(max as usize) > limit as usize {
+                return Err(EdgeError::Engine(
+                    "DictaLM context exceeds the 2048-token high-memory profile",
+                ));
+            }
+        }
 
         // Carry the active safety tier on the session config so the runtime
         // derives the tier-aware ADR-012 `RollbackPolicy` and records the true
@@ -1189,9 +1559,17 @@ impl LlmProvider for QwenChatProvider {
         // it masquerading as `Lightweight`. Both are deterministic from the
         // builder-set config, so they are identical on every turn.
         let requested = requested_session_safety(self.safety.mode, self.expert_model.is_some());
-        let cfg = SessionConfig {
-            safety: requested,
-            ..SessionConfig::default()
+        let cfg = match self.profile {
+            ChatProfile::Qwen => SessionConfig {
+                safety: requested,
+                ..SessionConfig::default()
+            },
+            ChatProfile::DictaLm => SessionConfig {
+                safety: requested,
+                device: el_core::DeviceTarget::HighEnd,
+                memory_budget_bytes: DICTALM_HIGH_MEMORY_BUDGET,
+                ..SessionConfig::default()
+            },
         };
         // Resolve the same effective tier the runtime will: only install the
         // contrastive steerer if `SecDecoding` survives device selection (it
@@ -1302,7 +1680,6 @@ impl LlmProvider for QwenChatProvider {
         let d_prefill = t_prefill.map(|t| t.elapsed()).unwrap_or_default();
         let (pf_total, pf_model, pf_calls) = bench::take();
 
-        let max = req.max_tokens.unwrap_or(self.default_max_tokens);
         let t_decode = bench::enabled().then(std::time::Instant::now);
         let stop = session.generate(&ports, max)?;
         let d_decode = t_decode.map(|t| t.elapsed()).unwrap_or_default();
@@ -1508,6 +1885,36 @@ fn render_chatml(messages: &[ChatMessage]) -> String {
     s
 }
 
+/// Compiled plain-chat subset of DictaLM's pinned upstream Jinja template.
+/// The public request type has no tool-call role, so tool rendering is excluded
+/// deliberately; the system-message selection and ChatML bytes are preserved.
+fn render_dictalm_chatml(messages: &[ChatMessage]) -> String {
+    let system = messages
+        .first()
+        .filter(|message| message.role == ChatRole::System)
+        .map(|message| message.content.trim_end())
+        .filter(|message| !message.is_empty())
+        .unwrap_or(DICTALM_DEFAULT_SYSTEM);
+    let mut out = format!("<|im_start|>system\n{system}<|im_end|>");
+    for (index, message) in messages.iter().enumerate() {
+        if index == 0 && message.role == ChatRole::System {
+            continue;
+        }
+        let role = match message.role {
+            ChatRole::System => "system",
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+        };
+        out.push_str("\n<|im_start|>");
+        out.push_str(role);
+        out.push('\n');
+        out.push_str(&message.content);
+        out.push_str("<|im_end|>");
+    }
+    out.push_str("\n<|im_start|>assistant\n");
+    out
+}
+
 fn requested_session_safety(configured: SafetyMode, has_expert: bool) -> SafetyMode {
     match (configured, has_expert) {
         (SafetyMode::Off, _) => SafetyMode::Off,
@@ -1621,6 +2028,21 @@ mod tests {
         w
     }
 
+    fn make_gguf_architecture_header(architecture: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensors
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // metadata entries
+        let key = b"general.architecture";
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // GGUF string value
+        bytes.extend_from_slice(&(architecture.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(architecture.as_bytes());
+        bytes
+    }
+
     // ── toy-model tests (unchanged) ──────────────────────────────────────────
 
     #[test]
@@ -1632,6 +2054,85 @@ mod tests {
         assert_eq!(a, b, "fixed weights → deterministic real-tensor forward");
         let c = eng.next_logits(&[5]);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn dictalm_renderer_uses_pinned_default_system_and_chatml_controls() {
+        let rendered = render_dictalm_chatml(&[ChatMessage::user("שלום")]);
+        assert!(rendered
+            .starts_with("<|im_start|>system\nYou are a helpful AI assistant named Dicta-LM 3.0"));
+        assert!(rendered.contains("\n<|im_start|>user\nשלום<|im_end|>"));
+        assert!(rendered.ends_with("\n<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn dictalm_renderer_uses_first_system_message_without_duplicate_turn() {
+        let rendered = render_dictalm_chatml(&[
+            ChatMessage::system("ענה בעברית.  "),
+            ChatMessage::user("שלום"),
+        ]);
+        assert!(rendered.starts_with("<|im_start|>system\nענה בעברית.<|im_end|>"));
+        assert_eq!(rendered.matches("<|im_start|>system").count(), 1);
+    }
+
+    #[test]
+    fn sha256_file_streams_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asset");
+        std::fs::write(&path, b"dictalm").unwrap();
+        assert_eq!(
+            sha256_file(&path).unwrap(),
+            "b32579f5833516aa492aaaab739b087a0a76a20685af4203e383b8b7e96d0e54"
+        );
+    }
+
+    #[test]
+    fn architecture_preflight_identifies_qwen3_without_loading_tensors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("header.gguf");
+        std::fs::write(&path, make_gguf_architecture_header("qwen3")).unwrap();
+        assert_eq!(gguf_architecture(&path).unwrap(), "qwen3");
+    }
+
+    #[test]
+    fn dictalm_capability_rejects_before_asset_loading() {
+        let err = DictaLmCapability {
+            high_end: false,
+            memory_budget_bytes: 0,
+        }
+        .validate()
+        .unwrap_err();
+        assert!(matches!(err, EdgeError::UnsupportedCapability(_)));
+        let err = DictaLmCapability {
+            high_end: true,
+            memory_budget_bytes: DICTALM_HIGH_MEMORY_BUDGET - 1,
+        }
+        .validate()
+        .unwrap_err();
+        assert!(matches!(err, EdgeError::MemoryBudgetExceeded { .. }));
+    }
+
+    #[test]
+    fn dictalm_template_requires_exact_pinned_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat_template.jinja");
+        std::fs::write(&path, "<|im_start|>system\\nDicta-LM 3.0").unwrap();
+        assert!(verify_dictalm_template(&path).is_err());
+    }
+
+    #[test]
+    fn dictalm_signature_gate_rejects_missing_or_untrusted_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DictaLmBundlePaths::new(
+            dir.path().join("model.gguf"),
+            dir.path().join("tokenizer.json"),
+            dir.path().join("chat_template.jinja"),
+            dir.path().join("manifest.sig"),
+        );
+        assert!(matches!(
+            verify_dictalm_bundle_signature(&paths),
+            Err(EdgeError::SignatureRejected)
+        ));
     }
 
     #[test]

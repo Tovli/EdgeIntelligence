@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use el_core::{ChatMessage, ChatRequest, ChatToken, LlmProvider, SafetyMode};
-use el_engine_candle::QwenChatProvider;
+use el_engine_candle::{DictaLmBundlePaths, DictaLmCapability, QwenChatProvider};
 
 const DEFAULT_MODEL: &str = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
 const DEFAULT_TOKENIZER: &str = "models/qwen2.5-0.5b-instruct.tokenizer.json";
@@ -31,6 +31,8 @@ const DEFAULT_SYSTEM: &str = "You are a helpful, concise assistant running local
 struct Args {
     model: PathBuf,
     tokenizer: PathBuf,
+    dictalm_template: Option<PathBuf>,
+    dictalm_signature: Option<PathBuf>,
     system: String,
     max_tokens: u32,
     once: Option<String>,
@@ -43,6 +45,8 @@ struct Args {
 fn parse_args() -> Result<Args, String> {
     let mut model = PathBuf::from(DEFAULT_MODEL);
     let mut tokenizer = PathBuf::from(DEFAULT_TOKENIZER);
+    let mut dictalm_template = None;
+    let mut dictalm_signature = None;
     let mut system = DEFAULT_SYSTEM.to_string();
     let mut max_tokens = 512u32;
     let mut once = None;
@@ -57,6 +61,12 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--model" | "-m" => model = PathBuf::from(next("--model")?),
             "--tokenizer" | "-t" => tokenizer = PathBuf::from(next("--tokenizer")?),
+            "--dictalm-template" => {
+                dictalm_template = Some(PathBuf::from(next("--dictalm-template")?))
+            }
+            "--dictalm-signature" => {
+                dictalm_signature = Some(PathBuf::from(next("--dictalm-signature")?))
+            }
             "--system" | "-s" => system = next("--system")?,
             "--prompt" | "-p" => once = Some(next("--prompt")?),
             "--once" => once = once.or(Some(String::new())),
@@ -92,6 +102,8 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         model,
         tokenizer,
+        dictalm_template,
+        dictalm_signature,
         system,
         max_tokens,
         once,
@@ -109,6 +121,8 @@ fn usage() {
          OPTIONS:\n\
          \x20 -m, --model <PATH>        GGUF model file [default: {DEFAULT_MODEL}]\n\
          \x20 -t, --tokenizer <PATH>    tokenizer.json  [default: {DEFAULT_TOKENIZER}]\n\
+         \x20     --dictalm-template <PATH>  load the pinned DictaLM 3 Qwen3 profile\n\
+         \x20     --dictalm-signature <PATH> detached signature for the DictaLM profile manifest\n\
          \x20 -s, --system <TEXT>       system prompt\n\
          \x20 -p, --prompt <TEXT>       send one message, print the reply, exit\n\
          \x20     --once                read one line from stdin, reply, exit\n\
@@ -149,7 +163,22 @@ fn main() {
     eprint!("loading {} ... ", args.model.display());
     let _ = std::io::stderr().flush();
     let load_start = Instant::now();
-    let provider = match QwenChatProvider::from_paths(&args.model, &args.tokenizer) {
+    let loaded = match (&args.dictalm_template, &args.dictalm_signature) {
+        (Some(template), Some(signature)) => QwenChatProvider::from_dictalm_bundle(
+            DictaLmBundlePaths::new(
+                args.model.clone(),
+                args.tokenizer.clone(),
+                template.clone(),
+                signature.clone(),
+            ),
+            DictaLmCapability::high_memory(),
+        ),
+        (Some(_), None) | (None, Some(_)) => Err(el_core::EdgeError::Engine(
+            "DictaLM requires both --dictalm-template and --dictalm-signature",
+        )),
+        (None, None) => QwenChatProvider::from_paths(&args.model, &args.tokenizer),
+    };
+    let provider = match loaded {
         Ok(p) => {
             let mut p = p
                 .with_safety(args.safety)

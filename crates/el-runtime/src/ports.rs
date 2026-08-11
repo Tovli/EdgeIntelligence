@@ -16,6 +16,16 @@ pub trait InferenceEngine {
     /// The end-of-sequence token id.
     fn eos_token(&self) -> Token;
 
+    /// Whether `token` terminates decoding for this model profile.
+    ///
+    /// Most model families have one EOS token, so the default preserves the
+    /// original port contract. Profiles such as DictaLM/Qwen3 can override this
+    /// to recognise their complete stop-token set without widening every host
+    /// binding or test double.
+    fn is_stop_token(&self, token: Token) -> bool {
+        token == self.eos_token()
+    }
+
     /// Roll the engine's internal state back so its context is exactly the
     /// prompt plus `keep_committed` generated tokens.
     ///

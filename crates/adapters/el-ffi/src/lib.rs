@@ -247,6 +247,61 @@ impl EdgeLlm {
         })
     }
 
+    /// Construct the official DictaLM 3.0 Qwen3 profile (ADR-027).
+    ///
+    /// Unlike `local_qwen`, this accepts only the immutable three-asset bundle:
+    /// pinned GGUF, pinned tokenizer, and the upstream chat template. Validation
+    /// occurs before any model tensor is constructed. The profile is native-only
+    /// and targets high-memory arm64 application hosts; callers on unsupported
+    /// hosts receive a provider error rather than falling back to another model.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[uniffi::constructor]
+    pub fn local_dictalm(
+        model_uri: String,
+        tokenizer_uri: String,
+        chat_template_uri: String,
+        manifest_signature_uri: String,
+        high_end: bool,
+        memory_budget_bytes: u64,
+    ) -> Result<Self, SdkError> {
+        if !cfg!(target_arch = "aarch64") {
+            return Err(SdkError::ProviderError {
+                message: "DictaLM is supported only on native arm64 high-memory devices".into(),
+            });
+        }
+        if model_uri.trim().is_empty()
+            || tokenizer_uri.trim().is_empty()
+            || chat_template_uri.trim().is_empty()
+            || manifest_signature_uri.trim().is_empty()
+        {
+            return Err(SdkError::ProviderError {
+                message: "DictaLM model, tokenizer, chat template, and manifest signature paths must not be empty"
+                    .into(),
+            });
+        }
+        let bundle = el_engine_candle::DictaLmBundlePaths::new(
+            model_uri.clone(),
+            tokenizer_uri.clone(),
+            chat_template_uri.clone(),
+            manifest_signature_uri.clone(),
+        );
+        let capability = el_engine_candle::DictaLmCapability {
+            high_end,
+            memory_budget_bytes,
+        };
+        let provider = el_engine_candle::QwenChatProvider::from_dictalm_bundle(bundle, capability)
+            .map_err(|error| SdkError::ProviderError {
+                message: format!(
+                    "{error} (model: {model_uri}, tokenizer: {tokenizer_uri}, template: {chat_template_uri})"
+                ),
+            })?;
+        Ok(Self {
+            provider: Box::new(provider),
+            default_model: "local/dictalm-3.0-1.7b-instruct-q4_k_m".into(),
+            max_tokens: Some(QWEN_FFI_DEFAULT_MAX_TOKENS),
+        })
+    }
+
     /// Construct with a frontier cloud backend (opt-in, ADR-010).
     ///
     /// `model` uses the routing prefix: `"openai/gpt-4o"`,
@@ -591,6 +646,25 @@ mod tests {
             missing_tokenizer,
             Err(SdkError::ProviderError { ref message }) if message == "Qwen tokenizer path must not be empty"
         ));
+    }
+
+    #[test]
+    fn dictalm_ffi_rejects_unsupported_host_before_asset_load() {
+        let result = EdgeLlm::local_dictalm(
+            "/not/read.gguf".into(),
+            "/not/read.tokenizer.json".into(),
+            "/not/read.jinja".into(),
+            "/not/read.sig".into(),
+            true,
+            4 * 1024 * 1024 * 1024,
+        );
+        #[cfg(not(target_arch = "aarch64"))]
+        assert!(matches!(
+            result,
+            Err(SdkError::ProviderError { ref message }) if message.contains("arm64 high-memory")
+        ));
+        #[cfg(target_arch = "aarch64")]
+        assert!(matches!(result, Err(SdkError::ProviderError { .. })));
     }
 
     #[test]

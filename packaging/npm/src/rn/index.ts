@@ -59,6 +59,44 @@ export function localEdgeLlm(modelUri: string, tokenizerUri?: string): EdgeLlmLi
   return native.EdgeLlm.localQwen(modelUri, tokenizerUri);
 }
 
+/**
+ * Create the official DictaLM 3.0 local profile. All three paths must refer to
+ * the pinned bundle; native Rust verifies the GGUF/tokenizer digests before it
+ * maps model tensors. Tool calling is intentionally not exposed by this first
+ * plain-chat React Native surface.
+ */
+export function localDictaLm(
+  modelUri: string,
+  tokenizerUri: string,
+  chatTemplateUri: string,
+  manifestSignatureUri: string,
+  highEnd: boolean,
+  memoryBudgetBytes: number,
+): EdgeLlmLike {
+  requireLocalAssetPath(modelUri, 'modelUri');
+  requireLocalAssetPath(tokenizerUri, 'tokenizerUri');
+  requireLocalAssetPath(chatTemplateUri, 'chatTemplateUri');
+  requireLocalAssetPath(manifestSignatureUri, 'manifestSignatureUri');
+  if (!Number.isSafeInteger(memoryBudgetBytes) || memoryBudgetBytes < 4 * 1024 * 1024 * 1024) {
+    throw new Error('DictaLM requires an explicit high-memory budget of at least 4 GiB.');
+  }
+  if (!highEnd) {
+    throw new Error('DictaLM requires an explicit HighEnd device capability.');
+  }
+  const native = loadNativeBindings();
+  if (typeof native.EdgeLlm.localDictalm !== 'function') {
+    throw new Error('installed native module does not support the DictaLM profile; rebuild the app.');
+  }
+  return native.EdgeLlm.localDictalm(
+    modelUri,
+    tokenizerUri,
+    chatTemplateUri,
+    manifestSignatureUri,
+    highEnd,
+    memoryBudgetBytes,
+  );
+}
+
 export function cloudEdgeLlm(model: string, apiKey: string): EdgeLlmLike {
   const native = loadNativeBindings();
   return native.EdgeLlm.cloud(model, apiKey);

@@ -291,7 +291,6 @@ impl<E: InferenceEngine> InferenceSession<E> {
             }
         }
 
-        let eos = self.engine.eos_token();
         let guarding = policy.guards() && ports.guard.is_some();
 
         // Tier-aware degradation (ADR-003/ADR-012): without budget for
@@ -403,7 +402,7 @@ impl<E: InferenceEngine> InferenceSession<E> {
                     kv_len: self.kv.len(),
                 });
 
-                if token == eos {
+                if self.engine.is_stop_token(token) {
                     terminating = Some(StopReason::Eos);
                 }
             }
@@ -659,6 +658,29 @@ mod tests {
         }
     }
 
+    struct SecondaryStopEngine;
+    impl InferenceEngine for SecondaryStopEngine {
+        fn prefill(&mut self, tokens: &[Token]) -> Result<u32> {
+            Ok(tokens.len() as u32)
+        }
+        fn next_logits(&mut self, _committed: &[Token]) -> Vec<i32> {
+            // Greedy sampling chooses token 2, which is a secondary stop.
+            vec![0, 0, 10]
+        }
+        fn eos_token(&self) -> Token {
+            1
+        }
+        fn is_stop_token(&self, token: Token) -> bool {
+            matches!(token, 1 | 2)
+        }
+        fn rollback(&mut self, _keep: u32) -> Result<()> {
+            Ok(())
+        }
+        fn reset_cache(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     // Grammar masker that disallows specific token ids.
     struct DisallowMasker(Vec<Token>);
     impl GrammarMasker for DisallowMasker {
@@ -689,6 +711,20 @@ mod tests {
         s.reset().unwrap();
         assert_eq!(s.phase(), Phase::Initialized);
         assert!(s.output().is_empty());
+    }
+
+    #[test]
+    fn secondary_stop_token_ends_generation() {
+        let mut s = InferenceSession::new(
+            SessionId(90),
+            SessionConfig::default(),
+            SecondaryStopEngine,
+            permit(),
+        );
+        let ports = Ports::permissive();
+        s.load_prompt(&ports, &[7]).unwrap();
+        assert_eq!(s.generate(&ports, 8).unwrap(), StopReason::Eos);
+        assert_eq!(s.output(), &[2]);
     }
 
     #[test]

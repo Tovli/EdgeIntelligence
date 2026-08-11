@@ -5,7 +5,9 @@ readonly apk_path="expo-smoke/android/app/build/outputs/apk/release/app-release.
 readonly package_name="com.tovli.edgeintelligence.example"
 readonly model_path="${EDGE_INTELLIGENCE_QWEN_GGUF:?set EDGE_INTELLIGENCE_QWEN_GGUF to the Qwen GGUF}"
 readonly tokenizer_path="${EDGE_INTELLIGENCE_QWEN_TOKENIZER:?set EDGE_INTELLIGENCE_QWEN_TOKENIZER to tokenizer.json}"
-readonly app_assets_dir="/sdcard/Android/data/$package_name/files/models"
+readonly app_external_dir="/sdcard/Android/data/$package_name"
+readonly app_files_dir="$app_external_dir/files"
+readonly app_assets_dir="$app_files_dir/models"
 readonly app_model_path="$app_assets_dir/qwen.gguf"
 readonly app_tokenizer_path="$app_assets_dir/tokenizer.json"
 readonly success_text="Edge Intelligence Qwen local session passed."
@@ -15,12 +17,16 @@ test -s "$model_path"
 test -s "$tokenizer_path"
 
 adb install -r "$apk_path"
-# `adb push` runs as the shell user, while Android grants this app access to
-# its own scoped external-files directory without a storage permission. Keeping
-# the release APK preserves its embedded JavaScript bundle for an offline smoke.
+# `adb push` runs as the shell user. Make the transferred app-specific external
+# files traversable and readable by the app UID; otherwise its Rust filesystem
+# calls see the paths as absent despite the shell-side transfer succeeding.
+# Keeping the release APK preserves its embedded JavaScript bundle for an offline
+# smoke.
 adb shell mkdir -p "$app_assets_dir"
 adb push "$model_path" "$app_model_path"
 adb push "$tokenizer_path" "$app_tokenizer_path"
+adb shell chmod 755 "$app_external_dir" "$app_files_dir" "$app_assets_dir"
+adb shell chmod 644 "$app_model_path" "$app_tokenizer_path"
 adb shell test -s "$app_model_path"
 adb shell test -s "$app_tokenizer_path"
 adb logcat -c

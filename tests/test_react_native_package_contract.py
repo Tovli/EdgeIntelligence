@@ -329,7 +329,10 @@ def test_expo_fixture_targets_current_supported_host() -> None:
     assert "Local-session failure UI follows." in smoke_script
     assert "dump_ui >&2" in smoke_script
     assert "adb push" in smoke_script
-    assert "/sdcard/Android/data/$package_name/files/models" in smoke_script
+    assert 'chmod 755 "$app_external_dir" "$app_files_dir" "$app_assets_dir"' in smoke_script
+    assert 'chmod 644 "$app_model_path" "$app_tokenizer_path"' in smoke_script
+    assert 'readonly app_external_dir="/sdcard/Android/data/$package_name"' in smoke_script
+    assert 'readonly app_assets_dir="$app_files_dir/models"' in smoke_script
     assert "app-release.apk" in smoke_script
     assert "app-debug.apk" not in smoke_script
     assert "localEdgeLlm('')" not in app

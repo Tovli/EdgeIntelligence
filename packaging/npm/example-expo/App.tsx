@@ -9,6 +9,23 @@ const modelUri = '/storage/emulated/0/Android/data/com.tovli.edgeintelligence.ex
 const tokenizerUri = '/storage/emulated/0/Android/data/com.tovli.edgeintelligence.example/files/models/tokenizer.json';
 const successText = 'Edge Intelligence Qwen local session passed.';
 
+function describeError(error: unknown): string {
+  const fallback = String(error);
+  if (
+    typeof error !== 'object'
+    || error === null
+    || !('inner' in error)
+    || typeof error.inner !== 'object'
+    || error.inner === null
+    || !('message' in error.inner)
+    || typeof error.inner.message !== 'string'
+  ) {
+    return fallback;
+  }
+
+  return `${fallback}: ${error.inner.message}`;
+}
+
 function assertReady(label: string, response: string): void {
   const normalized = response.trim().toLowerCase();
   if (
@@ -47,7 +64,7 @@ const resultText = (() => {
   try {
     return runQwenLocalSessionSmoke();
   } catch (error) {
-    return `Edge Intelligence Qwen local session failed: ${String(error)}`;
+    return `Edge Intelligence Qwen local session failed: ${describeError(error)}`;
   }
 })();
 

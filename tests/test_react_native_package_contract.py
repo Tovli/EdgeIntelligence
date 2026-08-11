@@ -315,6 +315,8 @@ def test_expo_fixture_targets_current_supported_host() -> None:
     assert lock["packages"]["node_modules/expo"]["version"] == "57.0.9"
     assert lock["packages"]["node_modules/react-native"]["version"] == "0.86.0"
     assert "Edge Intelligence Qwen local session passed." in app
+    assert "function describeError(error: unknown): string" in app
+    assert "error.inner.message" in app
     smoke_script = (
         ROOT / "scripts" / "expo-android-local-session-smoke.sh"
     ).read_text(encoding="utf-8")

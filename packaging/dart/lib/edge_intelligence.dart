@@ -42,9 +42,8 @@ final class EdgeLlm {
 
   /// Clears any cached session state.
   ///
-  /// The local provider resets automatically at the start of each call, so
-  /// this is a no-op for the current backend. Call it as a forward-compatible
-  /// signal if your host logic requires an explicit boundary between sessions.
+  /// A failure means the provider may retain a stale KV cache. Stop using this
+  /// handle or rebuild it rather than starting another conversation.
   Future<void> reset() {
     return dart_api.edgeLlmReset(sdk: _sdk);
   }

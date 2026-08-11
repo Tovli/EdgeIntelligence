@@ -34,6 +34,12 @@ PUB_MOBILE_ARTIFACTS = [
     "android-libs",
     "ios-xcframework",
 ]
+QWEN_FIXTURE_SCRIPT = Path("scripts/download-qwen-fixture.sh")
+QWEN_FIXTURE_MANIFEST = Path("scripts/qwen-fixture.sha256")
+QWEN_FFI_TEST_SCRIPT = Path("scripts/run-qwen-ffi-integration.sh")
+QWEN_FFI_TEST_NAME = "native_qwen_integration_decodes_and_streams_english_text"
+ADR_026_RELEASE_GUARD = "Assert ADR-026 migration has a minor release"
+ADR_026_VERSION_GUARD = "scripts/assert-adr-026-release-version.py"
 
 REQUIRED_INSTALLS = [
     (
@@ -110,9 +116,16 @@ def check_workflow(path: Path) -> list[str]:
         errors.append(f"{path}: wasm-pack download must run through retry wrapper")
 
     if path.name == "bindings.yml":
+        if "npm run test:rn-factory" not in text:
+            errors.append(f"{path}: React Native factory runtime test must run in PR validation")
         for trigger_path in (
             "packaging/dart/**",
             "scripts/build-ios-xcframework.sh",
+            "scripts/download-qwen-fixture.sh",
+            "scripts/qwen-fixture.sha256",
+            "scripts/run-qwen-ffi-integration.sh",
+            "scripts/assert-adr-026-release-version.py",
+            "scripts/expo-android-local-session-smoke.sh",
             "scripts/verify-android-page-alignment.py",
         ):
             if text.count(trigger_path) < 2:
@@ -126,8 +139,34 @@ def check_workflow(path: Path) -> list[str]:
                     f"{path}: PR validation artifact uploads must be gated with "
                     f"{BINDINGS_UPLOAD_IF!r}"
                 )
+        for job_name in ("host", "ios"):
+            job = workflow_job_body(text, job_name)
+            if job is None:
+                errors.append(f"{path}: missing {job_name} FFI validation job")
+                continue
+            for required_qwen_fixture_part in (
+                "actions/cache@v4",
+                "hashFiles('scripts/qwen-fixture.sha256')",
+                "scripts/download-qwen-fixture.sh qwen-fixture",
+                "EDGE_INTELLIGENCE_QWEN_GGUF",
+                "bash scripts/run-qwen-ffi-integration.sh",
+            ):
+                if required_qwen_fixture_part not in job:
+                    errors.append(
+                        f"{path}: {job_name} FFI validation must restore, verify, and run the real Qwen fixture ({required_qwen_fixture_part!r})"
+                    )
 
     if path.name == "release.yml":
+        if ADR_026_RELEASE_GUARD not in text:
+            errors.append(
+                f"{path}: missing ADR-026 minor-release guard for the one-path React Native migration"
+            )
+        if f"python3 {ADR_026_VERSION_GUARD}" not in text:
+            errors.append(
+                f"{path}: ADR-026 release guard must run {ADR_026_VERSION_GUARD}"
+            )
+        if "npm run test:rn-factory" not in text:
+            errors.append(f"{path}: React Native factory runtime test must run before publishing")
         if "Validate Dart package resolves without Flutter SDK" in text:
             errors.append(
                 f"{path}: Flutter plugin packages cannot claim standalone Dart resolution"
@@ -140,6 +179,21 @@ def check_workflow(path: Path) -> list[str]:
             errors.append(f"{path}: pub.dev publishing must run in Flutter context")
         if "verify-flutter-ios:" not in text:
             errors.append(f"{path}: missing Flutter iOS package verification job")
+        verify = workflow_job_body(text, "verify")
+        if verify is None:
+            errors.append(f"{path}: missing release verification job")
+        else:
+            for required_qwen_fixture_part in (
+                "actions/cache@v4",
+                "hashFiles('scripts/qwen-fixture.sha256')",
+                "scripts/download-qwen-fixture.sh qwen-fixture",
+                "EDGE_INTELLIGENCE_QWEN_GGUF",
+                "bash scripts/run-qwen-ffi-integration.sh",
+            ):
+                if required_qwen_fixture_part not in verify:
+                    errors.append(
+                        f"{path}: release verification must provision and run the real Qwen fixture ({required_qwen_fixture_part!r})"
+                    )
         for smoke_name in (
             "Run Flutter iOS CocoaPods package smoke build",
             "Run Flutter iOS SwiftPM package smoke build",
@@ -194,6 +248,23 @@ def check_workflow(path: Path) -> list[str]:
             errors.append(f"{path}: missing smoke-expo-native-module job")
         elif "lib/x86_64/libel_ffi.so" not in expo_smoke:
             errors.append(f"{path}: Expo Android smoke must assert the x86_64 Rust library")
+        else:
+            for required_qwen_smoke_part in (
+                "Restore Qwen Android smoke fixture cache",
+                "hashFiles('scripts/qwen-fixture.sha256')",
+                "scripts/download-qwen-fixture.sh qwen-fixture",
+                "EDGE_INTELLIGENCE_QWEN_GGUF",
+                ":app:assembleRelease",
+                "expo-android-local-session-smoke.sh",
+            ):
+                if required_qwen_smoke_part not in expo_smoke:
+                    errors.append(
+                        f"{path}: Expo Android smoke must exercise packaged Qwen inference ({required_qwen_smoke_part!r})"
+                    )
+        if "huggingface.co/Qwen/" in text:
+            errors.append(
+                f"{path}: Qwen fixture URLs belong only in the pinned downloader script"
+            )
         assemble_dart = workflow_job_body(text, "assemble-dart")
         if assemble_dart is None:
             errors.append(f"{path}: missing assemble-dart job")
@@ -297,11 +368,67 @@ def check_dart_mobile_package() -> list[str]:
     return errors
 
 
+def check_qwen_fixture() -> list[str]:
+    errors: list[str] = []
+    if not QWEN_FIXTURE_SCRIPT.is_file():
+        return [f"{QWEN_FIXTURE_SCRIPT}: missing pinned Qwen fixture downloader"]
+    if not QWEN_FIXTURE_MANIFEST.is_file():
+        return [f"{QWEN_FIXTURE_MANIFEST}: missing Qwen fixture SHA-256 manifest"]
+
+    downloader = QWEN_FIXTURE_SCRIPT.read_text(encoding="utf-8")
+    manifest = QWEN_FIXTURE_MANIFEST.read_text(encoding="utf-8")
+    if "/resolve/main/" in downloader:
+        errors.append(
+            f"{QWEN_FIXTURE_SCRIPT}: fixture downloads must pin immutable revisions, not main"
+        )
+    for required_downloader_part in (
+        "sha256sum -c",
+        "qwen-fixture.sha256",
+        "9217f5db79a29953eb74d5343926648285ec7e67",
+        "7ae557604adf67be50417f59c2c2f167def9a775",
+    ):
+        if required_downloader_part not in downloader:
+            errors.append(
+                f"{QWEN_FIXTURE_SCRIPT}: missing immutable fixture verification {required_downloader_part!r}"
+            )
+    for required_manifest_part in (
+        "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db  qwen.gguf",
+        "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539  tokenizer.json",
+    ):
+        if required_manifest_part not in manifest:
+            errors.append(
+                f"{QWEN_FIXTURE_MANIFEST}: missing expected SHA-256 entry {required_manifest_part!r}"
+            )
+    return errors
+
+
+def check_qwen_ffi_test_runner() -> list[str]:
+    if not QWEN_FFI_TEST_SCRIPT.is_file():
+        return [f"{QWEN_FFI_TEST_SCRIPT}: missing real Qwen FFI test runner"]
+
+    runner = QWEN_FFI_TEST_SCRIPT.read_text(encoding="utf-8")
+    errors: list[str] = []
+    for required_part in (
+        f'readonly test_name="{QWEN_FFI_TEST_NAME}"',
+        'cargo test -p el-ffi "$test_name" -- --ignored',
+        'grep -F "running 1 test"',
+        'grep -F "$test_name ... ok"',
+        'grep -F "test result: ok. 1 passed;"',
+    ):
+        if required_part not in runner:
+            errors.append(
+                f"{QWEN_FFI_TEST_SCRIPT}: must prove exactly one named real-Qwen test ran ({required_part!r})"
+            )
+    return errors
+
+
 def main() -> int:
     errors: list[str] = []
     for workflow in WORKFLOWS:
         errors.extend(check_workflow(workflow))
     errors.extend(check_dart_mobile_package())
+    errors.extend(check_qwen_fixture())
+    errors.extend(check_qwen_ffi_test_runner())
 
     if errors:
         print("\n".join(errors), file=sys.stderr)

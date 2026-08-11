@@ -15,6 +15,7 @@ packaging/npm/node_modules/
 packaging/dart/ios/edge_intelligence/Frameworks/el_ffi.xcframework/
 # Local model assets for the el-chat test client (downloaded, not committed).
 models/
+qwen-fixture/
 # Claude Code local state (worktrees, settings.local.json)
 .claude/
 benchmarks/data/

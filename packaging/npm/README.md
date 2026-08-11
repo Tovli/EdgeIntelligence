@@ -9,8 +9,9 @@ it needs; applications should not install `@ubjs/core` separately.
 
 ## Usage
 
-Copy the Qwen2.5 0.5B GGUF into app storage and pass that local path to the SDK
-facade.
+React Native Qwen inference requires two caller-provided local assets: the
+Qwen2.5 GGUF and its matching official `tokenizer.json`. The package never
+downloads either asset or falls back to a byte-level decoder.
 
 Browser / WASM:
 
@@ -19,12 +20,14 @@ import init, { EdgeLlm } from "edge-intelligence-sdk";
 
 await init();
 
-const qwen05b = "/models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
-const sdk = new EdgeLlm(qwen05b);
+const sdk = new EdgeLlm("/models/development-placeholder.gguf");
 const reply = sdk.ask_wasm("Summarize edge inference in one sentence.");
 
 console.log(reply);
 ```
+
+The browser/WASM local path is still a development placeholder; it does not yet
+run a caller-supplied Qwen GGUF.
 
 React Native:
 
@@ -32,7 +35,8 @@ React Native:
 import { localEdgeLlm } from "edge-intelligence-sdk";
 
 const qwen05b = "/data/user/0/com.example.app/files/models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
-const sdk = localEdgeLlm(qwen05b);
+const qwenTokenizer = "/data/user/0/com.example.app/files/models/qwen2.5-0.5b-instruct.tokenizer.json";
+const sdk = localEdgeLlm(qwen05b, qwenTokenizer);
 
 const reply = sdk.ask("Summarize edge inference in one sentence.");
 let streamed = "";
@@ -43,15 +47,32 @@ sdk.askStreamCb("Give me two deployment tips.", {
 });
 ```
 
+`ask` and `askStreamCb` are currently synchronous native calls. On the Qwen
+path, `askStreamCb` delivers the completed reply as fragments after generation,
+not while the model is decoding. Every Qwen reply is capped at 64 generated
+tokens; the current React Native API offers neither a caller-supplied limit nor
+a stop reason, so callers should treat the reply as potentially length-limited.
+For responsive incremental UI, run inference off the JS thread or wait for the
+separately scoped asynchronous binding surface.
+
+`reset()` throws if the provider cannot clear its session cache. Treat that as
+terminal for the handle and construct a new session instead of issuing another
+prompt against possibly stale conversation state.
+
 For an opt-in cloud session, use the guarded `cloudEdgeLlm(model, apiKey)`
 factory. React Native TypeScript consumers can import `EdgeLlmLike` and
 `SdkError` as types when their resolver selects the `react-native` export
 condition.
 
-Migrating from `EdgeLlm.local()`: prerelease React Native consumers should
-replace that value import and constructor call with `localEdgeLlm(modelPath)`.
-`EdgeLlmLike` is the TypeScript session interface; `EdgeLlm` is also available
-as a class type, not a runtime export.
+Migrating from the published one-path `localEdgeLlm(modelPath)` API: its
+deprecated overload remains available so existing TypeScript builds continue to
+compile, but it throws a migration error before creating a session. Pass the
+matching tokenizer as `localEdgeLlm(modelPath, tokenizerPath)`. The two-path
+factory constructs the native Qwen provider, renders Qwen2.5 ChatML, and
+decodes generated IDs through that tokenizer. `EdgeLlmLike` is the TypeScript
+session interface; `EdgeLlm` is also available as a class type, not a runtime
+export. Because the one-path call changes runtime behavior, this migration
+ships in the 0.4.0-or-later minor release rather than a 0.3.x patch release.
 
 ## React Native and Expo setup
 
@@ -87,8 +108,8 @@ browser-aware bundler or the React Native export in a native application.
 
 The release supports Android `armeabi-v7a`, `arm64-v8a`, and `x86_64`, plus iOS
 device and simulator slices in `el_ffi.xcframework`. Android x86 is not
-supported. Store GGUF files in the application's writable documents/files
-directory and pass that platform-local path to `localEdgeLlm`.
+supported. Store the GGUF and matching tokenizer in the application's writable
+documents/files directory and pass both platform-local paths to `localEdgeLlm`.
 
 Source, crate documentation, and release notes live in the Edge Intelligence
 repository.

@@ -58,6 +58,14 @@ jobs:
             exit 1
           fi
 
+      # ADR-026 changes the runtime behavior of the published one-path React
+      # Native factory. Do not ship that migration in the 0.3.x patch line.
+      - name: Assert ADR-026 migration has a minor release
+        if: github.event_name == 'push'
+        env:
+          TAG_VER: ${{ steps.tag.outputs.version }}
+        run: python3 scripts/assert-adr-026-release-version.py "$TAG_VER"
+
       # All internal dep version requirements live exclusively in [workspace.dependencies].
       # Verify every one of them matches the tag before touching any registry.
       - name: Assert all internal dep versions match tag
@@ -83,6 +91,21 @@ jobs:
 
       - name: cargo test --locked --workspace
         run: cargo test --locked --workspace
+
+      - name: Restore Qwen integration fixture cache
+        uses: actions/cache@v4
+        with:
+          path: qwen-fixture
+          key: qwen-fixture-${{ runner.os }}-${{ hashFiles('scripts/qwen-fixture.sha256') }}
+
+      - name: Download verified Qwen integration fixture
+        run: bash scripts/download-qwen-fixture.sh qwen-fixture
+
+      - name: Run real Qwen FFI integration fixture
+        env:
+          EDGE_INTELLIGENCE_QWEN_GGUF: ${{ github.workspace }}/qwen-fixture/qwen.gguf
+          EDGE_INTELLIGENCE_QWEN_TOKENIZER: ${{ github.workspace }}/qwen-fixture/tokenizer.json
+        run: bash scripts/run-qwen-ffi-integration.sh
 
       - name: Assert crates.io packages ship README.md
         run: bash scripts/assert-release-readmes.sh cargo
@@ -457,7 +480,8 @@ jobs:
         run: |
           trap 'rm -rf node_modules' EXIT
           bash ../scripts/retry-command.sh npm install --ignore-scripts --package-lock=false
-          npx tsc --noEmit --project tsconfig.rn.json
+          npm run typecheck:rn
+          npm run test:rn-factory
       - name: Set React Native package release version
         run: |
           npm pkg set version="$VERSION" --prefix assembly
@@ -660,6 +684,18 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+      - name: Restore Qwen Android smoke fixture cache
+        if: matrix.platform == 'android'
+        uses: actions/cache@v4
+        with:
+          path: qwen-fixture
+          key: qwen-fixture-${{ runner.os }}-${{ hashFiles('scripts/qwen-fixture.sha256') }}
+      - name: Download verified Qwen Android smoke fixture
+        if: matrix.platform == 'android'
+        run: |
+          bash scripts/download-qwen-fixture.sh qwen-fixture
+          echo "EDGE_INTELLIGENCE_QWEN_GGUF=${GITHUB_WORKSPACE}/qwen-fixture/qwen.gguf" >> "$GITHUB_ENV"
+          echo "EDGE_INTELLIGENCE_QWEN_TOKENIZER=${GITHUB_WORKSPACE}/qwen-fixture/tokenizer.json" >> "$GITHUB_ENV"
       - name: Install the packed SDK in an isolated Expo fixture
         run: |
           cp -R npm-package/example-expo expo-smoke

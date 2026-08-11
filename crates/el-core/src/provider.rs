@@ -154,6 +154,16 @@ pub trait LlmProvider: Send + Sync {
         req: &ChatRequest,
         on_token: &mut dyn FnMut(ChatToken),
     ) -> crate::Result<()>;
+
+    /// Release conversation-scoped state while keeping a provider's model
+    /// resources available for its next request.
+    ///
+    /// Providers without persistent conversation state use the default no-op.
+    /// Stateful providers override this to discard their KV cache, generated
+    /// output, and any other session-local buffers.
+    fn end_session(&self) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 import type { EdgeLlm, EdgeLlmLike } from './el_ffi';
 
 type NativeBindings = typeof import('./native');
+declare const require: (moduleId: string) => unknown;
 
 function loadNativeBindings(): NativeBindings {
   try {
@@ -9,7 +10,7 @@ function loadNativeBindings(): NativeBindings {
     const bindings = require('./native') as NativeBindings;
     if (
       !bindings.EdgeLlm
-      || typeof bindings.EdgeLlm.local !== 'function'
+      || typeof bindings.EdgeLlm.localQwen !== 'function'
       || typeof bindings.EdgeLlm.cloud !== 'function'
     ) {
       throw new Error('generated native entrypoint did not export EdgeLlm');
@@ -29,9 +30,33 @@ export function requireNativeElFfi(): void {
   loadNativeBindings();
 }
 
-export function localEdgeLlm(modelUri: string): EdgeLlmLike {
+function requireLocalAssetPath(path: string, label: string): void {
+  if (path.trim().length === 0) {
+    throw new Error(`${label} must be a non-empty local file path.`);
+  }
+}
+
+/**
+ * @deprecated A Qwen session requires a matching tokenizer. Pass it as the
+ * second argument: `localEdgeLlm(modelUri, tokenizerUri)`.
+ *
+ * This overload is retained for the published 0.3.x signature and, in the
+ * 0.4.0-or-later migration release, throws an error before constructing a
+ * byte-level session.
+ */
+export function localEdgeLlm(modelUri: string): EdgeLlmLike;
+export function localEdgeLlm(modelUri: string, tokenizerUri: string): EdgeLlmLike;
+export function localEdgeLlm(modelUri: string, tokenizerUri?: string): EdgeLlmLike {
+  requireLocalAssetPath(modelUri, 'modelUri');
+  if (tokenizerUri === undefined) {
+    throw new Error(
+      'localEdgeLlm(modelUri) requires a matching tokenizerUri for Qwen. '
+        + 'Migrate to localEdgeLlm(modelUri, tokenizerUri).'
+    );
+  }
+  requireLocalAssetPath(tokenizerUri, 'tokenizerUri');
   const native = loadNativeBindings();
-  return native.EdgeLlm.local(modelUri);
+  return native.EdgeLlm.localQwen(modelUri, tokenizerUri);
 }
 
 export function cloudEdgeLlm(model: string, apiKey: string): EdgeLlmLike {

@@ -33,6 +33,10 @@
 use el_core::CredentialRef;
 use el_core::{ChatMessage, ChatRequest, ChatToken, LlmProvider};
 
+/// Per-request generation bound for the synchronous React Native Qwen facade.
+#[cfg(not(target_arch = "wasm32"))]
+const QWEN_FFI_DEFAULT_MAX_TOKENS: u32 = 64;
+
 // UniFFI scaffolding — must appear once per crate, before any uniffi proc-macros.
 #[cfg(not(target_arch = "wasm32"))]
 uniffi::setup_scaffolding!("el_ffi");
@@ -84,6 +88,7 @@ impl From<el_core::EdgeError> for SdkError {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn emit_stream_error(
     result: std::result::Result<(), SdkError>,
     sink_closed: bool,
@@ -128,6 +133,8 @@ pub struct EdgeLlm {
     provider: Box<dyn LlmProvider>,
     /// Default model routing string (stored so `ask()` can fill `ChatRequest::model`).
     default_model: String,
+    /// Optional per-request completion cap applied by this FFI facade.
+    max_tokens: Option<u32>,
 }
 
 /// UniFFI-exported methods: constructors, blocking chat, and reset.
@@ -154,6 +161,8 @@ impl EdgeLlm {
     /// platform keystore.
     #[cfg_attr(not(target_arch = "wasm32"), uniffi::constructor)]
     pub fn local(model_uri: String) -> Result<Self, SdkError> {
+        #[cfg(target_arch = "wasm32")]
+        let _ = &model_uri;
         #[cfg(not(target_arch = "wasm32"))]
         {
             use el_core::{ModelFormat, ModelId, ModelVersion};
@@ -188,12 +197,53 @@ impl EdgeLlm {
             Ok(Self {
                 provider,
                 default_model: "local".into(),
+                max_tokens: None,
             })
         }
         #[cfg(target_arch = "wasm32")]
         Ok(Self {
             provider: Box::new(EchoProvider),
             default_model: "local".into(),
+            max_tokens: None,
+        })
+    }
+
+    /// Construct a real, air-gapped Qwen2/Qwen2.5 chat session for native
+    /// hosts (ADR-026). Both files must be caller-provided local assets: the
+    /// GGUF contains model weights and `tokenizer.json` provides the ChatML
+    /// control tokens plus the only valid token-id decoder.
+    ///
+    /// This intentionally does not fall back to [`Self::local`], whose
+    /// byte-level `LocalLlmProvider` exists only as a development/test seam.
+    /// Browser/WASM keeps its separate placeholder path and does not export
+    /// this constructor.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[uniffi::constructor]
+    pub fn local_qwen(model_uri: String, tokenizer_uri: String) -> Result<Self, SdkError> {
+        if model_uri.trim().is_empty() {
+            return Err(SdkError::ProviderError {
+                message: "Qwen model path must not be empty".into(),
+            });
+        }
+        if tokenizer_uri.trim().is_empty() {
+            return Err(SdkError::ProviderError {
+                message: "Qwen tokenizer path must not be empty".into(),
+            });
+        }
+
+        // React Native's current synchronous UniFFI methods execute on the JS
+        // thread. Every Qwen FFI request is therefore limited to 64 generated
+        // tokens. This facade has no caller-supplied generation-limit argument;
+        // hosts needing a different bound must use the Rust provider API until
+        // an async React Native surface is introduced.
+        let provider = el_engine_candle::QwenChatProvider::from_paths(&model_uri, &tokenizer_uri)
+            .map_err(|error| SdkError::ProviderError {
+            message: format!("{error} (model: {model_uri}, tokenizer: {tokenizer_uri})"),
+        })?;
+        Ok(Self {
+            provider: Box::new(provider),
+            default_model: "local/qwen".into(),
+            max_tokens: Some(QWEN_FFI_DEFAULT_MAX_TOKENS),
         })
     }
 
@@ -220,6 +270,7 @@ impl EdgeLlm {
         Self {
             provider: Box::new(provider),
             default_model: model,
+            max_tokens: None,
         }
     }
 
@@ -228,26 +279,40 @@ impl EdgeLlm {
     /// Returns `Err(SdkError::ProviderError)` on network/auth/engine failure
     /// so callers can distinguish model output from error conditions.
     pub fn ask(&self, prompt: String) -> Result<String, SdkError> {
-        let req = ChatRequest::new(self.default_model.clone(), vec![ChatMessage::user(prompt)]);
+        let req = self.request(prompt);
         self.provider
             .chat(&req)
             .map(|r| r.content)
             .map_err(SdkError::from)
     }
 
-    /// Reset the session (clears KV cache and output).
-    pub fn reset(&self) {
-        // Reset happens automatically at the start of each LocalLlmProvider::chat() call.
+    /// End the active conversation and clear its KV cache, generated output,
+    /// and other session-local buffers while retaining model weights.
+    ///
+    /// Returns an error if a stateful provider cannot release its session. The
+    /// caller must stop or rebuild the provider rather than reuse a possibly
+    /// stale KV cache.
+    pub fn reset(&self) -> Result<(), SdkError> {
+        self.provider.end_session().map_err(SdkError::from)
     }
 }
 
 impl EdgeLlm {
+    fn request(&self, prompt: String) -> ChatRequest {
+        let request = ChatRequest::new(self.default_model.clone(), vec![ChatMessage::user(prompt)]);
+        match self.max_tokens {
+            Some(max_tokens) => request.with_max_tokens(max_tokens),
+            None => request,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn ask_stream_with(
         &self,
         prompt: String,
         mut on_token: impl FnMut(String),
     ) -> Result<(), SdkError> {
-        let req = ChatRequest::new(self.default_model.clone(), vec![ChatMessage::user(prompt)]);
+        let req = self.request(prompt);
         self.provider
             .chat_stream(&req, &mut |t: ChatToken| {
                 if !t.is_final {
@@ -302,8 +367,8 @@ pub mod dart_api {
     }
 
     #[frb]
-    pub fn edge_llm_reset(sdk: &EdgeLlm) {
-        sdk.reset();
+    pub fn edge_llm_reset(sdk: &EdgeLlm) -> anyhow::Result<()> {
+        sdk.reset().map_err(to_anyhow)
     }
 
     #[frb]
@@ -511,5 +576,203 @@ mod tests {
             matches!(r, Err(SdkError::ProviderError { .. })),
             "non-empty path that doesn't exist must return SdkError"
         );
+    }
+
+    #[test]
+    fn local_qwen_requires_both_asset_paths() {
+        let missing_model = EdgeLlm::local_qwen("".into(), "tokenizer.json".into());
+        assert!(matches!(
+            missing_model,
+            Err(SdkError::ProviderError { ref message }) if message == "Qwen model path must not be empty"
+        ));
+
+        let missing_tokenizer = EdgeLlm::local_qwen("model.gguf".into(), "".into());
+        assert!(matches!(
+            missing_tokenizer,
+            Err(SdkError::ProviderError { ref message }) if message == "Qwen tokenizer path must not be empty"
+        ));
+    }
+
+    #[test]
+    fn local_qwen_missing_assets_return_sdk_error() {
+        let r = EdgeLlm::local_qwen(
+            "/nonexistent/qwen.gguf".into(),
+            "/nonexistent/tokenizer.json".into(),
+        );
+        assert!(matches!(
+            r,
+            Err(SdkError::ProviderError { ref message })
+                if message.contains("model file not found")
+                    && message.contains("model: /nonexistent/qwen.gguf")
+                    && message.contains("tokenizer: /nonexistent/tokenizer.json")
+        ));
+    }
+
+    fn assert_ready_completion(label: &str, text: &str) {
+        let trimmed = text.trim();
+        assert!(!trimmed.is_empty(), "{label} must not be empty");
+        assert!(
+            !trimmed.chars().all(|character| character == '?'),
+            "{label} must not be all question marks: {trimmed:?}"
+        );
+        assert_ne!(
+            trimmed, "I can't help with that request.",
+            "{label} must not be the deterministic safety refusal"
+        );
+        assert!(
+            trimmed.to_ascii_lowercase().contains("ready"),
+            "{label} must contain the requested word 'ready': {trimmed:?}"
+        );
+    }
+
+    struct ResetTrackingProvider {
+        reset_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        should_fail: bool,
+    }
+
+    impl LlmProvider for ResetTrackingProvider {
+        fn chat(&self, _: &ChatRequest) -> el_core::Result<el_core::ChatResponse> {
+            unreachable!("reset test does not chat")
+        }
+
+        fn chat_stream(
+            &self,
+            _: &ChatRequest,
+            _: &mut dyn FnMut(ChatToken),
+        ) -> el_core::Result<()> {
+            unreachable!("reset test does not stream")
+        }
+
+        fn end_session(&self) -> el_core::Result<()> {
+            self.reset_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.should_fail {
+                Err(el_core::EdgeError::Engine("reset failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn reset_forwards_to_provider_session_lifecycle() {
+        let reset_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sdk = EdgeLlm {
+            provider: Box::new(ResetTrackingProvider {
+                reset_calls: std::sync::Arc::clone(&reset_calls),
+                should_fail: false,
+            }),
+            default_model: "test".into(),
+            max_tokens: None,
+        };
+
+        sdk.reset().expect("provider reset must succeed");
+
+        assert_eq!(reset_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn reset_propagates_provider_failure() {
+        let sdk = EdgeLlm {
+            provider: Box::new(ResetTrackingProvider {
+                reset_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                should_fail: true,
+            }),
+            default_model: "test".into(),
+            max_tokens: None,
+        };
+
+        assert!(matches!(
+            sdk.reset(),
+            Err(SdkError::ProviderError { ref message }) if message.contains("reset failed")
+        ));
+    }
+
+    struct RequestCapProvider(std::sync::Arc<std::sync::Mutex<Vec<Option<u32>>>>);
+
+    impl LlmProvider for RequestCapProvider {
+        fn chat(&self, req: &ChatRequest) -> el_core::Result<el_core::ChatResponse> {
+            self.0.lock().unwrap().push(req.max_tokens);
+            Ok(el_core::ChatResponse {
+                content: "ready".into(),
+                model: req.model.clone(),
+                prompt_tokens: 0,
+                completion_tokens: 1,
+            })
+        }
+
+        fn chat_stream(
+            &self,
+            req: &ChatRequest,
+            on_token: &mut dyn FnMut(ChatToken),
+        ) -> el_core::Result<()> {
+            self.0.lock().unwrap().push(req.max_tokens);
+            on_token(ChatToken {
+                text: "ready".into(),
+                is_final: false,
+            });
+            on_token(ChatToken {
+                text: String::new(),
+                is_final: true,
+            });
+            Ok(())
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn qwen_ffi_cap_is_applied_to_ask_and_stream_requests() {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sdk = EdgeLlm {
+            provider: Box::new(RequestCapProvider(std::sync::Arc::clone(&requests))),
+            default_model: "local/qwen".into(),
+            max_tokens: Some(QWEN_FFI_DEFAULT_MAX_TOKENS),
+        };
+
+        sdk.ask("Reply with exactly: ready".into()).unwrap();
+        sdk.ask_stream_with("Reply with exactly: ready".into(), |_| {})
+            .unwrap();
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![Some(QWEN_FFI_DEFAULT_MAX_TOKENS); 2]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires EDGE_INTELLIGENCE_QWEN_GGUF and EDGE_INTELLIGENCE_QWEN_TOKENIZER"]
+    fn native_qwen_integration_decodes_and_streams_english_text() {
+        struct CapturingHandler(std::sync::Arc<std::sync::Mutex<String>>);
+
+        impl StreamHandler for CapturingHandler {
+            fn on_token(&self, token: String) {
+                self.0.lock().unwrap().push_str(&token);
+            }
+        }
+
+        let model_uri = std::env::var("EDGE_INTELLIGENCE_QWEN_GGUF")
+            .expect("set EDGE_INTELLIGENCE_QWEN_GGUF to the official Qwen2.5 GGUF");
+        let tokenizer_uri = std::env::var("EDGE_INTELLIGENCE_QWEN_TOKENIZER")
+            .expect("set EDGE_INTELLIGENCE_QWEN_TOKENIZER to its matching tokenizer.json");
+        let sdk = EdgeLlm::local_qwen(model_uri, tokenizer_uri)
+            .expect("official Qwen model/tokenizer pair must construct");
+
+        let reply = sdk
+            .ask("Reply with exactly: ready".into())
+            .expect("Qwen ask must succeed");
+        assert_ready_completion("ask response", &reply);
+
+        // Reset must succeed and must not unload the resident model. State
+        // release itself is verified by the provider/session lifecycle tests.
+        sdk.reset()
+            .expect("Qwen reset must release the active session");
+
+        let streamed = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        sdk.ask_stream_cb(
+            "Reply with exactly: ready".into(),
+            Box::new(CapturingHandler(std::sync::Arc::clone(&streamed))),
+        )
+        .expect("Qwen ask_stream_cb must succeed");
+        assert_ready_completion("streamed response", &streamed.lock().unwrap());
     }
 }

@@ -13,6 +13,11 @@ on:
       - '.cargo/config.toml'
       - 'Makefile'
       - 'scripts/build-ios-xcframework.sh'
+      - 'scripts/download-qwen-fixture.sh'
+      - 'scripts/qwen-fixture.sha256'
+      - 'scripts/run-qwen-ffi-integration.sh'
+      - 'scripts/assert-adr-026-release-version.py'
+      - 'scripts/expo-android-local-session-smoke.sh'
       - 'scripts/verify-android-page-alignment.py'
       - 'scripts/install-cargo-tool.sh'
       - 'scripts/retry-command.sh'
@@ -36,6 +41,11 @@ on:
       - 'Cargo.toml'
       - 'Makefile'
       - 'scripts/build-ios-xcframework.sh'
+      - 'scripts/download-qwen-fixture.sh'
+      - 'scripts/qwen-fixture.sha256'
+      - 'scripts/run-qwen-ffi-integration.sh'
+      - 'scripts/assert-adr-026-release-version.py'
+      - 'scripts/expo-android-local-session-smoke.sh'
       - 'scripts/verify-android-page-alignment.py'
       - 'scripts/install-cargo-tool.sh'
       - 'scripts/retry-command.sh'
@@ -58,6 +68,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test el-ffi (host target)
         run: cargo test -p el-ffi
+      - name: Restore Qwen integration fixture cache
+        uses: actions/cache@v4
+        with:
+          path: qwen-fixture
+          key: qwen-fixture-${{ runner.os }}-${{ hashFiles('scripts/qwen-fixture.sha256') }}
+      - name: Download verified Qwen integration fixture
+        run: bash scripts/download-qwen-fixture.sh qwen-fixture
+      - name: Run real Qwen FFI integration fixture
+        env:
+          EDGE_INTELLIGENCE_QWEN_GGUF: ${{ github.workspace }}/qwen-fixture/qwen.gguf
+          EDGE_INTELLIGENCE_QWEN_TOKENIZER: ${{ github.workspace }}/qwen-fixture/tokenizer.json
+        run: bash scripts/run-qwen-ffi-integration.sh
       - name: Test cargo tool installer
         run: bash tests/test-install-cargo-tool.sh
       - name: Test command retry wrapper
@@ -180,7 +202,8 @@ jobs:
         run: |
           trap 'rm -rf node_modules' EXIT
           bash ../scripts/retry-command.sh npm install --ignore-scripts --package-lock=false
-          npx tsc --noEmit --project tsconfig.rn.json
+          npm run typecheck:rn
+          npm run test:rn-factory
       - name: Run Expo Android native build smoke
         working-directory: assembly/example-expo
         run: |
@@ -218,6 +241,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build el-ffi iOS XCFramework
         run: bash scripts/build-ios-xcframework.sh
+      - name: Restore Qwen integration fixture cache
+        uses: actions/cache@v4
+        with:
+          path: qwen-fixture
+          key: qwen-fixture-${{ runner.os }}-${{ hashFiles('scripts/qwen-fixture.sha256') }}
+      - name: Download verified Qwen integration fixture
+        run: bash scripts/download-qwen-fixture.sh qwen-fixture
+      - name: Run real Qwen FFI integration fixture
+        env:
+          EDGE_INTELLIGENCE_QWEN_GGUF: ${{ github.workspace }}/qwen-fixture/qwen.gguf
+          EDGE_INTELLIGENCE_QWEN_TOKENIZER: ${{ github.workspace }}/qwen-fixture/tokenizer.json
+        run: bash scripts/run-qwen-ffi-integration.sh
 
   # ── Web: wasm32-unknown-unknown + wasm-pack ───────────────────────────────
   wasm:

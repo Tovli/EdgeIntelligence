@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 
@@ -16,6 +17,8 @@ PACKAGE = ROOT / "packaging" / "npm"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 BINDINGS_WORKFLOW = ROOT / ".github" / "workflows" / "bindings.yml"
 ADR = ROOT / "docs" / "adr" / "ADR-025-react-native-expo-autolink-ready-native-distribution.md"
+ADR_026 = ROOT / "docs" / "adr" / "ADR-026-tokenizer-aware-qwen-local-sessions-for-react-native.md"
+ADR_026_RELEASE_VERSION_GUARD = ROOT / "scripts" / "assert-adr-026-release-version.py"
 UBRN_CMAKE_PATCH = ROOT / "scripts" / "patch-ubrn-cmake.py"
 UBRN_VERSION = "0.31.0-3"
 
@@ -89,6 +92,41 @@ def test_adr_matches_the_expo_autolinking_dependency_contract() -> None:
     assert "Expo is not a peer dependency" in normalized
     assert "verified host for this decision is Expo SDK 57 / React Native 0.86" in normalized
     assert "React Native and Expo\n   remain peer dependencies" not in adr
+
+
+def test_adr_026_matches_the_tokenizer_aware_qwen_contract() -> None:
+    adr = ADR_026.read_text(encoding="utf-8")
+    normalized = " ".join(adr.split())
+
+    assert "localEdgeLlm(modelUri, tokenizerUri)" in normalized
+    assert "localEdgeLlm(modelUri)" in normalized
+    assert "QwenChatProvider::from_paths" in adr
+    assert "all-`?`" in adr
+    assert "64 generated tokens" in adr
+    assert "deferred to a separately scoped mobile" in adr
+    assert "0.4.0-or-later minor release" in adr
+
+
+def test_adr_026_release_version_guard_requires_a_minor_bump() -> None:
+    allowed = subprocess.run(
+        [sys.executable, str(ADR_026_RELEASE_VERSION_GUARD), "0.4.0"],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    rejected = subprocess.run(
+        [sys.executable, str(ADR_026_RELEASE_VERSION_GUARD), "0.3.15"],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert allowed.returncode == 0, allowed.stderr
+    assert "at or above 0.4.0" in allowed.stdout
+    assert rejected.returncode == 1
+    assert "below the required 0.4.0 minor release" in rejected.stderr
 
 
 def test_package_codegen_names_match_ubrn_turbo_module() -> None:
@@ -211,8 +249,52 @@ def test_runtime_guard_explains_how_to_load_the_native_module() -> None:
     assert "cloudEdgeLlm" in native_types
     assert "EdgeLlmLike" in native_types
     assert "react-native" not in native_types
-    assert "typeof bindings.EdgeLlm.local" in entrypoint
+    assert "typeof bindings.EdgeLlm.localQwen" in entrypoint
     assert "generated native entrypoint did not export EdgeLlm" in entrypoint
+
+
+def test_react_native_qwen_factory_requires_both_local_asset_paths() -> None:
+    ffi = (ROOT / "crates" / "adapters" / "el-ffi" / "src" / "lib.rs").read_text(
+        encoding="utf-8"
+    )
+    entrypoint = (PACKAGE / "src" / "rn" / "index.ts").read_text(encoding="utf-8")
+    native_types = (PACKAGE / "src" / "rn" / "index.d.ts").read_text(encoding="utf-8")
+    public_typecheck = (PACKAGE / "typecheck" / "rn-public-api.ts").read_text(
+        encoding="utf-8"
+    )
+
+    assert "pub fn local_qwen(model_uri: String, tokenizer_uri: String)" in ffi
+    assert "QwenChatProvider::from_paths(&model_uri, &tokenizer_uri)" in ffi
+    assert "Qwen model path must not be empty" in ffi
+    assert "Qwen tokenizer path must not be empty" in ffi
+    assert "native_qwen_integration_decodes_and_streams_english_text" in ffi
+    qwen_runner = ROOT / "scripts" / "run-qwen-ffi-integration.sh"
+    assert qwen_runner.is_file()
+    qwen_runner_source = qwen_runner.read_text(encoding="utf-8")
+    assert 'readonly test_name="native_qwen_integration_decodes_and_streams_english_text"' in qwen_runner_source
+    assert 'grep -F "running 1 test"' in qwen_runner_source
+    assert 'grep -F "$test_name ... ok"' in qwen_runner_source
+    assert "ask_stream_cb" in ffi
+    assert "max_tokens: Some(QWEN_FFI_DEFAULT_MAX_TOKENS)" in ffi
+    assert "QWEN_FFI_DEFAULT_MAX_TOKENS: u32 = 64" in ffi
+    assert "fn reset(&self) -> Result<(), SdkError>" in ffi
+    assert "self.provider.end_session()" in ffi
+    assert "model: {model_uri}, tokenizer: {tokenizer_uri}" in ffi
+    assert "qwen_ffi_cap_is_applied_to_ask_and_stream_requests" in ffi
+    assert "native.EdgeLlm.localQwen(modelUri, tokenizerUri)" in entrypoint
+    assert "requireLocalAssetPath(modelUri, 'modelUri')" in entrypoint
+    assert "requireLocalAssetPath(tokenizerUri, 'tokenizerUri')" in entrypoint
+    assert (
+        "localEdgeLlm(modelUri: string, tokenizerUri: string): EdgeLlmLike" in native_types
+    )
+    assert "localEdgeLlm(modelUri: string): EdgeLlmLike" in native_types
+    assert "Parameters<typeof localEdgeLlm>" in public_typecheck
+    assert "[modelUri: string, tokenizerUri: string]" in public_typecheck
+    assert "const legacyLocal: (modelUri: string)" in public_typecheck
+    assert "Migrate to localEdgeLlm(modelUri, tokenizerUri)." in entrypoint
+    runtime_test = PACKAGE / "typecheck" / "rn-factory-runtime-test.cjs"
+    assert runtime_test.is_file()
+    assert "localQwen" in runtime_test.read_text(encoding="utf-8")
 
 
 def test_expo_fixture_targets_current_supported_host() -> None:
@@ -232,12 +314,23 @@ def test_expo_fixture_targets_current_supported_host() -> None:
     assert lock["packages"][""]["dependencies"] == fixture["dependencies"]
     assert lock["packages"]["node_modules/expo"]["version"] == "57.0.9"
     assert lock["packages"]["node_modules/react-native"]["version"] == "0.86.0"
-    assert "Edge Intelligence native bridge loaded." in app
+    assert "Edge Intelligence Qwen local session passed." in app
     smoke_script = (
         ROOT / "scripts" / "expo-android-local-session-smoke.sh"
     ).read_text(encoding="utf-8")
-    assert "Edge Intelligence native bridge loaded." in smoke_script
-    assert "release smoke fixture" in app
+    assert "Edge Intelligence Qwen local session passed." in smoke_script
+    assert "localEdgeLlm(modelUri, tokenizerUri)" in app
+    assert "askStreamCb" in app
+    assert "sdk.reset();" in app
+    assert "EDGE_INTELLIGENCE_QWEN_GGUF" in smoke_script
+    assert "Edge Intelligence Qwen local session failed:" in smoke_script
+    assert "Local-session failure UI follows." in smoke_script
+    assert "dump_ui >&2" in smoke_script
+    assert "adb push" in smoke_script
+    assert "/sdcard/Android/data/$package_name/files/models" in smoke_script
+    assert "app-release.apk" in smoke_script
+    assert "app-debug.apk" not in smoke_script
+    assert "localEdgeLlm('')" not in app
     assert "export const sdk" not in app
     assert '"plugins"' not in app_config
     assert (PACKAGE / "example-expo" / "package-lock.json").is_file()
@@ -247,10 +340,16 @@ def test_expo_fixture_targets_current_supported_host() -> None:
     assert "release CI fixture" in fixture_readme
 
     workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    assert "Assert ADR-026 migration has a minor release" in workflow
+    assert "python3 scripts/assert-adr-026-release-version.py" in workflow
     assert "npm install --package-lock-only --ignore-scripts" in workflow
     assert "bash ../scripts/retry-command.sh npm ci" in workflow
     assert "Run React Native package type check" in workflow
-    assert "npx tsc --noEmit --project tsconfig.rn.json" in workflow
+    assert "npm run typecheck:rn" in workflow
+    assert "npm run test:rn-factory" in workflow
+    assert "scripts/download-qwen-fixture.sh qwen-fixture" in workflow
+    assert ":app:assembleRelease" in workflow
+    assert ":app:assembleDebug" not in workflow
 
 
 def test_expo_ios_smoke_selects_only_top_level_workspace() -> None:
@@ -291,11 +390,26 @@ def test_android_emulator_runner_receives_a_single_command() -> None:
 
 def test_documentation_uses_generated_typescript_names() -> None:
     readme = (PACKAGE / "README.md").read_text(encoding="utf-8")
+    ffi_readme = (ROOT / "crates" / "adapters" / "el-ffi" / "README.md").read_text(
+        encoding="utf-8"
+    )
+    ffi_source = (ROOT / "crates" / "adapters" / "el-ffi" / "src" / "lib.rs").read_text(
+        encoding="utf-8"
+    )
     normalized = " ".join(readme.split())
 
     assert "askStreamCb" in readme
     assert "onToken" in readme
     assert "ask_stream_cb" not in readme
+    assert "localEdgeLlm(qwen05b, qwenTokenizer)" in readme
+    assert "matching official `tokenizer.json`" in readme
+    assert "currently synchronous native calls" in readme
+    assert "Every Qwen reply is capped at 64 generated" in readme
+    assert "EdgeLlm.localQwen" in ffi_readme
+    assert "askStreamCb" in ffi_readme
+    assert "native log" not in ffi_source
+    assert "caller must stop or rebuild" in ffi_source
+    assert "self.provider.end_session().map_err(SdkError::from)" in ffi_source
     assert '"plugins": ["edge-intelligence-sdk"]' not in readme
     assert "Android x86 is not supported" in normalized
 
@@ -423,6 +537,7 @@ def test_contract_runs_for_pull_requests() -> None:
 
     assert "'packaging/npm/**'" in workflow
     assert "'tests/test_react_native_package_contract.py'" in workflow
+    assert workflow.count("'scripts/assert-adr-026-release-version.py'") == 2
     assert workflow.count("'.github/workflows/release.yml'") == 2
     assert "python3 tests/test_react_native_package_contract.py" in workflow
     assert "Assemble React Native package for Android smoke" in workflow

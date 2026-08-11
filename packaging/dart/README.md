@@ -7,6 +7,11 @@ The package exposes one framework-neutral Dart API. Flutter plugin metadata is
 used only to bundle the Android and iOS native runtimes; the public library does
 not import Flutter or expose Flutter types.
 
+> **Qwen limitation:** `EdgeLlm.local(modelUri)` is the retained byte-level
+> GGUF compatibility path. It does not accept `tokenizer.json` and is not
+> compatible with Qwen2/Qwen2.5 chat models; do not point it at a Qwen GGUF.
+> A tokenizer-aware Dart Qwen constructor is outside ADR-026's scope.
+
 ## Usage
 
 ```dart
@@ -16,6 +21,7 @@ Future<void> main() async {
   await initEdgeIntelligence();
 
   try {
+    // Legacy byte-level GGUF compatibility path; this must not be a Qwen model.
     final sdk = await EdgeLlm.local("/path/to/model.gguf");
     final reply = await sdk.ask("Summarize edge inference in one sentence.");
     print(reply);
@@ -63,7 +69,8 @@ The mobile release includes:
 - iOS 13+ device and simulator slices in a dynamic XCFramework.
 
 Keep framework-specific model storage, permissions, and UI state in the Flutter
-application. Pass the resulting local GGUF file path to `EdgeLlm.local`.
+application. `EdgeLlm.local` accepts a local GGUF only for the retained
+byte-level compatibility path; do not use it with Qwen2/Qwen2.5 chat models.
 
 ## Supported hosts
 
@@ -81,7 +88,8 @@ for browser applications.
 ## Example
 
 `example/` contains a runnable Flutter Android/iOS application that selects a
-local GGUF model and streams a response. Run it with:
+non-Qwen GGUF for the retained byte-level compatibility path and streams a
+response. Run it with:
 
 ```shell
 cd example

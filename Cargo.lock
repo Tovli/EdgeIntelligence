@@ -825,6 +825,7 @@ dependencies = [
  "el-core",
  "el-provenance",
  "el-runtime",
+ "serde_json",
  "tokenizers",
 ]
 

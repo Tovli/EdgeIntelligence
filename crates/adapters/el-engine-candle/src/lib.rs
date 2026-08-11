@@ -1009,8 +1009,7 @@ impl QwenChatProvider {
         let tokenizer = Tokenizer::from_file(tokenizer_path.as_ref())
             .map_err(|_| EdgeError::Engine("failed to load tokenizer.json"))?;
 
-        // Stop token: Qwen2.5 ChatML turn terminator (fallback to its known id).
-        let eos = tokenizer.token_to_id("<|im_end|>").unwrap_or(151_645);
+        let eos = qwen_chatml_eos(&tokenizer)?;
 
         let model_label = model_path
             .file_stem()
@@ -1130,6 +1129,49 @@ impl QwenChatProvider {
             .decode(ids, true)
             .map_err(|_| EdgeError::Engine("tokenizer decode failed"))
     }
+}
+
+/// Verify the tokenizer can encode the Qwen2.5 ChatML envelope and return its
+/// turn terminator. A tokenizer from another model family must fail at
+/// construction rather than decoding Qwen token IDs as arbitrary text.
+fn qwen_chatml_eos(tokenizer: &Tokenizer) -> Result<Token> {
+    fn added_special_token(tokenizer: &Tokenizer, token: &str) -> Result<Token> {
+        let added = tokenizer.get_added_vocabulary();
+        if !added.is_special_token(token) {
+            return Err(EdgeError::Engine(
+                "tokenizer.json must register Qwen ChatML control tokens as added special tokens",
+            ));
+        }
+        added
+            .get_vocab()
+            .get(token)
+            .copied()
+            .ok_or(EdgeError::Engine(
+                "tokenizer.json is missing a registered Qwen ChatML control token",
+            ))
+    }
+
+    let im_start = added_special_token(tokenizer, "<|im_start|>")?;
+    let im_end = added_special_token(tokenizer, "<|im_end|>")?;
+
+    // `token_to_id` also finds model-vocabulary entries, which are not
+    // necessarily isolated by `Tokenizer::encode`. The generated envelope has
+    // two starts and one end, so confirm all three survive encoding as their
+    // registered control-token IDs rather than being split into sub-pieces.
+    let envelope = render_chatml(&[ChatMessage::user("tokenizer validation")]);
+    let encoded = tokenizer
+        .encode(envelope, false)
+        .map_err(|_| EdgeError::Engine("tokenizer failed to encode the Qwen ChatML envelope"))?;
+    let ids = encoded.get_ids();
+    if ids.iter().filter(|&&id| id == im_start).count() != 2
+        || ids.iter().filter(|&&id| id == im_end).count() != 1
+    {
+        return Err(EdgeError::Engine(
+            "tokenizer.json does not encode Qwen ChatML controls as single added-token IDs",
+        ));
+    }
+
+    Ok(im_end)
 }
 
 impl LlmProvider for QwenChatProvider {
@@ -1349,6 +1391,10 @@ impl LlmProvider for QwenChatProvider {
         });
         Ok(())
     }
+
+    fn end_session(&self) -> Result<()> {
+        QwenChatProvider::end_session(self)
+    }
 }
 
 /// Print an `EL_BENCH` per-phase + per-forward breakdown for one `chat()` call.
@@ -1507,6 +1553,7 @@ fn local_load_permit(path: &std::path::Path) -> Result<LoadPermit> {
 mod tests {
     use super::*;
     use el_runtime::InferenceEngine;
+    use tokenizers::Tokenizer;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -1760,6 +1807,105 @@ mod tests {
                     <|im_start|>user\nbye<|im_end|>\n\
                     <|im_start|>assistant\n";
         assert_eq!(got, want);
+    }
+
+    fn tokenizer_with_base_tokens(tokens: &[(&str, u32)]) -> Tokenizer {
+        let vocab: serde_json::Map<String, serde_json::Value> = tokens
+            .iter()
+            .map(|(token, id)| ((*token).to_owned(), serde_json::Value::from(*id)))
+            .collect();
+        let spec = serde_json::json!({
+            "version": "1.0",
+            "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "<unk>" },
+        });
+        Tokenizer::from_bytes(serde_json::to_vec(&spec).unwrap())
+            .expect("synthetic tokenizer.json parses")
+    }
+
+    fn tokenizer_with_added_special_tokens(tokens: &[(&str, u32)]) -> Tokenizer {
+        let added_tokens: Vec<serde_json::Value> = tokens
+            .iter()
+            .map(|(token, id)| {
+                serde_json::json!({
+                    "id": id,
+                    "content": token,
+                    "single_word": false,
+                    "lstrip": false,
+                    "rstrip": false,
+                    "normalized": false,
+                    "special": true,
+                })
+            })
+            .collect();
+        let spec = serde_json::json!({
+            "version": "1.0",
+            "model": {
+                "type": "WordLevel",
+                "vocab": { "<unk>": 0 },
+                "unk_token": "<unk>",
+            },
+            "added_tokens": added_tokens,
+        });
+        Tokenizer::from_bytes(serde_json::to_vec(&spec).unwrap())
+            .expect("synthetic tokenizer.json parses")
+    }
+
+    #[test]
+    fn qwen_chatml_tokenizer_requires_both_control_tokens() {
+        let missing_start = tokenizer_with_added_special_tokens(&[("<|im_end|>", 11)]);
+        assert!(matches!(
+            qwen_chatml_eos(&missing_start),
+            Err(EdgeError::Engine(_))
+        ));
+
+        let missing_end = tokenizer_with_added_special_tokens(&[("<|im_start|>", 10)]);
+        assert!(matches!(
+            qwen_chatml_eos(&missing_end),
+            Err(EdgeError::Engine(_))
+        ));
+
+        let base_vocab_only =
+            tokenizer_with_base_tokens(&[("<|im_start|>", 10), ("<|im_end|>", 11)]);
+        assert!(matches!(
+            qwen_chatml_eos(&base_vocab_only),
+            Err(EdgeError::Engine(_))
+        ));
+
+        let qwen = tokenizer_with_added_special_tokens(&[("<|im_start|>", 10), ("<|im_end|>", 11)]);
+        let im_start = qwen
+            .get_added_vocabulary()
+            .get_vocab()
+            .get("<|im_start|>")
+            .copied()
+            .expect("<|im_start|> is registered as an added token");
+        let im_end = qwen
+            .get_added_vocabulary()
+            .get_vocab()
+            .get("<|im_end|>")
+            .copied()
+            .expect("<|im_end|> is registered as an added token");
+        assert_eq!(qwen_chatml_eos(&qwen).unwrap(), im_end);
+
+        let encoded = qwen
+            .encode(
+                render_chatml(&[ChatMessage::user("tokenizer validation")]),
+                false,
+            )
+            .expect("registered ChatML controls encode");
+        assert_eq!(
+            encoded
+                .get_ids()
+                .iter()
+                .filter(|&&id| id == im_start)
+                .count(),
+            2,
+            "both <|im_start|> controls must encode atomically"
+        );
+        assert_eq!(
+            encoded.get_ids().iter().filter(|&&id| id == im_end).count(),
+            1,
+            "the <|im_end|> control must encode atomically"
+        );
     }
 
     #[test]

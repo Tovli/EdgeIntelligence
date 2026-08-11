@@ -18,6 +18,30 @@ BINDINGS_WORKFLOW = ROOT / ".github" / "workflows" / "bindings.yml"
 STAGE_DART_EXAMPLE = ROOT / "scripts" / "stage_dart_example.py"
 
 
+def test_dart_example_labels_its_gguf_compatibility_path_as_non_qwen() -> None:
+    example = ROOT / "packaging" / "dart" / "example"
+    package_readme = (ROOT / "packaging" / "dart" / "README.md").read_text(
+        encoding="utf-8"
+    )
+    app = (example / "lib" / "main.dart").read_text(encoding="utf-8")
+    cli = (example / "dart_cli.dart").read_text(encoding="utf-8")
+    pubspec = (example / "pubspec.yaml").read_text(encoding="utf-8")
+    readme = (example / "README.md").read_text(encoding="utf-8")
+    normalized_package_readme = " ".join(package_readme.replace(">", "").split())
+    normalized_readme = " ".join(readme.split())
+    assert "FilePicker.platform.pickFiles" in app
+    assert "allowedExtensions: const ['gguf']" in app
+    assert "file_picker:" in pubspec
+    assert "Usage: dart run example/dart_cli.dart <model.gguf> [prompt]" in cli
+    assert "EdgeLlm.local(arguments.first)" in cli
+    assert "endsWith('.gguf')" not in cli
+    assert "not compatible with Qwen2/Qwen2.5" in normalized_package_readme
+    assert "must not be a Qwen model" in package_readme
+    assert "not compatible with Qwen2/Qwen2.5" in normalized_readme
+    assert "Qwen2/Qwen2.5 GGUF chat models." in cli
+    assert "Qwen2/Qwen2.5 models" in app
+
+
 def _workflow_job_body(workflow: str, job_name: str) -> str:
     match = re.search(
         rf"(?ms)^  {re.escape(job_name)}:\s*\n"

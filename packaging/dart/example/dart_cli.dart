@@ -4,8 +4,9 @@ import 'package:edge_intelligence/edge_intelligence.dart';
 
 Future<void> main(List<String> arguments) async {
   if (arguments.isEmpty) {
-    stderr
-        .writeln('Usage: dart run example/dart_cli.dart <model.gguf> [prompt]');
+    stderr.writeln(
+      'Usage: dart run example/dart_cli.dart <model.gguf> [prompt]',
+    );
     exitCode = 64;
     return;
   }
@@ -14,6 +15,10 @@ Future<void> main(List<String> arguments) async {
       ? arguments.skip(1).join(' ')
       : 'Summarize edge inference in one sentence.';
 
+  stderr.writeln(
+    'Warning: this byte-level Dart compatibility path is not compatible with '
+    'Qwen2/Qwen2.5 GGUF chat models.',
+  );
   await initEdgeIntelligence();
   try {
     final sdk = await EdgeLlm.local(arguments.first);

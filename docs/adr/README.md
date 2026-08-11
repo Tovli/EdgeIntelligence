@@ -29,6 +29,7 @@ the `adr-patterns` namespace.
 | [023](./ADR-023-baseline-performance-instrumentation.md) | Baseline performance instrumentation | proposed | telemetry, performance, testing, follow-up, P0 |
 | [024](./ADR-024-dart-only-platform-agnostic-pub-dev-sdk.md) | Dart-first pub.dev SDK with Flutter mobile runtimes | accepted | dart, flutter, pub.dev, bindings, packaging, platform-agnostic |
 | [025](./ADR-025-react-native-expo-autolink-ready-native-distribution.md) | Expo-autolink-ready React Native native distribution | accepted | react-native, expo, npm, packaging, jsi, bindings |
+| [026](./ADR-026-tokenizer-aware-qwen-local-sessions-for-react-native.md) | Tokenizer-aware Qwen local sessions for React Native | proposed | react-native, npm, qwen, tokenizer, bindings, on-device, api |
 
 ## Decision relationships
 
@@ -71,6 +72,10 @@ flowchart LR
     A001 --> A025[025 Expo/autolink-ready RN distribution]
     A011 --> A025
     A024 -. separate Dart package .-> A025
+    A002 --> A026[026 Tokenizer-aware Qwen RN sessions]
+    A004 --> A026
+    A018 --> A026
+    A025 --> A026
 ```
 
 > **ADR-008 is foundational** (the language decision) and drives the revisions to

@@ -128,6 +128,12 @@ class _EdgeIntelligenceExampleState extends State<EdgeIntelligenceExample> {
           child: ListView(
             padding: const EdgeInsets.all(20),
             children: [
+              const Text(
+                'Legacy byte-level GGUF compatibility demo. Do not select '
+                'Qwen2/Qwen2.5 models: this Dart binding is not '
+                'tokenizer-aware.',
+              ),
+              const SizedBox(height: 12),
               Row(
                 children: [
                   Expanded(

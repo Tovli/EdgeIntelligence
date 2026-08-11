@@ -44,6 +44,10 @@
       "javaPackageName": "com.edgeintelligence"
     }
   },
+  "scripts": {
+    "test:rn-factory": "node typecheck/rn-factory-runtime-test.cjs",
+    "typecheck:rn": "tsc --noEmit --project tsconfig.rn.json"
+  },
   "dependencies": {
     "@ubjs/core": "0.31.0-3",
     "uniffi-bindgen-react-native": "0.31.0-3"

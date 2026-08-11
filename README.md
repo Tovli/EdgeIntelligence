@@ -96,8 +96,10 @@ comes from three layers, each with a clear entry point:
 <summary><b>Which entry point should I use?</b></summary>
 
 - **Building a device, desktop, mobile, or web app** → use [`el-ffi`](crates/adapters/el-ffi)'s
-  `EdgeLlm`. Construct `EdgeLlm::local(model_uri)` (air-gapped) or
-  `EdgeLlm::cloud(model, api_key)` (opt-in), then call `ask(...)`; use
+  `EdgeLlm`. For native Qwen chat, construct
+  `EdgeLlm::local_qwen(model_uri, tokenizer_uri)` (air-gapped); the legacy
+  `EdgeLlm::local(model_uri)` is a byte-level development/test seam. Construct
+  `EdgeLlm::cloud(model, api_key)` only for opt-in frontier access, then call `ask(...)`; use
   `ask_stream_cb(...)` from React Native, `askStream(...)` from Dart, or the
   wasm-bindgen web stream surface from npm. The crate compiles to native and
   wasm artifacts and ships generated TypeScript/Dart bindings.

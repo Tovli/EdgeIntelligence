@@ -254,26 +254,26 @@ fn wire__crate__dart_api__edge_llm_reset_impl(
             >>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
-                transform_result_sse::<_, ()>((move || {
-                    let mut api_sdk_guard = None;
-                    let decode_indices_ =
-                        flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
-                            flutter_rust_bridge::for_generated::LockableOrderInfo::new(
-                                &api_sdk, 0, false,
-                            ),
-                        ]);
-                    for i in decode_indices_ {
-                        match i {
-                            0 => api_sdk_guard = Some(api_sdk.lockable_decode_sync_ref()),
-                            _ => unreachable!(),
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let mut api_sdk_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_sdk, 0, false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => api_sdk_guard = Some(api_sdk.lockable_decode_sync_ref()),
+                                _ => unreachable!(),
+                            }
                         }
-                    }
-                    let api_sdk_guard = api_sdk_guard.unwrap();
-                    let output_ok = Result::<_, ()>::Ok({
-                        crate::dart_api::edge_llm_reset(&*api_sdk_guard);
-                    })?;
-                    Ok(output_ok)
-                })())
+                        let api_sdk_guard = api_sdk_guard.unwrap();
+                        let output_ok = crate::dart_api::edge_llm_reset(&*api_sdk_guard)?;
+                        Ok(output_ok)
+                    })(),
+                )
             }
         },
     )

@@ -31,6 +31,11 @@ dump_ui() {
   adb shell cat /sdcard/window.xml 2>/dev/null || true
 }
 
+dump_failure_logs() {
+  echo "Local-session logcat follows." >&2
+  adb logcat -d -v threadtime >&2 || true
+}
+
 for _ in $(seq 1 180); do
   ui_dump=$(dump_ui)
   if printf '%s\n' "$ui_dump" | grep -qF "$success_text"; then
@@ -39,12 +44,13 @@ for _ in $(seq 1 180); do
   if printf '%s\n' "$ui_dump" | grep -qF "$failure_text"; then
     echo "Local-session failure UI follows." >&2
     printf '%s\n' "$ui_dump" >&2
+    dump_failure_logs
     exit 1
   fi
   sleep 2
 done
 
-echo "Local-session success UI was not found; logcat follows." >&2
+echo "Local-session success UI was not found." >&2
 dump_ui >&2
-adb logcat -d
+dump_failure_logs
 exit 1

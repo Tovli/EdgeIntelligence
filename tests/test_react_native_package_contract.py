@@ -374,9 +374,14 @@ def test_android_emulator_runner_receives_a_single_command() -> None:
     command = scalar.group(1)
     assert command == "sh scripts/expo-android-local-session-smoke.sh"
     assert "\r" not in command and "\n" not in command
+    assert "ram-size: 4096M" in emulator_step
+    assert "heap-size: 1024M" in emulator_step
 
     smoke_script = ROOT / "scripts" / "expo-android-local-session-smoke.sh"
     assert smoke_script.is_file()
+    smoke_source = smoke_script.read_text(encoding="utf-8")
+    assert "dump_failure_logs" in smoke_source
+    assert "adb logcat -d -v threadtime" in smoke_source
     shell = shutil.which("sh")
     if shell:
         syntax_check = subprocess.run(

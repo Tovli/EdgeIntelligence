@@ -66,12 +66,12 @@ tokenizer-aware.
    test decision. Test assets are CI-provisioned rather than committed to the
    package. The download uses immutable Hugging Face revisions and verifies
    committed SHA-256 digests before a fixture is used.
-7. The current React Native `ask` and `askStreamCb` calls are synchronous.
+7. The React Native compatibility `ask` and `askStreamCb` calls are synchronous.
    `askStreamCb` replays a completed reply because the runtime does not yet
-   expose a per-token decode hook. The factory therefore caps every Qwen reply
-   at 64 generated tokens. The current API offers neither a caller-supplied
-   limit nor a stop reason, and defers an asynchronous/incremental binding
-   surface to a separate decision.
+   expose a per-token decode hook. Those legacy calls are capped at 64 generated
+   tokens. ADR-027 subsequently added `askAsync` and `askStreamAsync`, which use
+   a bounded native worker and the provider's normal generation default; true
+   in-loop incremental streaming remains deferred to ADR-019.
 
 The browser/WASM local placeholder is outside this decision; this ADR governs
 the native React Native surface only.

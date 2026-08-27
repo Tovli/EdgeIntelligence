@@ -16,8 +16,9 @@
 
 use candle_core::{Device, Tensor};
 use el_core::{
-    ChatMessage, ChatRequest, ChatResponse, ChatRole, ChatToken, DomainEvent, EdgeError,
-    LlmProvider, Result, SafetyMode, SessionConfig, SessionId, StopReason, Token,
+    CancellationToken, ChatMessage, ChatRequest, ChatResponse, ChatRole, ChatToken, DomainEvent,
+    EdgeError, EventEnvelope, LlmProvider, Result, SafetyMode, SessionConfig, SessionId,
+    StopReason, Token,
 };
 use el_provenance::LoadPermit;
 use el_runtime::{
@@ -196,6 +197,24 @@ pub struct LocalLlmProvider {
     vocab: usize,
 }
 
+/// Provider-owned sessions buffer lifecycle events so the generic runtime has
+/// no logging dependency. Drain and report cancellation/fault events on both
+/// success and error paths; otherwise a later turn would discard the only
+/// operational signal that a session reset failed.
+fn report_session_lifecycle_events(events: &[EventEnvelope]) {
+    for envelope in events {
+        match envelope.event {
+            DomainEvent::GenerationCancelled { generated_tokens } => eprintln!(
+                "[session] generation cancelled after {generated_tokens} generated token(s)"
+            ),
+            DomainEvent::SessionResetFailed => eprintln!(
+                "[session] cache reset failed during cancellation; rebuilding the provider session is required"
+            ),
+            _ => {}
+        }
+    }
+}
+
 impl LocalLlmProvider {
     /// Load from a consumer-supplied GGUF file.
     pub fn from_path(
@@ -256,24 +275,66 @@ impl LocalLlmProvider {
             .collect::<Vec<_>>()
             .join("\n")
     }
-}
 
-impl LlmProvider for LocalLlmProvider {
-    fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
+    /// Restore a poisoned local session after a provider panic that the FFI
+    /// contained. A successful reset clears any partial cache while retaining
+    /// the resident engine; reset failure remains an explicit provider error.
+    fn lock_session(&self) -> Result<std::sync::MutexGuard<'_, InferenceSession<CandleEngine>>> {
+        match self.session.lock() {
+            Ok(session) => Ok(session),
+            Err(poisoned) => {
+                let mut session = poisoned.into_inner();
+                session.reset()?;
+                self.session.clear_poison();
+                eprintln!(
+                    "[session] recovered a poisoned local Candle session lock; conversation state was reset"
+                );
+                Ok(session)
+            }
+        }
+    }
+
+    fn chat_with_cancellation(
+        &self,
+        req: &ChatRequest,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ChatResponse> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(EdgeError::Cancelled);
+        }
+
         let prompt = Self::format_messages(&req.messages);
         let prompt_tokens = self.encode(&prompt);
         let prompt_len = prompt_tokens.len() as u32;
         let max = req.max_tokens.unwrap_or(64);
 
-        let mut session = self.session.lock().unwrap();
+        let mut session = self.lock_session()?;
         session.reset()?;
         let _ = session.drain_events(); // bound buffered events across reused turns
         let ports = Ports::permissive();
-        session.load_prompt(&ports, &prompt_tokens)?;
-        session.generate(&ports, max)?;
+        let prefill = match cancellation {
+            Some(token) => session.load_prompt_cancellable(&ports, &prompt_tokens, token),
+            None => session.load_prompt(&ports, &prompt_tokens),
+        };
+        if let Err(error) = prefill {
+            let events = session.drain_events();
+            report_session_lifecycle_events(&events);
+            return Err(error);
+        }
+        let turn = match cancellation {
+            Some(token) => session.generate_cancellable(&ports, max, token),
+            None => session.generate(&ports, max),
+        };
+        if let Err(error) = turn {
+            let events = session.drain_events();
+            report_session_lifecycle_events(&events);
+            return Err(error);
+        }
 
         let output = session.output().to_vec();
         let completion_len = output.len() as u32;
+        let events = session.drain_events();
+        report_session_lifecycle_events(&events);
 
         Ok(ChatResponse {
             content: Self::decode(&output),
@@ -281,6 +342,16 @@ impl LlmProvider for LocalLlmProvider {
             prompt_tokens: prompt_len,
             completion_tokens: completion_len,
         })
+    }
+}
+
+impl LlmProvider for LocalLlmProvider {
+    fn requires_exclusive_turn(&self) -> bool {
+        true
+    }
+
+    fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
+        self.chat_with_cancellation(req, None)
     }
 
     fn chat_stream(&self, req: &ChatRequest, on_token: &mut dyn FnMut(ChatToken)) -> Result<()> {
@@ -290,6 +361,32 @@ impl LlmProvider for LocalLlmProvider {
                 text: ch.to_string(),
                 is_final: false,
             });
+        }
+        on_token(ChatToken {
+            text: String::new(),
+            is_final: true,
+        });
+        Ok(())
+    }
+
+    fn chat_stream_cancellable(
+        &self,
+        req: &ChatRequest,
+        cancellation: &CancellationToken,
+        on_token: &mut dyn FnMut(ChatToken),
+    ) -> Result<()> {
+        let resp = self.chat_with_cancellation(req, Some(cancellation))?;
+        for ch in resp.content.chars() {
+            if cancellation.is_cancelled() {
+                return Err(EdgeError::Cancelled);
+            }
+            on_token(ChatToken {
+                text: ch.to_string(),
+                is_final: false,
+            });
+        }
+        if cancellation.is_cancelled() {
+            return Err(EdgeError::Cancelled);
         }
         on_token(ChatToken {
             text: String::new(),
@@ -867,10 +964,7 @@ impl QwenExpert {
     /// reading + parsing the GGUF — happens once in `from_path_primed`; this only
     /// re-runs the (cheap, bounded) prompt prefill.
     pub fn reprime(&self, prompt: &[Token]) -> Result<()> {
-        let mut st = self
-            .state
-            .lock()
-            .map_err(|_| EdgeError::Engine("expert mutex poisoned"))?;
+        let mut st = self.lock_state()?;
         st.engine.reset_cache()?;
         // reset_cache succeeded: engine is blank. Set fed to 0 before prefill so
         // a prefill failure leaves fed consistent with the blank engine state.
@@ -882,13 +976,26 @@ impl QwenExpert {
     /// Release the expert's conversation KV while keeping its weights resident
     /// (ADR-018) — the expert half of [`QwenChatProvider::end_session`].
     fn release(&self) -> Result<()> {
-        let mut st = self
-            .state
-            .lock()
-            .map_err(|_| EdgeError::Engine("expert mutex poisoned"))?;
+        let mut st = self.lock_state()?;
         st.engine.reset_cache()?;
         st.fed = 0;
         Ok(())
+    }
+
+    /// A caught expert panic may poison the mutable KV state. Reset it before
+    /// reusing the resident weights so the next turn can re-prime safely.
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, ExpertState>> {
+        match self.state.lock() {
+            Ok(state) => Ok(state),
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.engine.reset_cache()?;
+                state.fed = 0;
+                self.state.clear_poison();
+                eprintln!("[session] recovered a poisoned Qwen safety-expert lock");
+                Ok(state)
+            }
+        }
     }
 }
 
@@ -1096,24 +1203,70 @@ impl QwenChatProvider {
     /// conversation has started yet. To free the weights too, drop the provider
     /// (Rust ownership).
     pub fn end_session(&self) -> Result<()> {
-        let mut cell = self
-            .session
-            .lock()
-            .map_err(|_| EdgeError::Engine("chat session mutex poisoned"))?;
+        let mut cell = self.lock_session()?;
         if let ChatSession::Active(session) = &mut *cell {
             session.close()?;
         }
         // Release the resident safety expert's conversation KV too (keeps its
         // weights). Locked after the session — the same order `chat` uses — so
         // the two mutexes never deadlock.
-        let slot = self
-            .expert
-            .lock()
-            .map_err(|_| EdgeError::Engine("expert mutex poisoned"))?;
+        let slot = self.lock_expert_slot();
         if let Some(expert) = slot.as_ref() {
             expert.release()?;
         }
         Ok(())
+    }
+
+    /// Recover a session lock after a caught provider panic. A poisoned lock
+    /// may hold a partially transitioned conversation, so reset its cache and
+    /// turn it back into `Loaded`; the next chat constructs a fresh session over
+    /// the same resident weights instead of permanently bricking the handle.
+    fn lock_session(&self) -> Result<std::sync::MutexGuard<'_, ChatSession>> {
+        match self.session.lock() {
+            Ok(cell) => Ok(cell),
+            Err(poisoned) => {
+                let mut cell = poisoned.into_inner();
+                let previous = std::mem::replace(&mut *cell, ChatSession::Swapping);
+                match previous {
+                    ChatSession::Active(mut session) => {
+                        if let Err(error) = session.reset() {
+                            *cell = ChatSession::Active(session);
+                            return Err(error);
+                        }
+                        *cell = ChatSession::Loaded(session.into_engine());
+                    }
+                    ChatSession::Loaded(engine) => *cell = ChatSession::Loaded(engine),
+                    ChatSession::Swapping => {
+                        return Err(EdgeError::Engine(
+                            "chat session swap interrupted; rebuild the provider",
+                        ));
+                    }
+                }
+                self.session.clear_poison();
+                eprintln!(
+                    "[session] recovered a poisoned Qwen session lock; conversation state was rebuilt"
+                );
+                Ok(cell)
+            }
+        }
+    }
+
+    /// Drop a partially configured expert after a caught panic. The next turn
+    /// lazily reloads and primes it from `expert_model`, rather than retaining a
+    /// poisoned outer slot that would permanently reject all future chats.
+    fn lock_expert_slot(&self) -> std::sync::MutexGuard<'_, Option<std::sync::Arc<QwenExpert>>> {
+        match self.expert.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => {
+                let mut slot = poisoned.into_inner();
+                *slot = None;
+                self.expert.clear_poison();
+                eprintln!(
+                    "[session] recovered a poisoned Qwen expert slot; expert weights will be reloaded"
+                );
+                slot
+            }
+        }
     }
 
     fn encode(&self, text: &str) -> Result<Vec<Token>> {
@@ -1174,13 +1327,23 @@ fn qwen_chatml_eos(tokenizer: &Tokenizer) -> Result<Token> {
     Ok(im_end)
 }
 
-impl LlmProvider for QwenChatProvider {
-    fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
+impl QwenChatProvider {
+    fn chat_with_cancellation(
+        &self,
+        req: &ChatRequest,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ChatResponse> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(EdgeError::Cancelled);
+        }
         let prompt = render_chatml(&req.messages);
 
         let t_encode = bench::enabled().then(std::time::Instant::now);
         let prompt_tokens = self.encode(&prompt)?;
         let d_encode = t_encode.map(|t| t.elapsed()).unwrap_or_default();
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(EdgeError::Cancelled);
+        }
 
         // Carry the active safety tier on the session config so the runtime
         // derives the tier-aware ADR-012 `RollbackPolicy` and records the true
@@ -1202,10 +1365,7 @@ impl LlmProvider for QwenChatProvider {
         // ADR-018: reuse the resident model. Lock the session cell; on first use
         // promote the loaded weights into a reusable session (created with the now
         // final builder config); every later turn reuses it — no disk reload.
-        let mut cell = self
-            .session
-            .lock()
-            .map_err(|_| EdgeError::Engine("chat session mutex poisoned"))?;
+        let mut cell = self.lock_session()?;
         let t_load = bench::enabled().then(std::time::Instant::now);
         if matches!(&*cell, ChatSession::Loaded(_)) {
             let engine = match std::mem::replace(&mut *cell, ChatSession::Swapping) {
@@ -1242,10 +1402,7 @@ impl LlmProvider for QwenChatProvider {
                 // expert lock is always taken while holding the session lock — a
                 // fixed order, so no deadlock with `end_session`.
                 let expert = {
-                    let mut slot = self
-                        .expert
-                        .lock()
-                        .map_err(|_| EdgeError::Engine("expert mutex poisoned"))?;
+                    let mut slot = self.lock_expert_slot();
                     match slot.as_ref() {
                         Some(e) => {
                             e.reprime(&prompt_tokens)?;
@@ -1280,31 +1437,64 @@ impl LlmProvider for QwenChatProvider {
         // new suffix; a fresh turn does a full prefill. The engine's
         // longest-common-prefix check is the backstop, so a tokenizer round-trip
         // drift in the reused branch falls back to a correct full re-prefill.
-        match session.phase() {
-            el_core::Phase::Completed => session.continue_prompt(&ports, &prompt_tokens)?,
-            // First use, or a fresh start after `end_session` / error recovery.
-            el_core::Phase::Initialized => session.load_prompt(&ports, &prompt_tokens)?,
-            // Dirty: a prior turn's prefill failed mid-transition and left the
-            // session in `Prefilling`/`Decoding`. Now that the unconditional
-            // per-turn `reset()` is gone, a bare `load_prompt` here would hit
-            // `InvalidPhase` and wedge the provider — so discard the partial
-            // conversation (clearing the engine's possibly half-fed cache) and
-            // start fresh instead.
-            _ => {
-                let dirty_phase = session.phase().as_str();
-                session.reset()?;
-                session.load_prompt(&ports, &prompt_tokens)?;
-                eprintln!(
+        let prefill = (|| -> Result<()> {
+            match session.phase() {
+                el_core::Phase::Completed => match cancellation {
+                    Some(token) => {
+                        session.continue_prompt_cancellable(&ports, &prompt_tokens, token)?
+                    }
+                    None => session.continue_prompt(&ports, &prompt_tokens)?,
+                },
+                // First use, or a fresh start after `end_session` / error recovery.
+                el_core::Phase::Initialized => match cancellation {
+                    Some(token) => {
+                        session.load_prompt_cancellable(&ports, &prompt_tokens, token)?
+                    }
+                    None => session.load_prompt(&ports, &prompt_tokens)?,
+                },
+                // Dirty: a prior turn's prefill failed mid-transition, or
+                // cancellation could not clear the cache and left the session
+                // `Faulted`. Now that the unconditional per-turn `reset()` is gone,
+                // a bare `load_prompt` here would hit `InvalidPhase` and wedge the
+                // provider — so discard the partial conversation (clearing the
+                // engine's possibly half-fed cache) and start fresh instead.
+                _ => {
+                    let dirty_phase = session.phase().as_str();
+                    session.reset()?;
+                    match cancellation {
+                        Some(token) => {
+                            session.load_prompt_cancellable(&ports, &prompt_tokens, token)?
+                        }
+                        None => session.load_prompt(&ports, &prompt_tokens)?,
+                    }
+                    eprintln!(
                     "[session] partial state ({dirty_phase}) detected — context reset, this turn starts fresh"
                 );
+                }
             }
+            Ok(())
+        })();
+        if let Err(error) = prefill {
+            let events = session.drain_events();
+            report_session_lifecycle_events(&events);
+            return Err(error);
         }
         let d_prefill = t_prefill.map(|t| t.elapsed()).unwrap_or_default();
         let (pf_total, pf_model, pf_calls) = bench::take();
 
         let max = req.max_tokens.unwrap_or(self.default_max_tokens);
         let t_decode = bench::enabled().then(std::time::Instant::now);
-        let stop = session.generate(&ports, max)?;
+        let stop = match match cancellation {
+            Some(token) => session.generate_cancellable(&ports, max, token),
+            None => session.generate(&ports, max),
+        } {
+            Ok(stop) => stop,
+            Err(error) => {
+                let events = session.drain_events();
+                report_session_lifecycle_events(&events);
+                return Err(error);
+            }
+        };
         let d_decode = t_decode.map(|t| t.elapsed()).unwrap_or_default();
         let (dc_total, dc_model, dc_calls) = bench::take();
 
@@ -1322,6 +1512,7 @@ impl LlmProvider for QwenChatProvider {
         // prefix; any intervention is reported on stderr so the test client can
         // show the guard working without corrupting the reply on stdout.
         let events = session.drain_events();
+        report_session_lifecycle_events(&events);
         let safety_active = !matches!(self.safety.mode, SafetyMode::Off);
         let content = if safety_active {
             let violations = events
@@ -1373,6 +1564,16 @@ impl LlmProvider for QwenChatProvider {
             completion_tokens,
         })
     }
+}
+
+impl LlmProvider for QwenChatProvider {
+    fn requires_exclusive_turn(&self) -> bool {
+        true
+    }
+
+    fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
+        self.chat_with_cancellation(req, None)
+    }
 
     fn chat_stream(&self, req: &ChatRequest, on_token: &mut dyn FnMut(ChatToken)) -> Result<()> {
         // The runtime decode loop runs to completion internally (no per-token
@@ -1384,6 +1585,32 @@ impl LlmProvider for QwenChatProvider {
                 text: ch.to_string(),
                 is_final: false,
             });
+        }
+        on_token(ChatToken {
+            text: String::new(),
+            is_final: true,
+        });
+        Ok(())
+    }
+
+    fn chat_stream_cancellable(
+        &self,
+        req: &ChatRequest,
+        cancellation: &CancellationToken,
+        on_token: &mut dyn FnMut(ChatToken),
+    ) -> Result<()> {
+        let resp = self.chat_with_cancellation(req, Some(cancellation))?;
+        for ch in resp.content.chars() {
+            if cancellation.is_cancelled() {
+                return Err(EdgeError::Cancelled);
+            }
+            on_token(ChatToken {
+                text: ch.to_string(),
+                is_final: false,
+            });
+        }
+        if cancellation.is_cancelled() {
+            return Err(EdgeError::Cancelled);
         }
         on_token(ChatToken {
             text: String::new(),
@@ -1778,6 +2005,23 @@ mod tests {
         let r1 = p.chat(&req).unwrap();
         let r2 = p.chat(&req).unwrap();
         assert_eq!(r1.content, r2.content);
+    }
+
+    #[test]
+    fn local_provider_recovers_after_a_poisoned_session_lock() {
+        let p = LocalLlmProvider::toy(32, 8, 31, ok_permit()).unwrap();
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _session = p.session.lock().unwrap();
+            panic!("test-only local session poison");
+        }));
+        assert!(poison.is_err());
+
+        let req = el_core::ChatRequest::new("local", vec![el_core::ChatMessage::user("hello")])
+            .with_max_tokens(4);
+        assert!(
+            p.chat(&req).is_ok(),
+            "a caught panic must not brick the provider"
+        );
     }
 
     #[test]

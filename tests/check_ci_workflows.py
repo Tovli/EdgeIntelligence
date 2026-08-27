@@ -40,6 +40,8 @@ QWEN_FFI_TEST_SCRIPT = Path("scripts/run-qwen-ffi-integration.sh")
 QWEN_FFI_TEST_NAME = "native_qwen_integration_decodes_and_streams_english_text"
 ADR_026_RELEASE_GUARD = "Assert ADR-026 migration has a minor release"
 ADR_026_VERSION_GUARD = "scripts/assert-adr-026-release-version.py"
+ADR_027_RELEASE_GUARD = "Assert ADR-027 async API has a minor release"
+ADR_027_VERSION_GUARD = "scripts/assert-adr-027-release-version.py"
 
 REQUIRED_INSTALLS = [
     (
@@ -125,6 +127,7 @@ def check_workflow(path: Path) -> list[str]:
             "scripts/qwen-fixture.sha256",
             "scripts/run-qwen-ffi-integration.sh",
             "scripts/assert-adr-026-release-version.py",
+            "scripts/assert-adr-027-release-version.py",
             "scripts/expo-android-local-session-smoke.sh",
             "scripts/verify-android-page-alignment.py",
         ):
@@ -164,6 +167,14 @@ def check_workflow(path: Path) -> list[str]:
         if f"python3 {ADR_026_VERSION_GUARD}" not in text:
             errors.append(
                 f"{path}: ADR-026 release guard must run {ADR_026_VERSION_GUARD}"
+            )
+        if ADR_027_RELEASE_GUARD not in text:
+            errors.append(
+                f"{path}: missing ADR-027 minor-release guard for the async native API"
+            )
+        if f"python3 {ADR_027_VERSION_GUARD}" not in text:
+            errors.append(
+                f"{path}: ADR-027 release guard must run {ADR_027_VERSION_GUARD}"
             )
         if "npm run test:rn-factory" not in text:
             errors.append(f"{path}: React Native factory runtime test must run before publishing")

@@ -22,6 +22,7 @@ pub enum DegradeReason {
 
 /// Every fact the pipeline emits. Carries only ids, counts, enums, and
 /// fixed-point numbers — never content.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DomainEvent {
     // --- 1. Inference Runtime ---
@@ -155,6 +156,16 @@ pub enum DomainEvent {
         prompt_tokens: u32,
         completion_tokens: u32,
     },
+
+    // --- 11. Session lifecycle ---
+    /// A host abandoned a request. Deliberately carries no prompt or output
+    /// content (ADR-027). Kept at the end to preserve existing discriminants.
+    GenerationCancelled {
+        generated_tokens: u32,
+    },
+    /// The engine could not clear its cache during cancellation. The session is
+    /// marked faulted and must be reset successfully before it can serve a turn.
+    SessionResetFailed,
 }
 
 /// Standard envelope (`docs/ddd/domain-events.md`): every event is correlated by

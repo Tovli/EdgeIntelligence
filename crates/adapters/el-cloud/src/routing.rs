@@ -214,6 +214,10 @@ impl Default for CloudProvider {
 }
 
 impl LlmProvider for CloudProvider {
+    fn requires_exclusive_turn(&self) -> bool {
+        false
+    }
+
     fn chat(&self, req: &ChatRequest) -> Result<ChatResponse> {
         let (base_url, model_name) = resolve(&req.model);
         let api_key = req

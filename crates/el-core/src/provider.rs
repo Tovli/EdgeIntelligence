@@ -12,6 +12,8 @@
 //!   wasm-bindgen → `ReadableStream`).
 //! - `CredentialRef` is a runtime value from the host — never embedded.
 
+use crate::CancellationToken;
+
 /// Which role a message belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatRole {
@@ -143,6 +145,17 @@ pub struct ChatResponse {
 /// - `LocalLlmProvider` in `el-runtime` (wraps `InferenceSession` + Candle)
 /// - `CloudProvider` in `el-cloud` (wraps `reqwest` + OpenAI-compat API)
 pub trait LlmProvider: Send + Sync {
+    /// Whether calls on one provider instance must be serialized to protect a
+    /// resident conversation or another mutable session resource.
+    ///
+    /// Defaults to `true` so an out-of-tree provider remains safe until it
+    /// explicitly declares itself stateless. Cloud/relay-style providers that
+    /// keep no per-handle conversation state override this to admit concurrent
+    /// calls through one SDK handle.
+    fn requires_exclusive_turn(&self) -> bool {
+        true
+    }
+
     /// Blocking, non-streaming chat completion.
     fn chat(&self, req: &ChatRequest) -> crate::Result<ChatResponse>;
 
@@ -154,6 +167,36 @@ pub trait LlmProvider: Send + Sync {
         req: &ChatRequest,
         on_token: &mut dyn FnMut(ChatToken),
     ) -> crate::Result<()>;
+
+    /// Streaming chat with a cooperative cancellation signal (ADR-027).
+    ///
+    /// The default preserves compatibility for providers that cannot yet
+    /// interrupt their transport or engine. It stops forwarding tokens once
+    /// cancellation is observed and reports [`crate::EdgeError::Cancelled`]
+    /// after the provider returns. Stateful/local providers override this to
+    /// stop inference at runtime-defined cancellation boundaries.
+    fn chat_stream_cancellable(
+        &self,
+        req: &ChatRequest,
+        cancellation: &CancellationToken,
+        on_token: &mut dyn FnMut(ChatToken),
+    ) -> crate::Result<()> {
+        if cancellation.is_cancelled() {
+            return Err(crate::EdgeError::Cancelled);
+        }
+
+        self.chat_stream(req, &mut |token| {
+            if !cancellation.is_cancelled() {
+                on_token(token);
+            }
+        })?;
+
+        if cancellation.is_cancelled() {
+            Err(crate::EdgeError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
 
     /// Release conversation-scoped state while keeping a provider's model
     /// resources available for its next request.

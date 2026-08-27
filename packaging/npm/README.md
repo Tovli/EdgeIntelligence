@@ -32,28 +32,52 @@ run a caller-supplied Qwen GGUF.
 React Native:
 
 ```ts
-import { localEdgeLlm } from "edge-intelligence-sdk";
+import { askAsync, askStreamAsync, localEdgeLlm } from "edge-intelligence-sdk";
 
 const qwen05b = "/data/user/0/com.example.app/files/models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
 const qwenTokenizer = "/data/user/0/com.example.app/files/models/qwen2.5-0.5b-instruct.tokenizer.json";
 const sdk = localEdgeLlm(qwen05b, qwenTokenizer);
 
-const reply = sdk.ask("Summarize edge inference in one sentence.");
+const request = askAsync(sdk, "Summarize edge inference in one sentence.");
+const reply = await request.response;
 let streamed = "";
-sdk.askStreamCb("Give me two deployment tips.", {
+const stream = askStreamAsync(sdk, "Give me two deployment tips.", {
   onToken(token) {
     streamed += token;
   },
+  onComplete() {},
+  onError(error) { console.error(error); },
+  onCancelled() {},
 });
+// stream.cancel();
 ```
 
-`ask` and `askStreamCb` are currently synchronous native calls. On the Qwen
-path, `askStreamCb` delivers the completed reply as fragments after generation,
-not while the model is decoding. Every Qwen reply is capped at 64 generated
-tokens; the current React Native API offers neither a caller-supplied limit nor
-a stop reason, so callers should treat the reply as potentially length-limited.
-For responsive incremental UI, run inference off the JS thread or wait for the
-separately scoped asynchronous binding surface.
+`askAsync` and `askStreamAsync` use SDK-owned native workers, so generation
+never runs on the JavaScript thread. A conversational handle admits one active
+turn; a second turn or reset returns `Busy` instead of racing the session.
+Stateless providers may run concurrently, up to two async requests per handle;
+that capacity is not shared process-wide. Call `cancel()` to
+request cooperative cancellation at the next prefill, decode, or safety
+checkpoint boundary. The cancellation callback/promise rejection is prompt, but
+a backend that does not return at that boundary keeps its handle `Busy` until
+its stateful cleanup finishes. A cancellation that wins the race may follow
+partial tokens; treat `onCancelled` as the terminal outcome, not `onComplete`.
+A queued provider error retains that terminal outcome. A queued completion is
+changed to cancellation when buffered token fragments are discarded.
+
+`askAsync` never throws synchronously for native submission or binding-version
+errors: its `response` promise rejects instead. `askStreamAsync` likewise
+returns an inert request and invokes `onError` asynchronously for submission or
+binding-version errors.
+
+`ask` and `askStreamCb` remain synchronous compatibility calls. The current
+local Candle and Qwen providers produce a complete safe reply before replaying
+its fragments for both callback stream APIs, so `askStreamAsync` removes JS-thread
+blocking but does not yet reduce time-to-first-token. ADR-019 tracks true in-loop
+safe-token streaming. The legacy `ask` and `askStreamCb` Qwen replies are capped
+at 64 generated tokens; callers should treat only those replies as
+potentially length-limited. `askAsync` and `askStreamAsync` use the provider's
+normal generation default rather than the JavaScript-thread compatibility cap.
 
 `reset()` throws if the provider cannot clear its session cache. Treat that as
 terminal for the handle and construct a new session instead of issuing another
@@ -62,7 +86,10 @@ prompt against possibly stale conversation state.
 For an opt-in cloud session, use the guarded `cloudEdgeLlm(model, apiKey)`
 factory. React Native TypeScript consumers can import `EdgeLlmLike` and
 `SdkError` as types when their resolver selects the `react-native` export
-condition.
+condition. Native UniFFI bindings and this JavaScript wrapper must be released
+and rebuilt together: the wrapper detects a native build without the async
+methods and throws an explicit version-mismatch error instead of calling an
+undefined native function.
 
 Migrating from the published one-path `localEdgeLlm(modelPath)` API: its
 deprecated overload remains available so existing TypeScript builds continue to

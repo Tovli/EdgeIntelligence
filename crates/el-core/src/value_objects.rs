@@ -43,12 +43,17 @@ pub enum DeviceTarget {
 }
 
 /// Inference session state machine (ADR-001).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Initialized,
     Prefilling,
     Decoding,
     Completed,
+    /// Cache cleanup failed. This is terminal for the active turn, never an
+    /// in-progress generation state; providers must successfully reset before
+    /// starting another turn.
+    Faulted,
 }
 
 impl Phase {
@@ -58,6 +63,7 @@ impl Phase {
             Phase::Prefilling => "Prefilling",
             Phase::Decoding => "Decoding",
             Phase::Completed => "Completed",
+            Phase::Faulted => "Faulted",
         }
     }
 }

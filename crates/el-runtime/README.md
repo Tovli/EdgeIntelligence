@@ -26,6 +26,16 @@ and covered by tests.
   reach the runtime. Drives the `Initialized → Prefilling → Decoding → Completed`
   phases via `load_prompt()`, `generate()`, `reset()`, and emits content-free
   `EventEnvelope`s (`drain_events()`).
+- **Cooperative cancellation (ADR-027)** — `load_prompt_cancellable`,
+  `continue_prompt_cancellable`, and `generate_cancellable` observe a shared
+  `CancellationToken` before/after prefill, between decode steps, and at safety
+  checkpoints. Any mid-flight cancellation resets to `Initialized` because the
+  cache may be partial. Decode cancellation deliberately sacrifices prefix
+  reuse instead of replaying a potentially long prompt, keeping cancellation
+  latency bounded. If cache eviction cannot be recovered, the request still
+  returns `Cancelled` but the session enters explicit `Faulted` state and must
+  reset successfully (or be rebuilt) before reuse; it never remains in an
+  in-progress phase.
 - **Port traits** (the collaborator seams):
   - `InferenceEngine` — `prefill`, `next_logits` (integer milli-logits), `eos_token`.
   - `PromptCompressor` — optional LLMLingua-2-style compression.

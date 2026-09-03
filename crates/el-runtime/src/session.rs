@@ -2,8 +2,8 @@
 
 use crate::ports::{InferenceEngine, Ports};
 use el_core::{
-    DegradeReason, DomainEvent, EdgeError, EventEnvelope, Phase, Result, SessionConfig, SessionId,
-    StopReason, Token,
+    CancellationToken, DegradeReason, DomainEvent, EdgeError, EventEnvelope, Phase, Result,
+    SessionConfig, SessionId, StopReason, Token,
 };
 use el_memory::KvRegion;
 use el_provenance::LoadPermit;
@@ -101,6 +101,12 @@ impl<E: InferenceEngine> InferenceSession<E> {
     pub fn permit(&self) -> LoadPermit {
         self.permit
     }
+    /// Consume the session while retaining its resident engine. Adapter-level
+    /// recovery uses this to discard all session metadata after a poisoned
+    /// provider lock without reloading model weights.
+    pub fn into_engine(self) -> E {
+        self.engine
+    }
     /// Take the buffered domain events (a real build would stream these to the
     /// Telemetry subscriber).
     pub fn drain_events(&mut self) -> Vec<EventEnvelope> {
@@ -114,12 +120,37 @@ impl<E: InferenceEngine> InferenceSession<E> {
 
     /// Compress (optional) → prefill → build KV. Valid only from `Initialized`.
     pub fn load_prompt(&mut self, ports: &Ports, prompt: &[Token]) -> Result<()> {
+        self.load_prompt_inner(ports, prompt, None)
+    }
+
+    /// Cancellable prompt prefill (ADR-027).
+    ///
+    /// The engine forward is allowed to finish, but cancellation is checked
+    /// immediately before and after it. A post-prefill cancellation clears the
+    /// partial cache via the regular session-reset path, leaving the session
+    /// reusable instead of wedged in `Prefilling`.
+    pub fn load_prompt_cancellable(
+        &mut self,
+        ports: &Ports,
+        prompt: &[Token],
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        self.load_prompt_inner(ports, prompt, Some(cancellation))
+    }
+
+    fn load_prompt_inner(
+        &mut self,
+        ports: &Ports,
+        prompt: &[Token],
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<()> {
         if self.phase != Phase::Initialized {
             return Err(EdgeError::InvalidPhase {
                 expected: "Initialized",
                 found: self.phase.as_str(),
             });
         }
+        self.cancel_before_prefill_if_requested(cancellation)?;
 
         // Retain the raw prompt for ADR-013 ingress triage (scored in
         // `generate_with_policy` before any token is generated).
@@ -142,6 +173,7 @@ impl<E: InferenceEngine> InferenceSession<E> {
 
         self.phase = Phase::Prefilling;
         let kv_len = self.engine.prefill(&compressed)?;
+        self.cancel_after_prefill_if_requested(cancellation)?;
         for _ in 0..kv_len {
             let off = self.kv.len() as u64;
             self.kv.push(off);
@@ -186,13 +218,33 @@ impl<E: InferenceEngine> InferenceSession<E> {
     /// different prefix and defeat reuse — the two are mutually exclusive. `ports`
     /// is accepted for call-site symmetry with `load_prompt`; the grammar/safety/
     /// ingress ports are consumed by [`generate`](Self::generate), not here.
-    pub fn continue_prompt(&mut self, _ports: &Ports, full_context: &[Token]) -> Result<()> {
+    pub fn continue_prompt(&mut self, ports: &Ports, full_context: &[Token]) -> Result<()> {
+        self.continue_prompt_inner(ports, full_context, None)
+    }
+
+    /// Cancellable prefix-reusing prefill (ADR-027).
+    pub fn continue_prompt_cancellable(
+        &mut self,
+        ports: &Ports,
+        full_context: &[Token],
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        self.continue_prompt_inner(ports, full_context, Some(cancellation))
+    }
+
+    fn continue_prompt_inner(
+        &mut self,
+        _ports: &Ports,
+        full_context: &[Token],
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<()> {
         if self.phase != Phase::Completed {
             return Err(EdgeError::InvalidPhase {
                 expected: "Completed",
                 found: self.phase.as_str(),
             });
         }
+        self.cancel_before_prefill_if_requested(cancellation)?;
         // Reset step so this turn's events start from 0 (same as a fresh turn
         // via `new` + `load_prompt`). Events are drained per-turn, so per-turn
         // step numbering is the right level of granularity.
@@ -203,6 +255,7 @@ impl<E: InferenceEngine> InferenceSession<E> {
 
         self.phase = Phase::Prefilling;
         let kv_len = self.engine.prefill_reuse(full_context)?;
+        self.cancel_after_prefill_if_requested(cancellation)?;
         // Rebuild the KV descriptors to match the reused-plus-extended cache.
         self.kv = KvRegion::new();
         for _ in 0..kv_len {
@@ -233,7 +286,21 @@ impl<E: InferenceEngine> InferenceSession<E> {
         let effective = SafetyModeSelector::resolve(self.config.safety, self.config.device);
         self.emit(DomainEvent::SafetyModeSelected { mode: effective });
         let policy = RollbackPolicy::for_device(self.config.device, effective);
-        self.generate_with_policy(ports, max_tokens, policy)
+        self.generate_with_policy_inner(ports, max_tokens, policy, None)
+    }
+
+    /// Run the decode loop with cooperative cancellation checks between decode
+    /// steps and at safety-checkpoint boundaries (ADR-027).
+    pub fn generate_cancellable(
+        &mut self,
+        ports: &Ports,
+        max_tokens: u32,
+        cancellation: &CancellationToken,
+    ) -> Result<StopReason> {
+        let effective = SafetyModeSelector::resolve(self.config.safety, self.config.device);
+        self.emit(DomainEvent::SafetyModeSelected { mode: effective });
+        let policy = RollbackPolicy::for_device(self.config.device, effective);
+        self.generate_with_policy_inner(ports, max_tokens, policy, Some(cancellation))
     }
 
     /// The checkpointed-rollback safety control loop (ADR-012).
@@ -260,6 +327,27 @@ impl<E: InferenceEngine> InferenceSession<E> {
         ports: &Ports,
         max_tokens: u32,
         policy: RollbackPolicy,
+    ) -> Result<StopReason> {
+        self.generate_with_policy_inner(ports, max_tokens, policy, None)
+    }
+
+    /// Cancellable form of [`generate_with_policy`](Self::generate_with_policy).
+    pub fn generate_with_policy_cancellable(
+        &mut self,
+        ports: &Ports,
+        max_tokens: u32,
+        policy: RollbackPolicy,
+        cancellation: &CancellationToken,
+    ) -> Result<StopReason> {
+        self.generate_with_policy_inner(ports, max_tokens, policy, Some(cancellation))
+    }
+
+    fn generate_with_policy_inner(
+        &mut self,
+        ports: &Ports,
+        max_tokens: u32,
+        policy: RollbackPolicy,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<StopReason> {
         if self.phase != Phase::Decoding {
             return Err(EdgeError::InvalidPhase {
@@ -326,8 +414,12 @@ impl<E: InferenceEngine> InferenceSession<E> {
                 kv_len: state.start_kv,
             });
         }
+        self.cancel_decode_if_requested(cancellation, &state)?;
 
         let stop = loop {
+            // A completed engine step is the finest safe interruption point:
+            // the next iteration has not yet inspected or committed a token.
+            self.cancel_decode_if_requested(cancellation, &state)?;
             // A *candidate* termination for this iteration: the token cap is
             // reached (checked before generating), or — set below — the model
             // emitted EOS. With a guard active, neither is honoured until the
@@ -414,6 +506,10 @@ impl<E: InferenceEngine> InferenceSession<E> {
             // where EOS or the token cap returned a tail shorter than
             // `guard_every` unscored.
             if guarding {
+                // A guard checkpoint is a cancellation boundary too. This
+                // avoids surfacing a buffered, not-yet-verified token chunk
+                // after the host has abandoned the request.
+                self.cancel_decode_if_requested(cancellation, &state)?;
                 let guard = ports
                     .guard
                     .as_deref()
@@ -442,6 +538,66 @@ impl<E: InferenceEngine> InferenceSession<E> {
             stop,
         });
         Ok(stop)
+    }
+
+    /// A request cancelled before it mutates the session leaves the current
+    /// conversation intact. This check deliberately runs after phase validation:
+    /// an invalid call must report `InvalidPhase`, not destructively cancel an
+    /// unrelated, valid conversation.
+    fn cancel_before_prefill_if_requested(
+        &mut self,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<()> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            self.emit(DomainEvent::GenerationCancelled {
+                generated_tokens: 0,
+            });
+            return Err(EdgeError::Cancelled);
+        }
+        Ok(())
+    }
+
+    /// A prefill cannot be interrupted safely. Once it has completed, discard
+    /// its possibly partial/replaced cache before returning cancellation.
+    fn cancel_after_prefill_if_requested(
+        &mut self,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<()> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return self.cancel_with_reset(0);
+        }
+        Ok(())
+    }
+
+    /// Decode cancellation occurs at a safe token boundary. Reset instead of
+    /// replaying the prompt to a post-prefill baseline: cancellation favors
+    /// stop latency and a known-clean session over preserving prefix reuse. A
+    /// failed reset leaves a visible `Faulted` session rather than a wedged
+    /// in-progress phase.
+    fn cancel_decode_if_requested(
+        &mut self,
+        cancellation: Option<&CancellationToken>,
+        state: &GuardState,
+    ) -> Result<()> {
+        if !cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Ok(());
+        }
+
+        self.cancel_with_reset(self.output.len().saturating_sub(state.start_out as usize) as u32)
+    }
+
+    /// Reset after a prefill cancellation, preserving the cancellation result
+    /// even when cache cleanup fails.
+    fn cancel_with_reset(&mut self, generated_tokens: u32) -> Result<()> {
+        self.emit(DomainEvent::GenerationCancelled { generated_tokens });
+        if self.reset().is_err() {
+            // Do not falsely claim the cache was cleared: a stateful provider
+            // must retry reset (or be rebuilt) before reuse. This phase is
+            // terminal rather than in-progress, so cancellation cannot wedge it.
+            self.phase = Phase::Faulted;
+            self.emit(DomainEvent::SessionResetFailed);
+        }
+        Err(EdgeError::Cancelled)
     }
 
     /// Score the committed output and apply the ADR-012 rollback policy:
@@ -619,7 +775,7 @@ mod tests {
     use super::*;
     use crate::defaults::NullEngine;
     use crate::ports::{GrammarMasker, Ports};
-    use el_core::{ModelFormat, ModelId, ModelVersion};
+    use el_core::{CancellationToken, ModelFormat, ModelId, ModelVersion};
     use el_provenance::{ModelArtifact, SignatureVerifier};
     use el_safety::LightweightFilter;
 
@@ -689,6 +845,287 @@ mod tests {
         s.reset().unwrap();
         assert_eq!(s.phase(), Phase::Initialized);
         assert!(s.output().is_empty());
+    }
+
+    struct CancellationProbeEngine {
+        cancellation: CancellationToken,
+        cancel_during_prefill: bool,
+        cancel_after_first_decode: bool,
+        fail_reset: bool,
+        decoded: bool,
+        reset_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        rollback_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl InferenceEngine for CancellationProbeEngine {
+        fn prefill(&mut self, tokens: &[Token]) -> Result<u32> {
+            if self.cancel_during_prefill {
+                self.cancellation.cancel();
+            }
+            Ok(tokens.len() as u32)
+        }
+
+        fn next_logits(&mut self, _committed: &[Token]) -> Vec<i32> {
+            if !self.decoded && self.cancel_after_first_decode {
+                self.decoded = true;
+                self.cancellation.cancel();
+            }
+            vec![10, 0, 0]
+        }
+
+        fn eos_token(&self) -> Token {
+            99
+        }
+
+        fn rollback(&mut self, _keep_committed: u32) -> Result<()> {
+            self.rollback_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn reset_cache(&mut self) -> Result<()> {
+            self.reset_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_reset {
+                Err(EdgeError::Engine("test reset failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_during_prefill_resets_to_a_reusable_session() {
+        let cancellation = CancellationToken::new();
+        let reset_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rollback_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut session = InferenceSession::new(
+            SessionId(55),
+            SessionConfig::default(),
+            CancellationProbeEngine {
+                cancellation: cancellation.clone(),
+                cancel_during_prefill: true,
+                cancel_after_first_decode: false,
+                fail_reset: false,
+                decoded: false,
+                reset_calls: std::sync::Arc::clone(&reset_calls),
+                rollback_calls: std::sync::Arc::clone(&rollback_calls),
+            },
+            permit(),
+        );
+
+        let error = session
+            .load_prompt_cancellable(&Ports::permissive(), &[1, 2], &cancellation)
+            .unwrap_err();
+
+        assert_eq!(error, EdgeError::Cancelled);
+        assert_eq!(session.phase(), Phase::Initialized);
+        assert!(session.output().is_empty());
+        assert_eq!(reset_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(rollback_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let events = session.drain_events();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.event, DomainEvent::GenerationCancelled { .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.event, DomainEvent::SessionReset)));
+    }
+
+    #[test]
+    fn cancellation_between_decode_steps_resets_and_discards_partial_output() {
+        let cancellation = CancellationToken::new();
+        let reset_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rollback_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut session = InferenceSession::new(
+            SessionId(56),
+            SessionConfig::default(),
+            CancellationProbeEngine {
+                cancellation: cancellation.clone(),
+                cancel_during_prefill: false,
+                cancel_after_first_decode: true,
+                fail_reset: false,
+                decoded: false,
+                reset_calls: std::sync::Arc::clone(&reset_calls),
+                rollback_calls: std::sync::Arc::clone(&rollback_calls),
+            },
+            permit(),
+        );
+        let ports = Ports::permissive();
+
+        session
+            .load_prompt_cancellable(&ports, &[1], &cancellation)
+            .unwrap();
+        let error = session
+            .generate_cancellable(&ports, 8, &cancellation)
+            .unwrap_err();
+
+        assert_eq!(error, EdgeError::Cancelled);
+        assert_eq!(session.phase(), Phase::Initialized);
+        assert!(session.output().is_empty());
+        assert_eq!(reset_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(rollback_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let events = session.drain_events();
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            DomainEvent::GenerationCancelled {
+                generated_tokens: 1
+            }
+        )));
+    }
+
+    #[test]
+    fn decode_cancellation_stays_cancelled_when_cache_reset_fails_and_faults_the_session() {
+        let cancellation = CancellationToken::new();
+        let reset_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rollback_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut session = InferenceSession::new(
+            SessionId(57),
+            SessionConfig::default(),
+            CancellationProbeEngine {
+                cancellation: cancellation.clone(),
+                cancel_during_prefill: false,
+                cancel_after_first_decode: true,
+                fail_reset: true,
+                decoded: false,
+                reset_calls: std::sync::Arc::clone(&reset_calls),
+                rollback_calls: std::sync::Arc::clone(&rollback_calls),
+            },
+            permit(),
+        );
+        let ports = Ports::permissive();
+
+        session
+            .load_prompt_cancellable(&ports, &[1], &cancellation)
+            .unwrap();
+        let error = session
+            .generate_cancellable(&ports, 8, &cancellation)
+            .unwrap_err();
+
+        assert_eq!(error, EdgeError::Cancelled);
+        assert_eq!(session.phase(), Phase::Faulted);
+        assert_eq!(reset_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(rollback_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let events = session.drain_events();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.event, DomainEvent::GenerationCancelled { .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.event, DomainEvent::SessionResetFailed)));
+    }
+
+    #[test]
+    fn cancellation_stays_cancelled_when_cache_reset_fails_and_faults_the_session() {
+        let cancellation = CancellationToken::new();
+        let reset_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rollback_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut session = InferenceSession::new(
+            SessionId(57),
+            SessionConfig::default(),
+            CancellationProbeEngine {
+                cancellation: cancellation.clone(),
+                cancel_during_prefill: true,
+                cancel_after_first_decode: false,
+                fail_reset: true,
+                decoded: false,
+                reset_calls: std::sync::Arc::clone(&reset_calls),
+                rollback_calls: std::sync::Arc::clone(&rollback_calls),
+            },
+            permit(),
+        );
+
+        let error = session
+            .load_prompt_cancellable(&Ports::permissive(), &[1, 2], &cancellation)
+            .unwrap_err();
+
+        assert_eq!(error, EdgeError::Cancelled);
+        assert_eq!(session.phase(), Phase::Faulted);
+        assert_eq!(reset_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let events = session.drain_events();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.event, DomainEvent::GenerationCancelled { .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.event, DomainEvent::SessionResetFailed)));
+    }
+
+    #[test]
+    fn pre_cancelled_invalid_phase_calls_leave_the_session_untouched() {
+        let ports = Ports::permissive();
+        let cancellation = CancellationToken::new();
+        let mut decoding = InferenceSession::new(
+            SessionId(58),
+            SessionConfig::default(),
+            NullEngine::new(99, 8),
+            permit(),
+        );
+        decoding.load_prompt(&ports, &[1, 2]).unwrap();
+        decoding.drain_events();
+        cancellation.cancel();
+
+        for result in [
+            decoding.load_prompt_cancellable(&ports, &[3], &cancellation),
+            decoding.continue_prompt_cancellable(&ports, &[1, 2, 3], &cancellation),
+        ] {
+            assert!(matches!(result, Err(EdgeError::InvalidPhase { .. })));
+        }
+        assert_eq!(decoding.phase(), Phase::Decoding);
+        assert_eq!(decoding.kv_len(), 2);
+        assert!(decoding
+            .drain_events()
+            .iter()
+            .all(|event| !matches!(event.event, DomainEvent::GenerationCancelled { .. })));
+
+        let mut initialized = InferenceSession::new(
+            SessionId(59),
+            SessionConfig::default(),
+            NullEngine::new(99, 8),
+            permit(),
+        );
+        initialized.drain_events();
+        assert!(matches!(
+            initialized.generate_cancellable(&ports, 8, &cancellation),
+            Err(EdgeError::InvalidPhase { .. })
+        ));
+        assert_eq!(initialized.phase(), Phase::Initialized);
+        assert!(initialized
+            .drain_events()
+            .iter()
+            .all(|event| !matches!(event.event, DomainEvent::GenerationCancelled { .. })));
+    }
+
+    #[test]
+    fn pre_cancelled_follow_up_preserves_the_completed_conversation() {
+        let ports = Ports::permissive();
+        let mut session = InferenceSession::new(
+            SessionId(60),
+            SessionConfig::default(),
+            NullEngine::new(99, 8),
+            permit(),
+        );
+        session.load_prompt(&ports, &[1, 2]).unwrap();
+        session.generate(&ports, 8).unwrap();
+        let kv_before = session.kv_len();
+        session.drain_events();
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert_eq!(
+            session
+                .continue_prompt_cancellable(&ports, &[1, 2, 99, 3], &cancellation)
+                .unwrap_err(),
+            EdgeError::Cancelled
+        );
+        assert_eq!(session.phase(), Phase::Completed);
+        assert_eq!(session.kv_len(), kv_before);
+        assert!(session.drain_events().iter().any(|event| matches!(
+            event.event,
+            DomainEvent::GenerationCancelled {
+                generated_tokens: 0
+            }
+        )));
     }
 
     #[test]

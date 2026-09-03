@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cancellation;
 pub mod config;
 pub mod error;
 pub mod events;
@@ -23,6 +24,7 @@ pub mod ids;
 pub mod provider;
 pub mod value_objects;
 
+pub use cancellation::CancellationToken;
 pub use config::SessionConfig;
 pub use error::{EdgeError, Result};
 pub use events::{DegradeReason, DomainEvent, EventEnvelope};

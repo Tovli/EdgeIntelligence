@@ -19,6 +19,8 @@ BINDINGS_WORKFLOW = ROOT / ".github" / "workflows" / "bindings.yml"
 ADR = ROOT / "docs" / "adr" / "ADR-025-react-native-expo-autolink-ready-native-distribution.md"
 ADR_026 = ROOT / "docs" / "adr" / "ADR-026-tokenizer-aware-qwen-local-sessions-for-react-native.md"
 ADR_026_RELEASE_VERSION_GUARD = ROOT / "scripts" / "assert-adr-026-release-version.py"
+ADR_027 = ROOT / "docs" / "adr" / "ADR-027-asynchronous-execution-for-sdk-consumers.md"
+ADR_027_RELEASE_VERSION_GUARD = ROOT / "scripts" / "assert-adr-027-release-version.py"
 UBRN_CMAKE_PATCH = ROOT / "scripts" / "patch-ubrn-cmake.py"
 UBRN_VERSION = "0.31.0-3"
 
@@ -102,7 +104,7 @@ def test_adr_026_matches_the_tokenizer_aware_qwen_contract() -> None:
     assert "localEdgeLlm(modelUri)" in normalized
     assert "QwenChatProvider::from_paths" in adr
     assert "all-`?`" in adr
-    assert "64 generated tokens" in adr
+    assert "legacy calls are capped at 64 generated tokens" in normalized
     assert "deferred to a separately scoped mobile" in adr
     assert "0.4.0-or-later minor release" in adr
 
@@ -127,6 +129,40 @@ def test_adr_026_release_version_guard_requires_a_minor_bump() -> None:
     assert "at or above 0.4.0" in allowed.stdout
     assert rejected.returncode == 1
     assert "below the required 0.4.0 minor release" in rejected.stderr
+
+
+def test_adr_027_release_version_guard_requires_a_minor_bump() -> None:
+    adr = ADR_027.read_text(encoding="utf-8")
+    allowed = subprocess.run(
+        [sys.executable, str(ADR_027_RELEASE_VERSION_GUARD), "0.5.0"],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    rejected = subprocess.run(
+        [sys.executable, str(ADR_027_RELEASE_VERSION_GUARD), "0.4.3"],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert "0.5.0-or-later" in adr
+    assert allowed.returncode == 0, allowed.stderr
+    assert "at or above 0.5.0" in allowed.stdout
+    assert rejected.returncode == 1
+    assert "below the required 0.5.0 minor release" in rejected.stderr
+
+
+def test_adr_027_defers_executor_metrics_until_a_content_free_sink_exists() -> None:
+    adr = ADR_027.read_text(encoding="utf-8")
+    normalized = " ".join(adr.split())
+
+    assert "Measure queueing separately from inference (deferred)" in adr
+    assert "current native executor does not yet publish queue wait" in normalized
+    assert "executor-level, content-free queue wait" in normalized
+    assert "Async instrumentation records queue wait" not in adr
 
 
 def test_package_codegen_names_match_ubrn_turbo_module() -> None:
@@ -322,7 +358,18 @@ def test_expo_fixture_targets_current_supported_host() -> None:
     ).read_text(encoding="utf-8")
     assert "Edge Intelligence Qwen local session passed." in smoke_script
     assert "localEdgeLlm(modelUri, tokenizerUri)" in app
-    assert "askStreamCb" in app
+    assert "askAsync" in app
+    assert "askStreamAsync" in app
+    assert "await" in app
+    assert "onComplete" in app
+    assert "CallInvoker" in app
+    assert "askStreamCb" not in app
+    assert "overlapping askAsync" in app
+    assert "expectRejection(overlap.response, /busy/i" in app
+    assert "assertImmediateCancellation" in app
+    assert "assertImmediateCompletionCancellation" in app
+    assert "request.cancel();" in app
+    assert "completionSettled" in app
     assert "sdk.reset();" in app
     assert "EDGE_INTELLIGENCE_QWEN_GGUF" in smoke_script
     assert "Edge Intelligence Qwen local session failed:" in smoke_script
@@ -347,6 +394,8 @@ def test_expo_fixture_targets_current_supported_host() -> None:
     workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
     assert "Assert ADR-026 migration has a minor release" in workflow
     assert "python3 scripts/assert-adr-026-release-version.py" in workflow
+    assert "Assert ADR-027 async API has a minor release" in workflow
+    assert "python3 scripts/assert-adr-027-release-version.py" in workflow
     assert "npm install --package-lock-only --ignore-scripts" in workflow
     assert "bash ../scripts/retry-command.sh npm ci" in workflow
     assert "Run React Native package type check" in workflow
@@ -413,8 +462,9 @@ def test_documentation_uses_generated_typescript_names() -> None:
     assert "ask_stream_cb" not in readme
     assert "localEdgeLlm(qwen05b, qwenTokenizer)" in readme
     assert "matching official `tokenizer.json`" in readme
-    assert "currently synchronous native calls" in readme
-    assert "Every Qwen reply is capped at 64 generated" in readme
+    assert "`ask` and `askStreamCb` remain synchronous compatibility calls" in normalized
+    assert "legacy `ask` and `askStreamCb` Qwen replies are capped at 64 generated tokens" in normalized
+    assert "`askAsync` and `askStreamAsync` use the provider's normal generation default" in normalized
     assert "EdgeLlm.localQwen" in ffi_readme
     assert "askStreamCb" in ffi_readme
     assert "native log" not in ffi_source
@@ -548,6 +598,7 @@ def test_contract_runs_for_pull_requests() -> None:
     assert "'packaging/npm/**'" in workflow
     assert "'tests/test_react_native_package_contract.py'" in workflow
     assert workflow.count("'scripts/assert-adr-026-release-version.py'") == 2
+    assert workflow.count("'scripts/assert-adr-027-release-version.py'") == 2
     assert workflow.count("'.github/workflows/release.yml'") == 2
     assert "python3 tests/test_react_native_package_contract.py" in workflow
     assert "Assemble React Native package for Android smoke" in workflow

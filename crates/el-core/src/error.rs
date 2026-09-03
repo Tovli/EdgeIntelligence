@@ -4,6 +4,7 @@ use core::fmt;
 
 /// Errors surfaced by the SDK. Variants carry only static descriptors and
 /// numeric context — never user content.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EdgeError {
     /// Attempted to load/use a model that has not reached `Verified`
@@ -27,11 +28,16 @@ pub enum EdgeError {
     CloudRequest(Box<str>),
     /// Grammar constraint error (ADR-004). Heap-allocated for the same reason.
     Grammar(Box<str>),
+    /// A host cancelled a request at a defined cooperative boundary (ADR-027).
+    ///
+    /// Kept last to preserve the discriminants of the established variants.
+    Cancelled,
 }
 
 impl fmt::Display for EdgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            EdgeError::Cancelled => write!(f, "request cancelled (ADR-027)"),
             EdgeError::UnverifiedModel => {
                 write!(f, "model is not verified; refusing to load (ADR-006)")
             }

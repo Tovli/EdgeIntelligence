@@ -27,7 +27,11 @@ final class EdgeLlm {
     return EdgeLlm._(await dart_api.edgeLlmCloud(model: model, apiKey: apiKey));
   }
 
-  /// Runs a single prompt and returns the complete response.
+  /// Runs a single prompt off the UI isolate and returns the complete response.
+  ///
+  /// Stateful local providers permit one active operation per handle. A
+  /// concurrent local call fails with `Busy` rather than racing a conversation
+  /// session; stateless cloud providers may run concurrent calls.
   Future<String> ask(String prompt) {
     return dart_api.edgeLlmAsk(sdk: _sdk, prompt: prompt);
   }
@@ -35,7 +39,11 @@ final class EdgeLlm {
   /// Streams response tokens for a prompt.
   ///
   /// If the provider fails after emitting tokens, the returned stream emits a
-  /// terminal error event before it closes.
+  /// terminal error event before it closes. Cancelling the subscription closes
+  /// the native sink, but this current Dart surface does not expose ADR-027's
+  /// request handle and does not promise to interrupt inference or networking.
+  /// In particular, local Candle and Qwen adapters infer a full reply before
+  /// replaying fragments, so cancellation cannot stop that inference.
   Stream<String> askStream(String prompt) {
     return dart_api.edgeLlmAskStream(sdk: _sdk, prompt: prompt);
   }
@@ -43,7 +51,8 @@ final class EdgeLlm {
   /// Clears any cached session state.
   ///
   /// A failure means the provider may retain a stale KV cache. Stop using this
-  /// handle or rebuild it rather than starting another conversation.
+  /// handle or rebuild it rather than starting another conversation. Calling
+  /// this while a stateful operation is active fails with `Busy`.
   Future<void> reset() {
     return dart_api.edgeLlmReset(sdk: _sdk);
   }

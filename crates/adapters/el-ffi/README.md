@@ -26,20 +26,27 @@ only module allowed to contain FFI `unsafe`. The crate is `cdylib` +
   - `EdgeLlm::cloud(model, api_key)` — frontier cloud backend (opt-in, ADR-010).
     **Native only** — see the web limitation below. `api_key` must come from the
     platform keystore, never embedded.
-  - `ask(prompt) -> Result<String, SdkError>` — blocking chat.
+  - `ask(prompt) -> Result<String, SdkError>` — blocking compatibility chat.
   - `ask_stream_cb(prompt, handler)` — `StreamHandler` callback streaming
     (React Native; UniFFI cannot export `impl FnMut`).
+  - `ask_async(prompt, handler) -> AsyncRequest` and
+    `ask_stream_async(prompt, handler) -> AsyncRequest` — bounded native-worker
+    requests with cooperative cancellation (ADR-027).
   - `reset() -> Result<(), SdkError>` — clears a stateful session; on failure,
     discard or rebuild the handle rather than reuse a possibly stale KV cache.
 - **React Native** — generated UniFFI bindings expose `EdgeLlm.localQwen`
   (production Qwen), `EdgeLlm.local` (development seam), `EdgeLlm.cloud`,
-  `ask`, `askStreamCb`, and `reset`.
+  blocking compatibility methods, and the `askAsync` / `askStreamAsync`
+  native-worker surface.
 - **Dart / Flutter / pub.dev wrappers** — `edge_llm_*` FRB functions wrapped by the Dart
   facade as `EdgeLlm.local`, `EdgeLlm.cloud`, `ask`, `askStream`, and `reset`.
 - **`SdkError`** — a thin, FFI-safe projection of `el_core::EdgeError`
   (`el-core`'s `Box<str>`/Rust-specific variants are not FFI-safe). Projects to
   the host language's exception type, or a JS exception on wasm.
-- **`StreamHandler`** — the React Native streaming callback interface.
+- **`AsyncRequest`** — an idempotent React Native cancellation handle; terminal
+  callbacks are exactly-once. A cancelled callback can arrive before a backend
+  that ignores cancellation has drained; that handle remains `Busy` until its
+  provider exits, so synchronous re-entry never races a stateful session.
 
 ## Usage (Rust side)
 
@@ -80,28 +87,45 @@ console.log(reply);
 ## Usage (React Native)
 
 ```ts
-import { localEdgeLlm } from "edge-intelligence-sdk";
+import { askAsync, askStreamAsync, localEdgeLlm } from "edge-intelligence-sdk";
 
 const qwen05b = "/data/user/0/com.example.app/files/models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
 const qwenTokenizer = "/data/user/0/com.example.app/files/models/qwen2.5-0.5b-instruct.tokenizer.json";
 const sdk = localEdgeLlm(qwen05b, qwenTokenizer);
 
-const reply = sdk.ask("Summarize edge inference in one sentence.");
+const completion = askAsync(sdk, "Summarize edge inference in one sentence.");
+const reply = await completion.response;
 let streamed = "";
-sdk.askStreamCb("Give me two deployment tips.", {
+const stream = askStreamAsync(sdk, "Give me two deployment tips.", {
   onToken(token) {
     streamed += token;
   },
+  onComplete() {},
+  onError(error) { console.error(error); },
+  onCancelled() {},
 });
+// stream.cancel(); // requests cleanup at the next runtime boundary
 ```
 
-The current React Native methods are synchronous. `askStreamCb` replays the
-completed Qwen reply as text fragments because the runtime has no per-token
-decode hook yet; it does not make generation incremental. The Qwen factory
-always limits each reply to 64 generated tokens; the current React Native API
-does not offer a caller-supplied limit or a stop reason. Do not use either
-method for latency-sensitive UI on the JavaScript thread until the asynchronous
-React Native API is separately introduced.
+`ask` and `askStreamCb` remain synchronous compatibility seams. Use
+`askAsync`/`askStreamAsync` for application requests: stateful providers accept
+one active turn per handle, while stateless providers accept up to two native
+async requests per handle. Capacity is isolated to that handle and returns a
+typed `Busy` error rather than queuing unbounded work. A cancellation request is
+cooperative, so its latency is bounded by the next prefill, decode, or safety
+checkpoint boundary. `onCancelled` is delivered promptly, but a backend that
+does not return at that boundary keeps its handle `Busy` until cleanup has
+finished. The opt-in cloud transport bounds a stalled connection to 10 seconds,
+an idle stream read to 60 seconds, and a non-streaming request to 120 seconds,
+so it cannot hold that handle indefinitely. The legacy synchronous Qwen methods
+retain their 64-token UI-thread cap; native-worker calls use the provider's
+normal generation default. If cancellation wins the race, an async stream can already have
+delivered partial tokens and its `onCancelled` callback is authoritative. A
+queued provider error retains that outcome, but a queued completion is changed
+to cancellation when buffered token fragments are discarded. The current local Candle and Qwen providers replay completed
+text fragments for both callback stream APIs, so `askStreamAsync` moves work off
+the host thread without yet improving time-to-first-token. ADR-019 remains the
+authority for true in-loop safe-token streaming.
 
 ## Dart and Flutter
 
@@ -109,6 +133,14 @@ The existing Dart `EdgeLlm.local(modelUri)` binding remains a development/test
 surface and does not yet expose the tokenizer-aware Qwen constructor. It must
 not be used for Qwen GGUF chat until that binding receives a separately scoped
 ADR-026 compatibility update.
+
+Dart's `ask` and `askStream` execute as Flutter Rust Bridge asynchronous tasks,
+not on the UI isolate. Cancelling a Dart subscription closes its FRB sink; the
+runtime token is cancelled only after the sink refuses an append. The current
+local Candle and Qwen providers infer the full reply before replaying it, so
+this cannot interrupt inference or transport. Dart has no request-handle
+cancellation yet. A concurrent `ask`, `askStream`, or `reset` on the same
+handle receives `Busy` rather than racing the session.
 
 ## Native Qwen integration fixture
 

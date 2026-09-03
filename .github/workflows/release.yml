@@ -66,6 +66,14 @@ jobs:
           TAG_VER: ${{ steps.tag.outputs.version }}
         run: python3 scripts/assert-adr-026-release-version.py "$TAG_VER"
 
+      # ADR-027 adds public native scheduling and FFI error behavior. Do not
+      # ship that contract in the 0.4.x patch line.
+      - name: Assert ADR-027 async API has a minor release
+        if: github.event_name == 'push'
+        env:
+          TAG_VER: ${{ steps.tag.outputs.version }}
+        run: python3 scripts/assert-adr-027-release-version.py "$TAG_VER"
+
       # All internal dep version requirements live exclusively in [workspace.dependencies].
       # Verify every one of them matches the tag before touching any registry.
       - name: Assert all internal dep versions match tag

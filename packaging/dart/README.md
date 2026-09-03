@@ -42,6 +42,16 @@ If the package assets cannot be loaded from the host filesystem,
 initialization fails with an actionable `UnsupportedError`; hosts with a custom
 runtime location can pass an `externalLibrary` directly.
 
+`ask` and `askStream` run through Flutter Rust Bridge asynchronous tasks, so
+they do not execute inference on Flutter's UI isolate. Cancelling an
+`askStream` subscription closes its native sink, but the current Dart binding
+does not expose an ADR-027 request handle and does not promise to interrupt
+inference or network transport. Local Candle and Qwen infer a complete reply
+before replaying fragments, so subscription cancellation cannot stop their
+inference. Each stateful local `EdgeLlm` handle permits one active request;
+overlapping local requests or `reset()` return `Busy` rather than racing the
+session. Stateless cloud calls may run concurrently.
+
 ## Flutter Android and iOS
 
 Add `edge_intelligence` as a normal Flutter dependency. The plugin bundles

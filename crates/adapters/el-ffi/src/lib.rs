@@ -30,12 +30,87 @@
 #![deny(unsafe_code)]
 
 #[cfg(not(target_arch = "wasm32"))]
+use el_core::CancellationToken;
+#[cfg(not(target_arch = "wasm32"))]
 use el_core::CredentialRef;
-use el_core::{ChatMessage, ChatRequest, ChatToken, LlmProvider};
+use el_core::{ChatMessage, ChatRequest, ChatToken, EdgeError, LlmProvider};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::AtomicUsize;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+// Release mobile cdylibs rely on `catch_unwind` around both provider work and
+// foreign callbacks. Keep this compile-time guard coupled to Cargo's release
+// panic strategy so a future profile change cannot silently turn containment
+// into a process abort.
+#[cfg(all(not(target_arch = "wasm32"), not(panic = "unwind")))]
+compile_error!("native el-ffi requires panic = \"unwind\" for FFI panic containment");
 
 /// Per-request generation bound for the synchronous React Native Qwen facade.
 #[cfg(not(target_arch = "wasm32"))]
 const QWEN_FFI_DEFAULT_MAX_TOKENS: u32 = 64;
+
+/// Backpressure bound between an inference worker and host token delivery.
+#[cfg(not(target_arch = "wasm32"))]
+const ASYNC_STREAM_EVENT_BUFFER: usize = 32;
+/// Native-worker cap scoped to one SDK handle. It protects a stateless handle
+/// from unbounded thread creation without letting an uncooperative provider on
+/// one handle starve unrelated handles.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_ASYNC_REQUESTS_PER_HANDLE: usize = 2;
+
+/// A fail-fast permit for one stateful `EdgeLlm` operation.
+///
+/// Holding this across a provider call serializes `ask`, streaming, reset, and
+/// asynchronous worker requests on a single conversation handle.
+struct OperationPermit {
+    active: Arc<AtomicBool>,
+}
+
+impl Drop for OperationPermit {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+/// A per-handle permit for native asynchronous workers.
+#[cfg(not(target_arch = "wasm32"))]
+struct AsyncWorkerPermit {
+    active: Arc<AtomicUsize>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl AsyncWorkerPermit {
+    fn acquire(active: &Arc<AtomicUsize>) -> Result<Self, SdkError> {
+        loop {
+            let current = active.load(Ordering::Acquire);
+            if current >= MAX_ASYNC_REQUESTS_PER_HANDLE {
+                return Err(SdkError::Busy {
+                    message: "async request capacity reached for this SDK handle; retry after an active request completes".into(),
+                });
+            }
+            if active
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(Self {
+                    active: Arc::clone(active),
+                });
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for AsyncWorkerPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 // UniFFI scaffolding — must appear once per crate, before any uniffi proc-macros.
 #[cfg(not(target_arch = "wasm32"))]
@@ -71,19 +146,31 @@ use wasm_bindgen::prelude::*;
 pub enum SdkError {
     /// The LLM backend (local Candle or cloud) returned an error.
     ProviderError { message: String },
+    /// This stateful SDK handle or its per-handle async capacity is busy.
+    Busy { message: String },
+    /// The consumer cancelled a request at a cooperative runtime boundary.
+    Cancelled { message: String },
 }
 
 impl std::fmt::Display for SdkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self::ProviderError { message } = self;
-        write!(f, "{message}")
+        match self {
+            Self::ProviderError { message }
+            | Self::Busy { message }
+            | Self::Cancelled { message } => write!(f, "{message}"),
+        }
     }
 }
 
 impl From<el_core::EdgeError> for SdkError {
     fn from(e: el_core::EdgeError) -> Self {
-        Self::ProviderError {
-            message: e.to_string(),
+        match e {
+            EdgeError::Cancelled => Self::Cancelled {
+                message: "request cancelled".into(),
+            },
+            other => Self::ProviderError {
+                message: other.to_string(),
+            },
         }
     }
 }
@@ -117,6 +204,195 @@ pub trait StreamHandler: Send + Sync {
     fn on_token(&self, token: String);
 }
 
+/// Completion callbacks for non-blocking single-response requests.
+///
+/// Exactly one terminal callback is delivered: `on_complete`, `on_error`, or
+/// `on_cancelled`. A completion or error already queued before consumer
+/// cancellation retains that terminal outcome.
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export(callback_interface)]
+pub trait AsyncCompletionHandler: Send + Sync {
+    fn on_complete(&self, response: String);
+    fn on_error(&self, error: String);
+    fn on_cancelled(&self);
+}
+
+/// Token and terminal callbacks for non-blocking streaming requests.
+///
+/// `on_token` is never called after a terminal callback. If cancellation wins
+/// the race after one or more token callbacks, those fragments are a partial
+/// response and `on_cancelled` is the terminal outcome; callers must not treat
+/// them as a completed answer. A queued provider error retains its error
+/// outcome. A queued completion is retained only when no buffered token
+/// fragments are discarded; otherwise `on_cancelled` remains authoritative.
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export(callback_interface)]
+pub trait AsyncStreamHandler: Send + Sync {
+    fn on_token(&self, token: String);
+    fn on_complete(&self);
+    fn on_error(&self, error: String);
+    fn on_cancelled(&self);
+}
+
+/// Cooperative cancellation handle for an FFI-owned asynchronous request.
+///
+/// Cancellation is observed by the runtime at prefill and decode boundaries;
+/// it is idempotent and does not interrupt unsafe model-engine internals.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(uniffi::Object)]
+pub struct AsyncRequest {
+    /// The consumer-visible request signal. Internal delivery failures must not
+    /// change this value, or `is_cancelled` could contradict an error callback.
+    cancellation: CancellationToken,
+    /// The token passed to the provider. It is also tripped for internal
+    /// delivery failures so a cooperative provider can stop promptly.
+    runtime_cancellation: CancellationToken,
+    /// Wakes the delivery worker without polling when the consumer cancels.
+    /// A full bounded token queue is handled on its next receive instead.
+    cancel_notifier: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl AsyncRequest {
+    fn new(cancel_notifier: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            cancellation: CancellationToken::new(),
+            runtime_cancellation: CancellationToken::new(),
+            cancel_notifier: Mutex::new(Some(cancel_notifier)),
+        }
+    }
+
+    fn runtime_cancellation(&self) -> CancellationToken {
+        self.runtime_cancellation.clone()
+    }
+
+    /// Release the host-owned sender once delivery has a terminal outcome or
+    /// the producer exits. This lets the receiver observe a genuine worker
+    /// disconnect instead of keeping it alive for the FFI handle's lifetime.
+    fn disarm_cancel_notifier(&self) {
+        self.cancel_notifier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export]
+impl AsyncRequest {
+    /// Request cooperative cancellation. Safe to call more than once.
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+        self.runtime_cancellation.cancel();
+        let notifier = self
+            .cancel_notifier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(Arc::clone);
+        if let Some(notifier) = notifier {
+            notifier();
+        }
+    }
+
+    /// Returns whether cancellation has been requested by the consumer.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+}
+
+/// Events crossing the bounded boundary between synchronous inference and host
+/// callbacks. The delivery loop owns the host callback side so provider/session
+/// code never invokes foreign code while it owns its state.
+#[cfg(not(target_arch = "wasm32"))]
+enum AsyncStreamEvent {
+    Token(String),
+    Complete,
+    Cancelled,
+    Error(String),
+    CancellationRequested,
+}
+
+/// Terminal result for a non-streaming asynchronous request.
+#[cfg(not(target_arch = "wasm32"))]
+enum AsyncCompletionEvent {
+    Complete(String),
+    Cancelled,
+    Error(String),
+    CancellationRequested,
+}
+
+/// Consume already-buffered stream fragments after consumer cancellation without
+/// invoking foreign callbacks. A queued error remains factual. A queued
+/// completion cannot be delivered after silently discarding token fragments, so
+/// it is downgraded to cancellation in that case. This preserves the terminal
+/// contract without waiting for an uncooperative producer.
+#[cfg(not(target_arch = "wasm32"))]
+fn queued_stream_terminal(
+    receiver: &std::sync::mpsc::Receiver<AsyncStreamEvent>,
+) -> Option<AsyncStreamEvent> {
+    let mut discarded_token = false;
+    while let Ok(event) = receiver.try_recv() {
+        match event {
+            AsyncStreamEvent::Token(_) => discarded_token = true,
+            AsyncStreamEvent::CancellationRequested => {}
+            AsyncStreamEvent::Complete if discarded_token => {
+                return Some(AsyncStreamEvent::Cancelled);
+            }
+            terminal => return Some(terminal),
+        }
+    }
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cancellation_stream_terminal(
+    receiver: &mut Option<std::sync::mpsc::Receiver<AsyncStreamEvent>>,
+) -> (AsyncStreamEvent, bool) {
+    let terminal = receiver.as_ref().and_then(queued_stream_terminal);
+    drop(receiver.take());
+    match terminal {
+        Some(terminal) => (terminal, true),
+        None => (AsyncStreamEvent::Cancelled, false),
+    }
+}
+
+/// Consume a completion terminal already queued after a cancellation sentinel.
+/// As with streams, an established provider result is factual and therefore
+/// wins over a later cancellation without waiting for an uncooperative worker.
+#[cfg(not(target_arch = "wasm32"))]
+fn queued_completion_terminal(
+    receiver: &std::sync::mpsc::Receiver<AsyncCompletionEvent>,
+) -> Option<AsyncCompletionEvent> {
+    while let Ok(event) = receiver.try_recv() {
+        match event {
+            AsyncCompletionEvent::CancellationRequested => {}
+            terminal => return Some(terminal),
+        }
+    }
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cancellation_completion_terminal(
+    receiver: &mut Option<std::sync::mpsc::Receiver<AsyncCompletionEvent>>,
+) -> (AsyncCompletionEvent, bool) {
+    let terminal = receiver.as_ref().and_then(queued_completion_terminal);
+    drop(receiver.take());
+    match terminal {
+        Some(terminal) => (terminal, true),
+        None => (AsyncCompletionEvent::Cancelled, false),
+    }
+}
+
+/// Foreign callback failures must not unwind an SDK worker or suppress its
+/// terminal lifecycle attempt. There is no safe recovery after a terminal
+/// callback itself panics, but catching it keeps permit cleanup deterministic.
+#[cfg(not(target_arch = "wasm32"))]
+fn invoke_host_callback(callback: impl FnOnce()) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)).is_ok()
+}
+
 // ── Public FFI facade ────────────────────────────────────────────────────────
 
 /// The flat FFI-friendly facade (ADR-001, ADR-009, ADR-010).
@@ -130,11 +406,18 @@ pub trait StreamHandler: Send + Sync {
 #[cfg_attr(not(target_arch = "wasm32"), frb(opaque))]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub struct EdgeLlm {
-    provider: Box<dyn LlmProvider>,
+    provider: Arc<dyn LlmProvider>,
     /// Default model routing string (stored so `ask()` can fill `ChatRequest::model`).
     default_model: String,
     /// Optional per-request completion cap applied by this FFI facade.
     max_tokens: Option<u32>,
+    /// One active turn per conversational handle. Contention is reported as
+    /// `SdkError::Busy` rather than queued behind an unbounded backlog.
+    operation_active: Arc<AtomicBool>,
+    /// Number of native asynchronous requests currently accepted for this
+    /// handle. Unlike session serialization, this also bounds stateless calls.
+    #[cfg(not(target_arch = "wasm32"))]
+    async_requests_active: Arc<AtomicUsize>,
 }
 
 /// UniFFI-exported methods: constructors, blocking chat, and reset.
@@ -180,15 +463,15 @@ impl EdgeLlm {
             art.verify(&PermissiveVerifier, b"placeholder", b"sig", 0);
             let permit = art.ensure_loadable().map_err(SdkError::from)?;
 
-            let provider: Box<dyn LlmProvider> = if model_uri.is_empty() {
+            let provider: Arc<dyn LlmProvider> = if model_uri.is_empty() {
                 // No path — toy model for development/tests.
-                Box::new(
+                Arc::new(
                     el_engine_candle::LocalLlmProvider::toy(256, 64, 255, permit)
                         .map_err(SdkError::from)?,
                 )
             } else {
                 // Consumer-supplied GGUF path.
-                Box::new(
+                Arc::new(
                     el_engine_candle::LocalLlmProvider::from_path(&model_uri, 1, permit)
                         .map_err(SdkError::from)?,
                 )
@@ -198,13 +481,16 @@ impl EdgeLlm {
                 provider,
                 default_model: "local".into(),
                 max_tokens: None,
+                operation_active: Arc::new(AtomicBool::new(false)),
+                async_requests_active: Arc::new(AtomicUsize::new(0)),
             })
         }
         #[cfg(target_arch = "wasm32")]
         Ok(Self {
-            provider: Box::new(EchoProvider),
+            provider: Arc::new(EchoProvider),
             default_model: "local".into(),
             max_tokens: None,
+            operation_active: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -231,19 +517,19 @@ impl EdgeLlm {
             });
         }
 
-        // React Native's current synchronous UniFFI methods execute on the JS
-        // thread. Every Qwen FFI request is therefore limited to 64 generated
-        // tokens. This facade has no caller-supplied generation-limit argument;
-        // hosts needing a different bound must use the Rust provider API until
-        // an async React Native surface is introduced.
+        // Legacy synchronous methods retain their bounded 64-token behavior.
+        // SDK consumers that need non-blocking execution use `ask_async` or
+        // `ask_stream_async`, which run on native worker threads.
         let provider = el_engine_candle::QwenChatProvider::from_paths(&model_uri, &tokenizer_uri)
             .map_err(|error| SdkError::ProviderError {
             message: format!("{error} (model: {model_uri}, tokenizer: {tokenizer_uri})"),
         })?;
         Ok(Self {
-            provider: Box::new(provider),
+            provider: Arc::new(provider),
             default_model: "local/qwen".into(),
             max_tokens: Some(QWEN_FFI_DEFAULT_MAX_TOKENS),
+            operation_active: Arc::new(AtomicBool::new(false)),
+            async_requests_active: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -268,9 +554,11 @@ impl EdgeLlm {
             inner,
         };
         Self {
-            provider: Box::new(provider),
+            provider: Arc::new(provider),
             default_model: model,
             max_tokens: None,
+            operation_active: Arc::new(AtomicBool::new(false)),
+            async_requests_active: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -279,6 +567,7 @@ impl EdgeLlm {
     /// Returns `Err(SdkError::ProviderError)` on network/auth/engine failure
     /// so callers can distinguish model output from error conditions.
     pub fn ask(&self, prompt: String) -> Result<String, SdkError> {
+        let _operation = self.try_start_operation()?;
         let req = self.request(prompt);
         self.provider
             .chat(&req)
@@ -293,14 +582,46 @@ impl EdgeLlm {
     /// caller must stop or rebuild the provider rather than reuse a possibly
     /// stale KV cache.
     pub fn reset(&self) -> Result<(), SdkError> {
+        let _operation = self.try_start_operation()?;
         self.provider.end_session().map_err(SdkError::from)
     }
 }
 
 impl EdgeLlm {
+    fn try_start_operation(&self) -> Result<Option<OperationPermit>, SdkError> {
+        if !self.provider.requires_exclusive_turn() {
+            return Ok(None);
+        }
+        self.operation_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| SdkError::Busy {
+                message: "an operation is already active for this SDK handle".into(),
+            })?;
+        Ok(Some(OperationPermit {
+            active: Arc::clone(&self.operation_active),
+        }))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn try_start_async_worker(&self) -> Result<AsyncWorkerPermit, SdkError> {
+        AsyncWorkerPermit::acquire(&self.async_requests_active)
+    }
+
     fn request(&self, prompt: String) -> ChatRequest {
+        self.request_with_max_tokens(prompt, self.max_tokens)
+    }
+
+    /// The legacy synchronous facade is capped to avoid blocking a host UI for
+    /// an unbounded reply. Native-worker requests do not inherit that transport
+    /// workaround; the provider's own default generation policy remains active.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn async_request(&self, prompt: String) -> ChatRequest {
+        self.request_with_max_tokens(prompt, None)
+    }
+
+    fn request_with_max_tokens(&self, prompt: String, max_tokens: Option<u32>) -> ChatRequest {
         let request = ChatRequest::new(self.default_model.clone(), vec![ChatMessage::user(prompt)]);
-        match self.max_tokens {
+        match max_tokens {
             Some(max_tokens) => request.with_max_tokens(max_tokens),
             None => request,
         }
@@ -312,9 +633,28 @@ impl EdgeLlm {
         prompt: String,
         mut on_token: impl FnMut(String),
     ) -> Result<(), SdkError> {
+        let _operation = self.try_start_operation()?;
         let req = self.request(prompt);
         self.provider
             .chat_stream(&req, &mut |t: ChatToken| {
+                if !t.is_final {
+                    on_token(t.text);
+                }
+            })
+            .map_err(SdkError::from)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn ask_stream_with_cancellation(
+        &self,
+        prompt: String,
+        cancellation: &CancellationToken,
+        mut on_token: impl FnMut(String),
+    ) -> Result<(), SdkError> {
+        let _operation = self.try_start_operation()?;
+        let req = self.request(prompt);
+        self.provider
+            .chat_stream_cancellable(&req, cancellation, &mut |t: ChatToken| {
                 if !t.is_final {
                     on_token(t.text);
                 }
@@ -339,6 +679,296 @@ impl EdgeLlm {
         handler: Box<dyn StreamHandler>,
     ) -> Result<(), SdkError> {
         self.ask_stream_with(prompt, |token| handler.on_token(token))
+    }
+
+    /// Begin a non-blocking completion on a native FFI worker.
+    ///
+    /// The request is rejected with `SdkError::Busy` when this conversational
+    /// stateful handle already has an active turn. Stateless providers may
+    /// accept concurrent calls on one SDK handle. Exactly one terminal callback
+    /// is delivered after acceptance.
+    /// If a backend cannot stop immediately, `on_cancelled` is delivered
+    /// promptly but this handle remains Busy until its provider exits and its
+    /// stateful session is safe to reuse.
+    pub fn ask_async(
+        &self,
+        prompt: String,
+        handler: Box<dyn AsyncCompletionHandler>,
+    ) -> Result<Arc<AsyncRequest>, SdkError> {
+        let operation = self.try_start_operation()?;
+        let worker = self.try_start_async_worker()?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let cancellation_sender = sender.clone();
+        let request = Arc::new(AsyncRequest::new(Arc::new(move || {
+            let _ = cancellation_sender.try_send(AsyncCompletionEvent::CancellationRequested);
+        })));
+        let producer_request = Arc::clone(&request);
+        let delivery_request = Arc::clone(&request);
+        let runtime_cancellation = request.runtime_cancellation();
+        let provider = Arc::clone(&self.provider);
+        let chat_request = self.async_request(prompt);
+
+        std::thread::Builder::new()
+            .name("edge-intelligence-request".into())
+            .spawn(move || {
+                let (ack_sender, ack_receiver) = std::sync::mpsc::sync_channel(0);
+                let producer = std::thread::Builder::new()
+                    .name("edge-intelligence-request-producer".into())
+                    .spawn(move || {
+                        // The provider owns these per-handle permits until it
+                        // actually exits. A cancellation callback may be delivered
+                        // first, but later calls still fail fast with Busy
+                        // until stateful cleanup has completed.
+                        let operation_permit = operation;
+                        let worker_permit = worker;
+                        let mut response = String::new();
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            provider.chat_stream_cancellable(
+                                &chat_request,
+                                &runtime_cancellation,
+                                &mut |token: ChatToken| {
+                                    if !token.is_final {
+                                        response.push_str(&token.text);
+                                    }
+                                },
+                            )
+                        }));
+                        let terminal = match result {
+                            Ok(Ok(())) if runtime_cancellation.is_cancelled() => {
+                                AsyncCompletionEvent::Cancelled
+                            }
+                            Ok(Ok(())) => AsyncCompletionEvent::Complete(response),
+                            Ok(Err(EdgeError::Cancelled)) => AsyncCompletionEvent::Cancelled,
+                            Ok(Err(error)) => {
+                                AsyncCompletionEvent::Error(SdkError::from(error).to_string())
+                            }
+                            Err(_) => {
+                                AsyncCompletionEvent::Error("async request worker panicked".into())
+                            }
+                        };
+                        producer_request.disarm_cancel_notifier();
+                        if sender.send(terminal).is_ok() {
+                            // Keep the permits through terminal callback
+                            // delivery; dropping the receiver/ack sender after
+                            // early cancellation lets this exit without a join.
+                            let _ = ack_receiver.recv();
+                        }
+                        drop(operation_permit);
+                        drop(worker_permit);
+                    });
+
+                if let Err(error) = producer {
+                    delivery_request.disarm_cancel_notifier();
+                    let _ = invoke_host_callback(|| {
+                        handler.on_error(format!("failed to start async request worker: {error}"))
+                    });
+                    return;
+                }
+
+                let mut receiver = Some(receiver);
+                let (terminal, needs_ack) = match receiver
+                    .as_ref()
+                    .expect("receiver lives until a terminal event")
+                    .recv()
+                {
+                    Ok(AsyncCompletionEvent::CancellationRequested) => {
+                        cancellation_completion_terminal(&mut receiver)
+                    }
+                    Ok(event) => (event, true),
+                    Err(_) => (
+                        AsyncCompletionEvent::Error(
+                            "async request worker exited without a terminal event".into(),
+                        ),
+                        false,
+                    ),
+                };
+
+                match terminal {
+                    AsyncCompletionEvent::Complete(response) => {
+                        let _ = invoke_host_callback(|| handler.on_complete(response));
+                    }
+                    AsyncCompletionEvent::Cancelled => {
+                        let _ = invoke_host_callback(|| handler.on_cancelled());
+                    }
+                    AsyncCompletionEvent::Error(error) => {
+                        let _ = invoke_host_callback(|| handler.on_error(error));
+                    }
+                    AsyncCompletionEvent::CancellationRequested => {
+                        unreachable!("cancellation notifications are handled in the receive loop")
+                    }
+                }
+                if needs_ack {
+                    let _ = ack_sender.send(());
+                }
+                delivery_request.disarm_cancel_notifier();
+            })
+            .map_err(|error| SdkError::ProviderError {
+                message: format!("failed to start async request worker: {error}"),
+            })?;
+
+        Ok(request)
+    }
+
+    /// Begin a non-blocking token stream on native FFI workers.
+    ///
+    /// A bounded channel forwards provider-emitted tokens to a delivery worker,
+    /// so host callbacks never run under a provider/session lock. Slow callbacks
+    /// apply backpressure instead of accumulating an unbounded token buffer. The
+    /// host binding is responsible for dispatching callbacks onto any UI-specific
+    /// executor. Providers that only replay a completed response (including the
+    /// current local Candle/Qwen adapters) do not improve time-to-first-token;
+    /// ADR-019 owns true in-loop safe-token streaming. If a backend cannot stop
+    /// immediately after cancellation, `on_cancelled` is delivered promptly but
+    /// the handle remains Busy until provider cleanup is complete.
+    pub fn ask_stream_async(
+        &self,
+        prompt: String,
+        handler: Box<dyn AsyncStreamHandler>,
+    ) -> Result<Arc<AsyncRequest>, SdkError> {
+        let operation = self.try_start_operation()?;
+        let worker = self.try_start_async_worker()?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(ASYNC_STREAM_EVENT_BUFFER);
+        let cancellation_sender = sender.clone();
+        let request = Arc::new(AsyncRequest::new(Arc::new(move || {
+            let _ = cancellation_sender.try_send(AsyncStreamEvent::CancellationRequested);
+        })));
+        let producer_request = Arc::clone(&request);
+        let delivery_request = Arc::clone(&request);
+        let user_cancellation = request.cancellation.clone();
+        let runtime_cancellation = request.runtime_cancellation();
+        let provider = Arc::clone(&self.provider);
+        let chat_request = self.async_request(prompt);
+
+        std::thread::Builder::new()
+            .name("edge-intelligence-stream".into())
+            .spawn(move || {
+                let (ack_sender, ack_receiver) = std::sync::mpsc::sync_channel(0);
+                let producer_cancellation = runtime_cancellation.clone();
+                let producer = std::thread::Builder::new()
+                    .name("edge-intelligence-stream-producer".into())
+                    .spawn(move || {
+                        // Keep the stateful session and this handle's worker
+                        // slot owned by inference until it exits. Cancellation
+                        // can notify the host promptly, but safe reuse remains
+                        // unavailable until this cleanup completes.
+                        let operation_permit = operation;
+                        let worker_permit = worker;
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            provider.chat_stream_cancellable(
+                                &chat_request,
+                                &producer_cancellation,
+                                &mut |token: ChatToken| {
+                                    if !token.is_final
+                                        && sender.send(AsyncStreamEvent::Token(token.text)).is_err()
+                                    {
+                                        producer_cancellation.cancel();
+                                    }
+                                },
+                            )
+                        }));
+                        let terminal = match result {
+                            Ok(Ok(())) if producer_cancellation.is_cancelled() => {
+                                AsyncStreamEvent::Cancelled
+                            }
+                            Ok(Ok(())) => AsyncStreamEvent::Complete,
+                            Ok(Err(EdgeError::Cancelled)) => AsyncStreamEvent::Cancelled,
+                            Ok(Err(error)) => {
+                                AsyncStreamEvent::Error(SdkError::from(error).to_string())
+                            }
+                            Err(_) => {
+                                AsyncStreamEvent::Error("async stream worker panicked".into())
+                            }
+                        };
+                        producer_request.disarm_cancel_notifier();
+                        if sender.send(terminal).is_ok() {
+                            let _ = ack_receiver.recv();
+                        }
+                        drop(operation_permit);
+                        drop(worker_permit);
+                    });
+
+                match producer {
+                    Ok(_) => {}
+                    Err(error) => {
+                        delivery_request.disarm_cancel_notifier();
+                        let _ = invoke_host_callback(|| {
+                            handler
+                                .on_error(format!("failed to start async stream worker: {error}"))
+                        });
+                        return;
+                    }
+                };
+
+                let mut receiver = Some(receiver);
+                let (terminal, needs_ack) = loop {
+                    match receiver
+                        .as_ref()
+                        .expect("receiver lives until a terminal event")
+                        .recv()
+                    {
+                        Ok(AsyncStreamEvent::Token(token)) => {
+                            // If the token queue was full when cancellation was
+                            // requested, the notifier could not enqueue its
+                            // sentinel. Observe the atomic before invoking host
+                            // code so that the next receive still cancels
+                            // promptly without polling.
+                            if user_cancellation.is_cancelled() {
+                                break cancellation_stream_terminal(&mut receiver);
+                            }
+                            if !invoke_host_callback(|| handler.on_token(token)) {
+                                runtime_cancellation.cancel();
+                                drop(receiver.take());
+                                break (
+                                    AsyncStreamEvent::Error(
+                                        "async stream token callback panicked".into(),
+                                    ),
+                                    false,
+                                );
+                            }
+                        }
+                        Ok(AsyncStreamEvent::CancellationRequested) => {
+                            break cancellation_stream_terminal(&mut receiver);
+                        }
+                        Ok(event) => {
+                            break (event, true);
+                        }
+                        Err(_) => {
+                            runtime_cancellation.cancel();
+                            break (
+                                AsyncStreamEvent::Error(
+                                    "async stream worker exited without a terminal event".into(),
+                                ),
+                                false,
+                            );
+                        }
+                    }
+                };
+
+                match terminal {
+                    AsyncStreamEvent::Complete => {
+                        let _ = invoke_host_callback(|| handler.on_complete());
+                    }
+                    AsyncStreamEvent::Cancelled => {
+                        let _ = invoke_host_callback(|| handler.on_cancelled());
+                    }
+                    AsyncStreamEvent::Error(error) => {
+                        let _ = invoke_host_callback(|| handler.on_error(error));
+                    }
+                    AsyncStreamEvent::Token(_) => unreachable!("token events are handled above"),
+                    AsyncStreamEvent::CancellationRequested => {
+                        unreachable!("cancellation notifications are handled in the receive loop")
+                    }
+                }
+                if needs_ack {
+                    let _ = ack_sender.send(());
+                }
+                delivery_request.disarm_cancel_notifier();
+            })
+            .map_err(|error| SdkError::ProviderError {
+                message: format!("failed to start async stream worker: {error}"),
+            })?;
+
+        Ok(request)
     }
 }
 
@@ -374,13 +1004,18 @@ pub mod dart_api {
     #[frb]
     pub fn edge_llm_ask_stream(sdk: &EdgeLlm, prompt: String, sink: StreamSink<String, DcoCodec>) {
         let mut sink_closed = false;
-        let result = sdk.ask_stream_with(prompt, |token| {
+        let cancellation = CancellationToken::new();
+        let sink_cancellation = cancellation.clone();
+        let result = sdk.ask_stream_with_cancellation(prompt, &cancellation, |token| {
             if !sink_closed {
                 if sink.add(token).is_err() {
                     // Dart cancelled the stream (e.g. take(n), listen().cancel()).
-                    // LlmProvider has no cancellation hook so generation runs to
-                    // completion; remaining tokens are silently dropped.
+                    // This only stops delivery through the current FRB surface.
+                    // Replay-style local providers have already finished
+                    // inference before their first sink write, so it is not an
+                    // inference-cancellation guarantee.
                     sink_closed = true;
+                    sink_cancellation.cancel();
                 }
             }
         });
@@ -450,6 +1085,10 @@ struct BoundCloudProvider {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl LlmProvider for BoundCloudProvider {
+    fn requires_exclusive_turn(&self) -> bool {
+        false
+    }
+
     fn chat(&self, req: &ChatRequest) -> el_core::Result<el_core::ChatResponse> {
         let mut r = req.clone();
         r.model = self.model.clone();
@@ -479,6 +1118,10 @@ struct EchoProvider;
 
 #[cfg(target_arch = "wasm32")]
 impl LlmProvider for EchoProvider {
+    fn requires_exclusive_turn(&self) -> bool {
+        false
+    }
+
     fn chat(&self, req: &ChatRequest) -> el_core::Result<el_core::ChatResponse> {
         let echo = req
             .messages
@@ -521,6 +1164,9 @@ impl LlmProvider for EchoProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static ASYNC_WORKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    const ASYNC_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     #[test]
     fn local_toy_ask_returns_non_empty_response() {
@@ -567,6 +1213,747 @@ mod tests {
         );
 
         assert_eq!(errors, vec!["stream interrupted"]);
+    }
+
+    #[test]
+    fn queued_stream_error_beats_a_later_consumer_cancellation() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        sender
+            .send(AsyncStreamEvent::Token("partial".into()))
+            .unwrap();
+        sender
+            .send(AsyncStreamEvent::Error("provider failed".into()))
+            .unwrap();
+        let mut receiver = Some(receiver);
+
+        let (terminal, needs_ack) = cancellation_stream_terminal(&mut receiver);
+
+        assert!(needs_ack, "the producer is waiting for terminal delivery");
+        assert!(matches!(
+            terminal,
+            AsyncStreamEvent::Error(error) if error == "provider failed"
+        ));
+        assert!(receiver.is_none());
+    }
+
+    #[test]
+    fn queued_stream_completion_after_discarded_tokens_is_cancelled() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        sender
+            .send(AsyncStreamEvent::Token("partial".into()))
+            .unwrap();
+        sender.send(AsyncStreamEvent::Complete).unwrap();
+        let mut receiver = Some(receiver);
+
+        let (terminal, needs_ack) = cancellation_stream_terminal(&mut receiver);
+
+        assert!(needs_ack, "the producer is waiting for terminal delivery");
+        assert!(matches!(terminal, AsyncStreamEvent::Cancelled));
+        assert!(receiver.is_none());
+    }
+
+    #[test]
+    fn queued_completion_error_beats_a_later_consumer_cancellation() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        sender
+            .send(AsyncCompletionEvent::CancellationRequested)
+            .unwrap();
+        sender
+            .send(AsyncCompletionEvent::Error("provider failed".into()))
+            .unwrap();
+        let mut receiver = Some(receiver);
+
+        let (terminal, needs_ack) = cancellation_completion_terminal(&mut receiver);
+
+        assert!(needs_ack, "the producer is waiting for terminal delivery");
+        assert!(matches!(
+            terminal,
+            AsyncCompletionEvent::Error(error) if error == "provider failed"
+        ));
+        assert!(receiver.is_none());
+    }
+
+    struct StatelessTestProvider;
+
+    impl LlmProvider for StatelessTestProvider {
+        fn requires_exclusive_turn(&self) -> bool {
+            false
+        }
+
+        fn chat(&self, _: &ChatRequest) -> el_core::Result<el_core::ChatResponse> {
+            Ok(el_core::ChatResponse {
+                content: "ready".into(),
+                model: "test".into(),
+                prompt_tokens: 0,
+                completion_tokens: 1,
+            })
+        }
+
+        fn chat_stream(
+            &self,
+            _: &ChatRequest,
+            on_token: &mut dyn FnMut(ChatToken),
+        ) -> el_core::Result<()> {
+            on_token(ChatToken {
+                text: "ready".into(),
+                is_final: false,
+            });
+            on_token(ChatToken {
+                text: String::new(),
+                is_final: true,
+            });
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stateless_provider_skips_the_exclusive_turn_reservation() {
+        let sdk = EdgeLlm {
+            provider: Arc::new(StatelessTestProvider),
+            default_model: "test".into(),
+            max_tokens: None,
+            operation_active: Arc::new(AtomicBool::new(false)),
+            async_requests_active: Arc::new(AtomicUsize::new(0)),
+        };
+
+        assert!(sdk.try_start_operation().unwrap().is_none());
+        assert!(!sdk.operation_active.load(Ordering::Acquire));
+    }
+
+    struct BlockingCancellableProvider {
+        started: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl LlmProvider for BlockingCancellableProvider {
+        fn chat(&self, _: &ChatRequest) -> el_core::Result<el_core::ChatResponse> {
+            Ok(el_core::ChatResponse {
+                content: "ready".into(),
+                model: "test".into(),
+                prompt_tokens: 0,
+                completion_tokens: 1,
+            })
+        }
+
+        fn chat_stream(
+            &self,
+            _: &ChatRequest,
+            on_token: &mut dyn FnMut(ChatToken),
+        ) -> el_core::Result<()> {
+            on_token(ChatToken {
+                text: "ready".into(),
+                is_final: false,
+            });
+            on_token(ChatToken {
+                text: String::new(),
+                is_final: true,
+            });
+            Ok(())
+        }
+
+        fn chat_stream_cancellable(
+            &self,
+            _: &ChatRequest,
+            cancellation: &CancellationToken,
+            _: &mut dyn FnMut(ChatToken),
+        ) -> el_core::Result<()> {
+            let (started, ready) = &*self.started;
+            *started.lock().unwrap() = true;
+            ready.notify_all();
+            while !cancellation.is_cancelled() {
+                let (lock, _) = ready
+                    .wait_timeout(
+                        started.lock().unwrap(),
+                        std::time::Duration::from_millis(10),
+                    )
+                    .unwrap();
+                drop(lock);
+            }
+            Err(EdgeError::Cancelled)
+        }
+    }
+
+    struct TerminalRecordingStreamHandler {
+        terminal: std::sync::Arc<(std::sync::Mutex<Option<String>>, std::sync::Condvar)>,
+        terminal_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsyncStreamHandler for TerminalRecordingStreamHandler {
+        fn on_token(&self, _: String) {
+            panic!("a cancelled provider must not emit a token")
+        }
+
+        fn on_complete(&self) {
+            self.record("complete");
+        }
+
+        fn on_error(&self, error: String) {
+            self.record(&format!("error:{error}"));
+        }
+
+        fn on_cancelled(&self) {
+            self.record("cancelled");
+        }
+    }
+
+    impl TerminalRecordingStreamHandler {
+        fn record(&self, outcome: &str) {
+            self.terminal_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (terminal, done) = &*self.terminal;
+            *terminal.lock().unwrap() = Some(outcome.into());
+            done.notify_all();
+        }
+    }
+
+    struct CancelsBeforeSuccessProvider;
+
+    impl LlmProvider for CancelsBeforeSuccessProvider {
+        fn chat(&self, _: &ChatRequest) -> el_core::Result<el_core::ChatResponse> {
+            unreachable!("the async completion test uses the cancellable stream seam")
+        }
+
+        fn chat_stream(
+            &self,
+            _: &ChatRequest,
+            _: &mut dyn FnMut(ChatToken),
+        ) -> el_core::Result<()> {
+            unreachable!("the async completion test uses the cancellable stream seam")
+        }
+
+        fn chat_stream_cancellable(
+            &self,
+            _: &ChatRequest,
+            cancellation: &CancellationToken,
+            _: &mut dyn FnMut(ChatToken),
+        ) -> el_core::Result<()> {
+            // Models/providers that observe cancellation only between their
+            // internal units may still finish with Ok. The FFI must project
+            // that race as Cancelled, not as a successful response.
+            cancellation.cancel();
+            Ok(())
+        }
+    }
+
+    struct CompletionRecordingHandler {
+        terminal: std::sync::Arc<(std::sync::Mutex<Option<String>>, std::sync::Condvar)>,
+    }
+
+    impl AsyncCompletionHandler for CompletionRecordingHandler {
+        fn on_complete(&self, response: String) {
+            self.record(&format!("complete:{response}"));
+        }
+
+        fn on_error(&self, error: String) {
+            self.record(&format!("error:{error}"));
+        }
+
+        fn on_cancelled(&self) {
+            self.record("cancelled");
+        }
+    }
+
+    impl CompletionRecordingHandler {
+        fn record(&self, outcome: &str) {
+            let (terminal, done) = &*self.terminal;
+            *terminal.lock().unwrap() = Some(outcome.into());
+            done.notify_all();
+        }
+    }
+
+    fn wait_for_terminal(
+        terminal: &std::sync::Arc<(std::sync::Mutex<Option<String>>, std::sync::Condvar)>,
+    ) -> String {
+        let (terminal_lock, terminal_done) = &**terminal;
+        let mut outcome = terminal_lock.lock().unwrap();
+        while outcome.is_none() {
+            let (next, timeout) = terminal_done
+                .wait_timeout(outcome, ASYNC_TEST_TIMEOUT)
+                .unwrap();
+            assert!(!timeout.timed_out(), "async request did not finish");
+            outcome = next;
+        }
+        outcome.clone().unwrap()
+    }
+
+    fn wait_until_idle(sdk: &EdgeLlm) {
+        let deadline = std::time::Instant::now() + ASYNC_TEST_TIMEOUT;
+        while sdk
+            .operation_active
+            .load(std::sync::atomic::Ordering::Acquire)
+            || sdk
+                .async_requests_active
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "async provider did not release its per-handle permits"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn async_completion_projects_post_provider_cancellation_as_cancelled() {
+        let _capacity_test_guard = ASYNC_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let terminal =
+            std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+        let sdk = EdgeLlm {
+            provider: Arc::new(CancelsBeforeSuccessProvider),
+            default_model: "test".into(),
+            max_tokens: None,
+            operation_active: Arc::new(AtomicBool::new(false)),
+            async_requests_active: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let request = sdk
+            .ask_async(
+                "cancel".into(),
+                Box::new(CompletionRecordingHandler {
+                    terminal: std::sync::Arc::clone(&terminal),
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(wait_for_terminal(&terminal), "cancelled");
+        wait_until_idle(&sdk);
+        assert!(
+            !request.is_cancelled(),
+            "provider-level cancellation must not masquerade as consumer cancellation"
+        );
+    }
+
+    struct IgnoresCancellationProvider {
+        started: Signal,
+        release: Signal,
+    }
+
+    impl LlmProvider for IgnoresCancellationProvider {
+        fn chat(&self, _: &ChatRequest) -> el_core::Result<el_core::ChatResponse> {
+            unreachable!("the cancellation-liveness test uses the stream seam")
+        }
+
+        fn chat_stream(
+            &self,
+            _: &ChatRequest,
+            _: &mut dyn FnMut(ChatToken),
+        ) -> el_core::Result<()> {
+            unreachable!("the cancellation-liveness test uses the stream seam")
+        }
+
+        fn chat_stream_cancellable(
+            &self,
+            _: &ChatRequest,
+            _: &CancellationToken,
+            on_token: &mut dyn FnMut(ChatToken),
+        ) -> el_core::Result<()> {
+            let (started, started_ready) = &*self.started;
+            *started.lock().unwrap() = true;
+            started_ready.notify_all();
+
+            let (released, release_ready) = &*self.release;
+            let mut is_released = released.lock().unwrap();
+            while !*is_released {
+                let (next, timeout) = release_ready
+                    .wait_timeout(is_released, ASYNC_TEST_TIMEOUT)
+                    .unwrap();
+                if timeout.timed_out() {
+                    return Err(EdgeError::Engine("test provider was never released"));
+                }
+                is_released = next;
+            }
+            drop(is_released);
+
+            on_token(ChatToken {
+                text: "late".into(),
+                is_final: false,
+            });
+            Ok(())
+        }
+    }
+
+    fn wait_for_signal(signal: &Signal, message: &str) {
+        let (state, ready) = &**signal;
+        let mut set = state.lock().unwrap();
+        while !*set {
+            let (next, timeout) = ready.wait_timeout(set, ASYNC_TEST_TIMEOUT).unwrap();
+            assert!(!timeout.timed_out(), "{message}");
+            set = next;
+        }
+    }
+
+    #[test]
+    fn consumer_cancellation_notifies_promptly_while_a_noncooperative_provider_drains() {
+        let _capacity_test_guard = ASYNC_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let started =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let terminal =
+            std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+        let sdk = EdgeLlm {
+            provider: Arc::new(IgnoresCancellationProvider {
+                started: std::sync::Arc::clone(&started),
+                release: std::sync::Arc::clone(&release),
+            }),
+            default_model: "test".into(),
+            max_tokens: None,
+            operation_active: Arc::new(AtomicBool::new(false)),
+            async_requests_active: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let request = sdk
+            .ask_async(
+                "cancel".into(),
+                Box::new(CompletionRecordingHandler {
+                    terminal: std::sync::Arc::clone(&terminal),
+                }),
+            )
+            .unwrap();
+        wait_for_signal(&started, "provider did not start");
+
+        request.cancel();
+        assert_eq!(wait_for_terminal(&terminal), "cancelled");
+        assert!(request.is_cancelled());
+        assert!(matches!(sdk.reset(), Err(SdkError::Busy { .. })));
+
+        let (released, release_ready) = &*release;
+        *released.lock().unwrap() = true;
+        release_ready.notify_all();
+        wait_until_idle(&sdk);
+        sdk.reset()
+            .expect("the handle is reusable after the provider drains");
+    }
+
+    #[test]
+    fn async_stream_returns_immediately_rejects_overlap_and_reports_cancelled_once() {
+        let _capacity_test_guard = ASYNC_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let started =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let terminal =
+            std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+        let terminal_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sdk = EdgeLlm {
+            provider: Arc::new(BlockingCancellableProvider {
+                started: std::sync::Arc::clone(&started),
+            }),
+            default_model: "test".into(),
+            max_tokens: None,
+            operation_active: Arc::new(AtomicBool::new(false)),
+            async_requests_active: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let sdk = Arc::new(sdk);
+        let (submission_sender, submission_receiver) = std::sync::mpsc::sync_channel(1);
+        let submitting_sdk = Arc::clone(&sdk);
+        let submitting_terminal = std::sync::Arc::clone(&terminal);
+        let submitting_terminal_calls = std::sync::Arc::clone(&terminal_calls);
+        std::thread::spawn(move || {
+            let _ = submission_sender.send(submitting_sdk.ask_stream_async(
+                "wait".into(),
+                Box::new(TerminalRecordingStreamHandler {
+                    terminal: submitting_terminal,
+                    terminal_calls: submitting_terminal_calls,
+                }),
+            ));
+        });
+        let request = submission_receiver
+            .recv_timeout(ASYNC_TEST_TIMEOUT)
+            .expect("submission must not wait for provider work")
+            .expect("submission must be accepted");
+
+        let (started_lock, started_ready) = &*started;
+        let mut is_started = started_lock.lock().unwrap();
+        while !*is_started {
+            let (next, timeout) = started_ready
+                .wait_timeout(is_started, ASYNC_TEST_TIMEOUT)
+                .unwrap();
+            assert!(!timeout.timed_out(), "async worker did not start");
+            is_started = next;
+        }
+        drop(is_started);
+
+        assert!(matches!(sdk.reset(), Err(SdkError::Busy { .. })));
+        request.cancel();
+
+        let (terminal_lock, terminal_done) = &*terminal;
+        let mut outcome = terminal_lock.lock().unwrap();
+        while outcome.is_none() {
+            let (next, timeout) = terminal_done
+                .wait_timeout(outcome, ASYNC_TEST_TIMEOUT)
+                .unwrap();
+            assert!(!timeout.timed_out(), "async cancellation did not finish");
+            outcome = next;
+        }
+        assert_eq!(outcome.as_deref(), Some("cancelled"));
+        drop(outcome);
+        wait_until_idle(&sdk);
+        assert_eq!(
+            terminal_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a request emits exactly one terminal callback"
+        );
+
+        sdk.reset()
+            .expect("the released operation permit must allow a reset");
+    }
+
+    type Signal = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+    struct PauseAfterFirstTokenProvider {
+        release: Signal,
+    }
+
+    impl LlmProvider for PauseAfterFirstTokenProvider {
+        fn chat(&self, _: &ChatRequest) -> el_core::Result<el_core::ChatResponse> {
+            unreachable!("the async stream test uses the cancellable stream seam")
+        }
+
+        fn chat_stream(
+            &self,
+            _: &ChatRequest,
+            _: &mut dyn FnMut(ChatToken),
+        ) -> el_core::Result<()> {
+            unreachable!("the async stream test uses the cancellable stream seam")
+        }
+
+        fn chat_stream_cancellable(
+            &self,
+            _: &ChatRequest,
+            cancellation: &CancellationToken,
+            on_token: &mut dyn FnMut(ChatToken),
+        ) -> el_core::Result<()> {
+            on_token(ChatToken {
+                text: "first".into(),
+                is_final: false,
+            });
+
+            let (released, ready) = &*self.release;
+            let mut is_released = released.lock().unwrap();
+            while !*is_released && !cancellation.is_cancelled() {
+                let (next, timeout) = ready.wait_timeout(is_released, ASYNC_TEST_TIMEOUT).unwrap();
+                if timeout.timed_out() {
+                    return Err(EdgeError::Engine(
+                        "host did not receive the first token incrementally",
+                    ));
+                }
+                is_released = next;
+            }
+            drop(is_released);
+
+            if cancellation.is_cancelled() {
+                return Err(EdgeError::Cancelled);
+            }
+            on_token(ChatToken {
+                text: "second".into(),
+                is_final: false,
+            });
+            on_token(ChatToken {
+                text: String::new(),
+                is_final: true,
+            });
+            Ok(())
+        }
+    }
+
+    struct IncrementalRecordingHandler {
+        sdk: Arc<EdgeLlm>,
+        release: Signal,
+        tokens: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        reset_was_busy: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+        terminal: std::sync::Arc<(std::sync::Mutex<Option<String>>, std::sync::Condvar)>,
+    }
+
+    impl AsyncStreamHandler for IncrementalRecordingHandler {
+        fn on_token(&self, token: String) {
+            *self.reset_was_busy.lock().unwrap() =
+                Some(matches!(self.sdk.reset(), Err(SdkError::Busy { .. })));
+            self.tokens.lock().unwrap().push(token);
+            let (released, ready) = &*self.release;
+            *released.lock().unwrap() = true;
+            ready.notify_all();
+        }
+
+        fn on_complete(&self) {
+            self.record("complete");
+        }
+
+        fn on_error(&self, error: String) {
+            self.record(&format!("error:{error}"));
+        }
+
+        fn on_cancelled(&self) {
+            self.record("cancelled");
+        }
+    }
+
+    impl IncrementalRecordingHandler {
+        fn record(&self, outcome: &str) {
+            let (terminal, done) = &*self.terminal;
+            *terminal.lock().unwrap() = Some(outcome.into());
+            done.notify_all();
+        }
+    }
+
+    #[test]
+    fn async_stream_delivers_incrementally_and_keeps_the_turn_busy_during_callbacks() {
+        let _capacity_test_guard = ASYNC_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let tokens = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reset_was_busy = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let terminal =
+            std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+        let sdk = Arc::new(EdgeLlm {
+            provider: Arc::new(PauseAfterFirstTokenProvider {
+                release: std::sync::Arc::clone(&release),
+            }),
+            default_model: "test".into(),
+            max_tokens: None,
+            operation_active: Arc::new(AtomicBool::new(false)),
+            async_requests_active: Arc::new(AtomicUsize::new(0)),
+        });
+
+        sdk.ask_stream_async(
+            "stream".into(),
+            Box::new(IncrementalRecordingHandler {
+                sdk: Arc::clone(&sdk),
+                release,
+                tokens: std::sync::Arc::clone(&tokens),
+                reset_was_busy: std::sync::Arc::clone(&reset_was_busy),
+                terminal: std::sync::Arc::clone(&terminal),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(wait_for_terminal(&terminal), "complete");
+        wait_until_idle(&sdk);
+        assert_eq!(
+            *reset_was_busy.lock().unwrap(),
+            Some(true),
+            "the turn permit stays held through callback delivery"
+        );
+        assert_eq!(tokens.lock().unwrap().as_slice(), ["first", "second"]);
+    }
+
+    struct ImmediateTokenProvider;
+
+    impl LlmProvider for ImmediateTokenProvider {
+        fn chat(&self, _: &ChatRequest) -> el_core::Result<el_core::ChatResponse> {
+            unreachable!("the callback-panic test uses the cancellable stream seam")
+        }
+
+        fn chat_stream(
+            &self,
+            _: &ChatRequest,
+            _: &mut dyn FnMut(ChatToken),
+        ) -> el_core::Result<()> {
+            unreachable!("the callback-panic test uses the cancellable stream seam")
+        }
+
+        fn chat_stream_cancellable(
+            &self,
+            _: &ChatRequest,
+            _: &CancellationToken,
+            on_token: &mut dyn FnMut(ChatToken),
+        ) -> el_core::Result<()> {
+            on_token(ChatToken {
+                text: "token".into(),
+                is_final: false,
+            });
+            Ok(())
+        }
+    }
+
+    struct PanicThenRecordHandler {
+        terminal: std::sync::Arc<(std::sync::Mutex<Option<String>>, std::sync::Condvar)>,
+    }
+
+    impl AsyncStreamHandler for PanicThenRecordHandler {
+        fn on_token(&self, _: String) {
+            panic!("foreign token callback failure");
+        }
+
+        fn on_complete(&self) {
+            self.record("complete");
+        }
+
+        fn on_error(&self, error: String) {
+            self.record(&format!("error:{error}"));
+        }
+
+        fn on_cancelled(&self) {
+            self.record("cancelled");
+        }
+    }
+
+    impl PanicThenRecordHandler {
+        fn record(&self, outcome: &str) {
+            let (terminal, done) = &*self.terminal;
+            *terminal.lock().unwrap() = Some(outcome.into());
+            done.notify_all();
+        }
+    }
+
+    #[test]
+    fn token_callback_panic_still_attempts_one_terminal_error() {
+        let _capacity_test_guard = ASYNC_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let terminal =
+            std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+        let sdk = EdgeLlm {
+            provider: Arc::new(ImmediateTokenProvider),
+            default_model: "test".into(),
+            max_tokens: None,
+            operation_active: Arc::new(AtomicBool::new(false)),
+            async_requests_active: Arc::new(AtomicUsize::new(0)),
+        };
+
+        sdk.ask_stream_async(
+            "panic".into(),
+            Box::new(PanicThenRecordHandler {
+                terminal: std::sync::Arc::clone(&terminal),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            wait_for_terminal(&terminal),
+            "error:async stream token callback panicked"
+        );
+        wait_until_idle(&sdk);
+    }
+
+    #[test]
+    fn async_worker_capacity_is_scoped_per_handle() {
+        let _capacity_test_guard = ASYNC_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first_handle = Arc::new(AtomicUsize::new(0));
+        let second_handle = Arc::new(AtomicUsize::new(0));
+        let first = AsyncWorkerPermit::acquire(&first_handle).expect("first worker slot");
+        let second = AsyncWorkerPermit::acquire(&first_handle).expect("second worker slot");
+
+        assert!(matches!(
+            AsyncWorkerPermit::acquire(&first_handle),
+            Err(SdkError::Busy { .. })
+        ));
+
+        let independent = AsyncWorkerPermit::acquire(&second_handle)
+            .expect("a busy handle must not exhaust another handle's capacity");
+
+        drop(independent);
+        drop(second);
+        drop(first);
     }
 
     #[test]
@@ -658,12 +2045,14 @@ mod tests {
     fn reset_forwards_to_provider_session_lifecycle() {
         let reset_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sdk = EdgeLlm {
-            provider: Box::new(ResetTrackingProvider {
+            provider: Arc::new(ResetTrackingProvider {
                 reset_calls: std::sync::Arc::clone(&reset_calls),
                 should_fail: false,
             }),
             default_model: "test".into(),
             max_tokens: None,
+            operation_active: Arc::new(AtomicBool::new(false)),
+            async_requests_active: Arc::new(AtomicUsize::new(0)),
         };
 
         sdk.reset().expect("provider reset must succeed");
@@ -674,12 +2063,14 @@ mod tests {
     #[test]
     fn reset_propagates_provider_failure() {
         let sdk = EdgeLlm {
-            provider: Box::new(ResetTrackingProvider {
+            provider: Arc::new(ResetTrackingProvider {
                 reset_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 should_fail: true,
             }),
             default_model: "test".into(),
             max_tokens: None,
+            operation_active: Arc::new(AtomicBool::new(false)),
+            async_requests_active: Arc::new(AtomicUsize::new(0)),
         };
 
         assert!(matches!(
@@ -724,9 +2115,11 @@ mod tests {
     fn qwen_ffi_cap_is_applied_to_ask_and_stream_requests() {
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sdk = EdgeLlm {
-            provider: Box::new(RequestCapProvider(std::sync::Arc::clone(&requests))),
+            provider: Arc::new(RequestCapProvider(std::sync::Arc::clone(&requests))),
             default_model: "local/qwen".into(),
             max_tokens: Some(QWEN_FFI_DEFAULT_MAX_TOKENS),
+            operation_active: Arc::new(AtomicBool::new(false)),
+            async_requests_active: Arc::new(AtomicUsize::new(0)),
         };
 
         sdk.ask("Reply with exactly: ready".into()).unwrap();
@@ -736,6 +2129,12 @@ mod tests {
         assert_eq!(
             *requests.lock().unwrap(),
             vec![Some(QWEN_FFI_DEFAULT_MAX_TOKENS); 2]
+        );
+        assert_eq!(
+            sdk.async_request("Reply with exactly: ready".into())
+                .max_tokens,
+            None,
+            "the compatibility cap must not silently constrain native-worker calls"
         );
     }
 

@@ -69,7 +69,10 @@ fn parse_args() -> Result<Args, String> {
                 safety = match next("--safety")?.to_ascii_lowercase().as_str() {
                     "off" | "none" => SafetyMode::Off,
                     "lightweight" | "light" | "on" => SafetyMode::Lightweight,
-                    other => return Err(format!("bad --safety '{other}' (use off|lightweight)")),
+                    "sec-decoding" | "sec_decoding" | "secdecoding" => SafetyMode::SecDecoding,
+                    other => return Err(format!(
+                        "bad --safety '{other}' (use off|lightweight|sec-decoding)"
+                    )),
                 }
             }
             "--guard-word" => guard_words.push(next("--guard-word")?),
@@ -113,7 +116,7 @@ fn usage() {
          \x20 -p, --prompt <TEXT>       send one message, print the reply, exit\n\
          \x20     --once                read one line from stdin, reply, exit\n\
          \x20     --max-tokens <N>      max generated tokens per reply [default: 512]\n\
-         \x20     --safety <MODE>       on-device safety: off | lightweight [default: lightweight]\n\
+         \x20     --safety <MODE>       on-device safety: off | lightweight | sec-decoding [default: lightweight]\n\
          \x20     --guard-word <WORD>   add a chunk-guard trip word (repeatable; demo/test hook)\n\
          \x20     --expert-model <PATH> safety expert GGUF → model-backed contrastive steering (ADR-013)\n\
          \x20     --steer-alpha <MILLI> contrastive steering strength x1000 [default: 1000]\n\
@@ -171,6 +174,24 @@ fn main() {
     // Show the active on-device safety posture (ADR-005 tier + ADR-012 loop).
     let safety_desc = match args.safety {
         SafetyMode::Off => "off".to_string(),
+        SafetyMode::SecDecoding => {
+            let mut d =
+                "sec-decoding — ADR-012 decode-time guard + checkpointed rollback + ADR-013 contrastive steering"
+                    .to_string();
+            if let Some(ref expert) = args.expert_model {
+                d.push_str(&format!(
+                    " (expert: {}, alpha {})",
+                    expert.display(),
+                    args.steer_alpha
+                ));
+            } else {
+                d.push_str(" (no expert model supplied — contrastive steering inactive)");
+            }
+            if !args.guard_words.is_empty() {
+                d.push_str(&format!("; guard words: {}", args.guard_words.join(", ")));
+            }
+            d
+        }
         _ => {
             let mut d =
                 "lightweight — ADR-012 decode-time guard + checkpointed rollback".to_string();
